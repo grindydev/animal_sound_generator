@@ -76,75 +76,39 @@ Audio generation introduces concepts your NSFW project didn't cover:
     │   • Crop to 2-second clips
     ▼
  Phase 2 — Audio Classifier (baseline, like NSFW Phase 1-2)
-    │   • 1D CNN on raw audio + 2D CNN on spectrograms
-    │   • Confusion matrix, accuracy, compare approaches
-    │   • Course reference: L1-M4 (CNN), L3-M2 (interpreting)
+    │   • 2D CNN on spectrograms (your NSFW CNN skills transfer!)
+    │   • Confusion matrix, accuracy, per-class analysis
+    │   • This classifier becomes your evaluation tool later
     ▼
- Phase 3 — Transfer Learning for Audio
-    │   • Use pretrained audio models (PANNs, VGGish)
-    │   • Same 3 strategies as NSFW: freeze / fine-tune / full retrain
-    │   • Course reference: L2-M2 (transfer_learning)
-    ▼
- Phase 4 — Optuna Hyperparameter Tuning
-    │   • Search best classifier architecture, learning rate, augmentation
-    │   • Course reference: L2-M1 (optuna)
-    ▼
- Phase 5 — Grad-CAM for Audio (What frequencies matter?)
-    │   • Saliency maps on spectrograms — visual + audio debugging
-    │   • Course reference: L3-M2 (saliency_and_class_activation_map)
-    ▼
- Phase 6 — Autoencoder (learn to reconstruct)
+ Phase 3 — Autoencoder (learn to reconstruct)
     │   • Encoder: compress spectrogram → latent vector
     │   • Decoder: latent vector → reconstruct spectrogram
     │   • The decoder is the GENERATOR you'll build on
-    │   • Course reference: L3-M2 (stable diffusion concepts)
     ▼
- Phase 7 — U-Net Autoencoder with Skip Connections
-    │   • Add skip connections from encoder → decoder
-    │   • Better reconstruction = better generation later
-    │   • Course reference: L3-M1 (resnet)
+ Phase 4 — Conditional VAE (generate by class + diverse)
+    │   • Add class conditioning: specify which animal to generate
+    │   • VAE sampling: same class → different sounds each time
+    │   • Latent space exploration, interpolation between animals
     ▼
- Phase 8 — Conditional Generation (generate by class)
-    │   • Add class label to the latent space
-    │   • Generate spectrogram → convert to audio
-    │   • First moment: "it made a dog sound!"
-    │   • Course reference: L3-M3 (self-attention, conditioning)
-    ▼
- Phase 9 — Variational Autoencoder (diverse generation)
-    │   • VAE: sample from learned distribution
-    │   • Each sample produces a slightly different bark/meow
-    │   • KL divergence loss: keep latent space organized
-    │   • Course reference: L3-M2 (DDPM noise concepts)
-    ▼
- Phase 10 — Audio Quality & Evaluation
-    │   • FAD (Fréchet Audio Distance), classification agreement
+ Phase 5 — Audio Quality & Evaluation
+    │   • Fréchet Audio Distance, classification agreement
+    │   • Latent space visualization (t-SNE)
     │   • Compare real vs generated spectrograms
-    │   • Course reference: L2-M1 (evaluation metrics)
     ▼
- Phase 11 — Latent Space Mixing (multiple animals)
-    │   • z_dog + z_cat = hybrid sound
-    │   • Interpolation between animals
-    │   • Course reference: L3-M2 (stable diffusion latent space)
+ Phase 6 — Advanced Generation (longer, mixed, refined)
+    │   • Mix multiple animals in latent space
+    │   • Generate longer sequences (autoregressive / overlap-add)
+    │   • Diffusion refinement for higher quality
     ▼
- Phase 12 — Longer & Sequential Sounds
-    │   • Autoregressive: predict next audio chunk
-    │   • Stitch chunks into longer sequences
-    │   • Course reference: L3-M3 (decoder_block, translation)
+ Phase 7 — Re-practice All Techniques on the Generator
+    │   • Transfer learning, Optuna, skip connections (U-Net)
+    │   • Grad-CAM on spectrograms, pruning, quantization
+    │   • All applied to YOUR generative model
     ▼
- Phase 13 — Diffusion Refinement (highest quality)
-    │   • VAE output → diffusion model cleans it up
-    │   • Same as DDPM but on spectrograms
-    │   • Course reference: L3-M2 (DDPM pipeline)
-    ▼
- Phase 14 — Pruning + Quantization
-    │   • Shrink generator for real-time inference
-    │   • Course reference: L3-M4 (pruning, quantization)
-    ▼
- Phase 15 — Deployment (Web App)
+ Phase 8 — Deployment (Web App)
         • Export generator, FastAPI + React web app
         • Click animal button → generate unique sound
-        • MLflow tracking throughout all phases
-        • Course reference: L3-M4 (ONNX, MLflow, deployment)
+        • Mix mode, temperature control, history
 ```
 
 ---
@@ -167,6 +131,7 @@ Audio generation introduces concepts your NSFW project didn't cover:
 | Custom AudioDataset | `data_loader.py` — `__getitem__` returns (spectrogram, label) | L1-M3 `data_management/main.py` |
 | Train/val/test split | Same as NSFW project | L1-M3 |
 | Crop to 2 seconds | Energy-based windowing (loudest 2s) | New |
+| Audio augmentation | Time shift, noise, pitch shift, SpecAugment | L1-M3 (augmentation) |
 
 ### Key insight: Audio as Images
 
@@ -199,7 +164,7 @@ Spectrogram = 2D image where:
 
 ## Phase 2 — Audio Classifier (Baseline) 🔲
 
-**Goal:** Build a classifier as a warm-up (same pattern as NSFW Phase 1-2). This teaches you what features matter for animal sounds.
+**Goal:** Build a classifier as a warm-up (same pattern as NSFW Phase 1-2). This teaches you what features matter for animal sounds, AND you'll reuse this classifier in Phase 5 to evaluate your generator.
 
 **Build these files:** `model.py`, `train.py`, `evaluate.py`
 
@@ -208,159 +173,26 @@ Spectrogram = 2D image where:
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
 | 2D CNN on spectrograms | `model.py` — same CNN architecture as NSFW | L1-M4 `cnn/main.py` |
-| 1D CNN on raw waveforms | `model.py` — alternative approach | New |
-| Data augmentation for audio | `data_loader.py` — time shift, noise, pitch shift, SpecAugment | L1-M3 (augmentation) |
-| Confusion matrix | `evaluate.py` | Same as NSFW |
-| MLflow tracking | `train.py` — log params, metrics, spectrograms | L3-M4 `MLflow/main.py` |
 | Config-driven training | `train.py` — CONFIG dict | Same as NSFW |
-
-### Approach comparison
-
-```python
-# Approach A: 2D CNN on Mel-spectrogram (like an image)
-# Pros: well-studied, works like image classification
-# Cons: loses phase information
-
-# Approach B: 1D CNN on raw waveform
-# Pros: learns directly from audio, no preprocessing bias
-# Cons: longer sequences, harder to train
-```
+| Confusion matrix + F1 | `evaluate.py` | Same as NSFW |
+| MLflow tracking | `train.py` — log params, metrics | L3-M4 `MLflow/main.py` |
+| Early stopping + LR scheduler | `train.py` | L2-M1 `scheduler/main.py` |
 
 ### After classification — record results
 
 ```
 ┌──────────────────────────────────────────────┐
 │ AUDIO CLASSIFIER BASELINE                    │
-│ Test Accuracy (2D CNN):  ??%                 │
-│ Test Accuracy (1D CNN):  ??%                 │
-│ Hardest classes:        ???                  │
-│ Easy classes:           ???                  │
-│ Spectrogram vs Raw:     ??? is better        │
+│ Test Accuracy:  ??%                          │
+│ Hardest classes: ???                         │
+│ Easy classes:    ???                         │
+│ Best model saved for Phase 5 evaluation      │
 └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 3 — Transfer Learning for Audio 🔲
-
-**Goal:** Use a pretrained audio model — biggest accuracy jump (just like NSFW Phase 4).
-
-**Build these files:** `transfer_audio.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Pretrained audio models | `transfer_audio.py` — PANNs (Pretrained Audio Neural Networks) or VGGish | L2-M2 `transfer_learning/main.py` |
-| Strategy 1: Freeze all, train head | Same as NSFW ResNet18 Strategy 1 | L2-M2 (freeze all) |
-| Strategy 2: Fine-tune later layers | Same as NSFW ResNet18 Strategy 2 | L2-M2 (fine-tune) |
-| Strategy 3: Full retrain | Same as NSFW ResNet18 Strategy 3 | L2-M2 (full retrain) |
-| Pretrained preprocessing | PANNs expects 64 mel bins, specific sample rate | Like ImageNet normalization in NSFW |
-| Compare with Phase 2 baseline | Did pretrained help? | Same comparison pattern as NSFW |
-
-### Pretrained audio models
-
-```python
-# Option A: PANNs (CNN14) — trained on AudioSet (2M YouTube videos)
-#   Input: 64 mel bins, 2 seconds
-#   Very similar to ResNet18 for images
-
-# Option B: VGGish — trained on YouTube-8M
-#   Input: 64 mel bins, 0.96 seconds
-#   Older but simpler
-
-# Option C: torchvggish (Google's VGGish ported to PyTorch)
-#   pip install torchvggish
-```
-
-### After transfer learning — record results
-
-```
-┌──────────────────────────────────────────────┐
-│ TRANSFER LEARNING COMPARISON                 │
-│ Strategy 1 (freeze all):   ???%              │
-│ Strategy 2 (fine-tune):    ???%              │
-│ Strategy 3 (full retrain): ???%              │
-│ Phase 2 baseline:          ???%              │
-│ Best approach:             ???               │
-│ Overfitting?               Yes/No            │
-└──────────────────────────────────────────────┘
-```
-
----
-
-## Phase 4 — Optuna Hyperparameter Tuning 🔲
-
-**Goal:** Push the best model from Phase 2-3 to its limit.
-
-**Build this file:** `tuning.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Flexible CNN architecture | `tuning.py` — variable layers, filters, kernel sizes | L2-M1 `optuna/main.py` |
-| Search space design | `tuning.py` — lr, dropout, augmentation params | L2-M1 (optuna) |
-| Train fraction for fast trials | `data_loader.py` — 50% data for optuna trials | Same as NSFW |
-| Retrain with best params | `tuning.py` — full data, more epochs | Same as NSFW |
-| Compare with baseline | Phase 2 vs Phase 3 vs Phase 4 | Same comparison pattern as NSFW |
-
-### Search space
-
-| Parameter | Search space | Why |
-|-----------|-------------|-----|
-| Learning rate | 1e-5 to 1e-2 | Always search this |
-| Num conv layers | 2-6 | Deeper = more capacity |
-| Filters per layer | 16-256 (powers of 2) | GPU-friendly |
-| Dropout | 0.1-0.5 | Regularization |
-| Mel bins | 64 or 128 | Input resolution |
-| SpecAugment intensity | time_mask / freq_mask width | How much augmentation |
-| Batch size | 16, 32, 64 | Memory vs speed |
-
-### After Optuna — record results
-
-```
-┌──────────────────────────────────────────────┐
-│ OPTUNA TUNING                                │
-│ Best accuracy:    ???%                       │
-│ Best params:      (see study)               │
-│ Improvement:      +X.X% vs baseline         │
-│ N trials:         20 × 10 epochs            │
-└──────────────────────────────────────────────┘
-```
-
----
-
-## Phase 5 — Grad-CAM for Audio 🔲
-
-**Goal:** See what frequency and time regions the model focuses on for each animal.
-
-**Build this file:** `grad_cam_audio.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Grad-CAM on spectrograms | `grad_cam_audio.py` — same Grad-CAM, but overlay on spectrogram | L3-M2 `saliency_and_class_activation_map/main.py` |
-| Frequency importance | Which mel bins matter for dog vs cat? | New — unique to audio |
-| Temporal importance | Which time steps matter? | New — when does the bark happen? |
-| Per-class comparison | Dog focuses on low freq, bird on high freq? | Same pattern as NSFW per-class comparison |
-| Saliency maps | Pixel-level gradient importance | L3-M2 (saliency) |
-
-### What you'll discover
-
-```
-Dog bark:  Grad-CAM focuses on LOW frequencies + sharp temporal onset
-Cat meow:  Grad-CAM focuses on MID frequencies + sustained tone
-Bird:      Grad-CAM focuses on HIGH frequencies + rapid temporal patterns
-Frog:      Grad-CAM focuses on narrow frequency band + repetitive pattern
-
-This tells you what the model learned — and what to improve
-```
-
----
-
-## Phase 6 — Autoencoder (Reconstruct) 🔲
+## Phase 3 — Autoencoder (Reconstruct) 🔲
 
 **Goal:** Learn to compress and reconstruct audio. The **decoder** is the foundation of your generator.
 
@@ -414,107 +246,23 @@ OUTPUT: Audio waveform → .wav file
 #                          The decoder LEARNED to generate spectrograms.
 ```
 
----
-
-## Phase 7 — U-Net Autoencoder with Skip Connections 🔲
-
-**Goal:** Better reconstruction using skip connections — same idea as ResNet but for the encoder-decoder path.
-
-**Build this file:** `unet_autoencoder.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Skip connections (encoder → decoder) | `unet_autoencoder.py` — copy encoder features to decoder | L3-M1 `resnet/main.py` |
-| U-Net architecture | `unet_autoencoder.py` — the standard architecture for generation tasks | L3-M1 (residual connections) |
-| Why skips help generation | Encoder preserves fine details that decoder would lose | Same concept as Phase 5 in NSFW |
-| Compare with Phase 6 | U-Net vs basic autoencoder reconstruction quality | Same comparison pattern as NSFW |
-
-### Why skip connections matter for generation
-
-```
-Basic autoencoder:
-  Encoder: fine details → pool → gone forever
-  Decoder: tries to reconstruct → blurry, missing details
-
-U-Net with skip connections:
-  Encoder: conv_block1 → pool → conv_block2 → pool → ...
-                    ↓                         ↓
-  Decoder: ... ← up ← conv_block2' ← up ← conv_block1'
-                    ↑                         ↑
-                  skip                      skip
-                  (fine details preserved!)
-```
-
-### After U-Net — record results
+### After autoencoder — listen and record
 
 ```
 ┌──────────────────────────────────────────────┐
-│ AUTOENCODER COMPARISON                       │
-│ Basic autoencoder reconstruction loss:  ???  │
-│ U-Net autoencoder reconstruction loss:  ???  │
-│ Audio quality (basic):                  ???/10│
-│ Audio quality (U-Net):                  ???/10│
-│ Skip connections helped?                Yes/No│
+│ AUTOENCODER                                  │
+│ Reconstruction loss:  ???                    │
+│ Audio quality:        ???/10                 │
+│ Does it sound like the original?  Yes/No     │
+│ What's lost in compression?      ???         │
 └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 8 — Conditional Generation (by Class) 🔲
+## Phase 4 — Conditional VAE (Generate by Class) 🔲
 
-**Goal:** Generate animal sounds by specifying which animal you want.
-
-**Build this file:** `generator.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Class conditioning | `generator.py` — concatenate class embedding to latent | L3-M3 `decoder_block` (conditioning) |
-| Label embedding | `generator.py` — `nn.Embedding(num_classes, embed_dim)` | L2-M3 `embeddings/main.py` |
-| Conditional decoder | `generator.py` — [latent + class_emb] → decoder | L3-M2 (text conditioning in stable diffusion) |
-| Audio saving | `generator.py` — `torchaudio.save()` | New |
-| Listening tests | Manual — does it sound like the right animal? | New — subjective evaluation |
-
-### Conditioning approaches
-
-```python
-# Approach A: Concatenation
-class_embedding = self.embed(label)          # [batch, 64]
-z_input = torch.cat([z, class_embedding])    # [batch, 128+64]
-output = self.decoder(z_input)
-
-# Approach B: Addition (projection to same size)
-class_embedding = self.embed_and_project(label)  # [batch, 128]
-z_input = z + class_embedding                    # [batch, 128]
-output = self.decoder(z_input)
-
-# Approach C: Feature-wise modulation (FiLM)
-gamma, beta = self.class_to_params(label)    # scale & shift
-z_input = gamma * z + beta                   # per-feature modulation
-output = self.decoder(z_input)
-```
-
-### After conditional generation
-
-```
-┌──────────────────────────────────────────────┐
-│ CONDITIONAL GENERATION                       │
-│ Can generate dog sounds?    Yes/No           │
-│ Can generate cat sounds?    Yes/No           │
-│ Classes sound different?    Yes/No           │
-│ Audio quality:              ???/10           │
-│ Common artifacts:           ???              │
-└──────────────────────────────────────────────┘
-```
-
----
-
-## Phase 9 — Variational Autoencoder (Diverse Generation) 🔲
-
-**Goal:** Generate diverse, unique sounds each time. Same class → different barks.
+**Goal:** Generate animal sounds by specifying which animal, with diversity.
 
 **Build this file:** `vae.py`
 
@@ -525,9 +273,11 @@ output = self.decoder(z_input)
 | Variational Autoencoder | `vae.py` — encoder outputs μ and σ | L3-M2 (diffusion noise concepts) |
 | Reparameterization trick | `vae.py` — `z = μ + σ * ε` where ε ~ N(0,1) | New — key to differentiable sampling |
 | KL divergence loss | `vae.py` — keeps latent space organized | New — regularization for the latent space |
+| Class conditioning | `vae.py` — `nn.Embedding(num_classes, embed_dim)` | L2-M3 `embeddings/main.py` |
+| Conditional decoder | `vae.py` — [z + class_emb] → decoder → spectrogram | L3-M2 (text conditioning in stable diffusion) |
 | Sampling at inference | `vae.py` — random z → unique generation each time | L3-M2 (noise → denoise → image) |
-| Latent space visualization | `vae.py` — t-SNE of z vectors colored by class | L3-M2 (interpreting) |
-| Interpolation between classes | `vae.py` — z_dog → z_cat, decode each step | L3-M2 (stable diffusion latent arithmetic) |
+| Latent space interpolation | `vae.py` — z_dog → z_cat, decode each step | L3-M2 (stable diffusion latent arithmetic) |
+| Audio saving | `vae.py` — `torchaudio.save()` | New |
 
 ### VAE vs regular Autoencoder
 
@@ -550,22 +300,37 @@ kl_loss = -0.5 * sum(1 + log(σ²) - μ² - σ²)          # Keep latent space n
 total_loss = reconstruction_loss + beta * kl_loss      # beta controls tradeoff
 ```
 
-### After VAE
+### Conditioning approaches
+
+```python
+# Approach A: Concatenation
+class_embedding = self.embed(label)          # [batch, 64]
+z_input = torch.cat([z, class_embedding])    # [batch, 128+64]
+output = self.decoder(z_input)
+
+# Approach B: Addition (projection to same size)
+class_embedding = self.embed_and_project(label)  # [batch, 128]
+z_input = z + class_embedding                    # [batch, 128]
+output = self.decoder(z_input)
+```
+
+### After conditional VAE
 
 ```
 ┌──────────────────────────────────────────────┐
-│ VAE GENERATION                               │
-│ Same class, different sounds?   Yes/No       │
-│ Sound quality vs Phase 8:      Better/Worse  │
-│ Latent space is organized?     Yes/No        │
-│ Can interpolate between classes?  Yes/No     │
-│ Interpolation sounds smooth?   Yes/No        │
+│ CONDITIONAL VAE                              │
+│ Can generate dog sounds?    Yes/No           │
+│ Can generate cat sounds?    Yes/No           │
+│ Classes sound different?    Yes/No           │
+│ Same class, different each time? Yes/No      │
+│ Can interpolate dog → cat?  Yes/No           │
+│ Audio quality:              ???/10           │
 └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 10 — Audio Quality & Evaluation 🔲
+## Phase 5 — Audio Quality & Evaluation 🔲
 
 **Goal:** Move beyond "sounds okay to me" — quantify generation quality.
 
@@ -576,182 +341,289 @@ total_loss = reconstruction_loss + beta * kl_loss      # beta controls tradeoff
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
 | Fréchet Audio Distance (FAD) | `evaluate_gen.py` — distribution distance between real & generated | New (like FID for images) |
-| Spectrogram comparison | `evaluate_gen.py` — real vs generated side by side | L3-M2 `interpreting/main.py` |
-| Classification-based eval | `evaluate_gen.py` — does Phase 2 classifier agree with intended class? | Uses your Phase 2 classifier! |
+| Classification agreement | `evaluate_gen.py` — does Phase 2 classifier predict the intended class? | Uses your Phase 2 classifier! |
 | t-SNE visualization | `evaluate_gen.py` — real vs generated clusters | New |
-| Diversity metric | `evaluate_gen.py` — pairwise distance in latent space | New |
-| MLflow logging | Log all metrics for comparison | L3-M4 `MLflow/main.py` |
+| Spectrogram comparison | `evaluate_gen.py` — real vs generated side by side | L3-M2 `interpreting/main.py` |
+| Diversity metric | `evaluate_gen.py` — pairwise latent distance | New |
+| MLflow logging | Log all metrics | L3-M4 `MLflow/main.py` |
 
 ### Evaluation strategies
 
 ```python
-# Strategy 1: "Turing Test" — can a classifier tell real from fake?
-# Train classifier on real, test on generated
-# If accuracy is LOW → generated audio looks real (good!)
-# If accuracy is HIGH → generated audio has obvious artifacts (bad!)
-
-# Strategy 2: Classification agreement
-# Generate "dog" sound → run through classifier → should predict "dog"
+# Strategy 1: Classification agreement
+# Generate "dog" sound → run through Phase 2 classifier → should predict "dog"
 # Agreement rate = generation accuracy
+
+# Strategy 2: "Turing Test" — can classifier tell real from fake?
+# Train classifier on real, test on generated
+# If accuracy is LOW → generated looks real (good!)
+# If accuracy is HIGH → generated has obvious artifacts (bad!)
 
 # Strategy 3: Diversity metric
 # Generate 10 "dog" sounds → pairwise distance in latent space
 # High distance = diverse (good)
-# Low distance = mode collapse, all same (bad)
+# Low distance = mode collapse (bad)
 ```
 
----
-
-## Phase 11 — Latent Space Mixing (Multiple Animals) 🔲
-
-**Goal:** Mix multiple animal sounds by combining their latent representations.
-
-**Build this file:** `latent_mixing.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Latent space arithmetic | `latent_mixing.py` — vector math in z-space | L3-M2 `stable_diffusion` (latent space concepts) |
-| Interpolation | z_dog → z_cat, decode each step → hear smooth transition | L3-M2 (stable diffusion latent arithmetic) |
-| Weighted mixing | 0.6×dog + 0.4×cat → hybrid sound | L3-M2 (prompt weighting concept) |
-| Style transfer | Keep content, change "style" (pitch, energy) | L3-M2 (guidance_scale, negative_prompt) |
-| Guided generation | Control generation by manipulating latent dimensions | L3-M2 (guidance_scale controls) |
-
-### What you'll create
-
-```python
-# Mix two animals
-z_dog = encoder(dog_sound)
-z_cat = encoder(cat_sound)
-
-# Smooth interpolation: 0% dog → 100% cat
-for alpha in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
-    z_mix = (1 - alpha) * z_dog + alpha * z_cat
-    audio = decoder(z_mix)
-    # Listen to the morphing!
-
-# Weighted mix: "mostly dog with a hint of cat"
-z_mix = 0.7 * z_dog + 0.3 * z_cat
-
-# Three-way mix: "dog-cat-bird"
-z_mix = 0.5 * z_dog + 0.3 * z_cat + 0.2 * z_bird
-```
-
----
-
-## Phase 12 — Longer & Sequential Sounds 🔲
-
-**Goal:** Generate sounds longer than 2 seconds by predicting the next audio chunk.
-
-**Build this file:** `sequential_generator.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Autoregressive generation | Predict next spectrogram frame given previous frames | L3-M3 `decoder_block` (Shakespeare generator) |
-| Overlap-add stitching | Generate overlapping 2-sec chunks, crossfade | New |
-| Sequence-to-sequence | "dog bark → pause → cat meow" as a sequence plan | L3-M3 `translation` (encoder-decoder) |
-| Temperature control | Higher = more random/diverse, lower = more consistent | L3-M3 (generation temperature) |
-| Causal masking | Can only attend to past audio chunks (not future) | L3-M3 `decoder_block` (causal mask) |
-
-### Approaches
-
-```python
-# Approach A: Overlap-Add (simplest)
-# Generate 2-sec chunks with 0.5s overlap, crossfade between them
-chunk1 = generate(label, seed=1)  # [0.0 - 2.0s]
-chunk2 = generate(label, seed=2)  # [1.5 - 3.5s]  ← overlap 0.5s
-# Crossfade in overlap region → seamless 3.5s audio
-
-# Approach B: Autoregressive (predict next chunk)
-# Like Shakespeare generator but for audio
-# Input: previous spectrogram → Output: next spectrogram frame
-# Course reference: decoder_block/main.py
-
-# Approach C: Sequence planner (different animals in order)
-# Input: [dog, pause, cat, pause, cow] → Output: full audio scene
-# Course reference: translation/main.py (English → French, but Animal → Audio)
-```
-
----
-
-## Phase 13 — Diffusion Refinement (Highest Quality) 🔲
-
-**Goal:** Use a diffusion model to clean up VAE output — the same architecture as Stable Diffusion but on spectrograms.
-
-**Build this file:** `diffusion_refine.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Forward diffusion (add noise) | `diffusion_refine.py` — gradually corrupt spectrogram | L3-M2 `stable_diffusion` (forward process) |
-| Reverse diffusion (denoise) | `diffusion_refine.py` — U-Net learns to remove noise | L3-M2 (reverse process) |
-| Conditional diffusion | Guide denoising toward target animal class | L3-M2 (text conditioning) |
-| DDPM on spectrograms | Same as DDPM bedroom model, but for audio spectrograms | L3-M2 (DDPM pipeline) |
-| Noise schedule | Linear vs cosine schedule — controls quality/speed tradeoff | L3-M2 (inference steps) |
-
-### Pipeline (exactly like Stable Diffusion!)
-
-```
-VAE generates rough spectrogram
-         │
-    ┌────▼────┐
-    │ ADD NOISE│  ← Forward diffusion (t steps)
-    └────┬────┘
-         │  noisy spectrogram
-    ┌────▼────┐
-    │  U-NET  │  ← Learns to predict & remove noise
-    │  DENOISE│     conditioned on animal class
-    └────┬────┘
-         │  refined spectrogram (cleaner than VAE output)
-    ┌────▼────┐
-    │ GRIFFIN │  ← Convert back to audio
-    │ -LIM    │
-    └────┬────┘
-         │
-OUTPUT: High-quality animal sound
-```
-
----
-
-## Phase 14 — Pruning + Quantization 🔲
-
-**Goal:** Shrink the generator for real-time inference on edge devices.
-
-**Build this file:** `optimize.py`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| L1 unstructured pruning | `optimize.py` — remove smallest weights from generator | L3-M4 `pruning/main.py` |
-| Fine-tune after pruning | `optimize.py` — recover quality with 3-5 epochs | L3-M4 (pruning) |
-| Dynamic quantization | `optimize.py` — FP32 → INT8 for faster inference | L3-M4 `quantization/main.py` |
-| ONNX export | `optimize.py` — export optimized generator | L3-M4 `ONNX/main.py` |
-| Benchmark speed vs quality | `optimize.py` — measure latency and audio quality tradeoff | L3-M4 `metro_city/main.py` |
-
-### Optimization comparison (same as NSFW)
+### After evaluation — record results
 
 ```
 ┌──────────────────────────────────────────────┐
-│ OPTIMIZATION PIPELINE                        │
-│                                              │
-│ Original generator:  ??? ms per sound        │
-│ Pruned 30%:          ??? ms (faster?)        │
-│ Quantized INT8:      ??? ms (faster?)        │
-│ ONNX:                ??? ms (faster?)        │
-│                                              │
-│ Audio quality drop:  ???%                    │
-│ Real-time capable?   Yes/No (<100ms)         │
+│ GENERATION EVALUATION                        │
+│ Classification agreement:  ??%               │
+│ FAD score:                 ???               │
+│ Diversity score:           ???               │
+│ Real vs generated t-SNE:   ???               │
+│ Best class:                ???               │
+│ Worst class:               ???               │
 └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 15 — Deployment (Web App) 🔲
+## Phase 6 — Advanced Generation 🔲
+
+**Goal:** Push beyond basic 2-second single-animal generation.
+
+**Build these files:** `latent_mixing.py`, `sequential_generator.py`, `diffusion_refine.py`
+
+### 6a — Latent Space Mixing (Multiple Animals)
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| Latent space arithmetic | `latent_mixing.py` — vector math in z-space | L3-M2 `stable_diffusion` (latent space) |
+| Interpolation | z_dog → z_cat, decode each step → smooth transition | L3-M2 (latent arithmetic) |
+| Weighted mixing | 0.7×dog + 0.3×cat → hybrid sound | L3-M2 (prompt weighting) |
+
+```python
+# Smooth interpolation: 0% dog → 100% cat
+for alpha in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+    z_mix = (1 - alpha) * z_dog + alpha * z_cat
+    audio = decoder(z_mix)  # hear the morphing!
+
+# Three-way mix: "dog-cat-bird"
+z_mix = 0.5 * z_dog + 0.3 * z_cat + 0.2 * z_bird
+```
+
+### 6b — Longer & Sequential Sounds
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| Autoregressive generation | Predict next audio chunk from previous | L3-M3 `decoder_block` (Shakespeare generator) |
+| Overlap-add stitching | Crossfade between generated chunks | New |
+| Sequence planning | "dog bark → pause → cat meow" as a sequence | L3-M3 `translation` (seq2seq) |
+| Temperature control | Higher = more random, lower = more consistent | L3-M3 (generation temperature) |
+| Causal masking | Can only attend to past chunks (not future) | L3-M3 `decoder_block` (causal mask) |
+
+### 6c — Diffusion Refinement
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| Forward diffusion (add noise) | Gradually corrupt spectrogram | L3-M2 `stable_diffusion` (forward process) |
+| Reverse diffusion (denoise) | U-Net learns to remove noise | L3-M2 (reverse process) |
+| Conditional diffusion | Guide denoising toward target animal class | L3-M2 (text conditioning) |
+| DDPM on spectrograms | Same pipeline as DDPM bedroom model | L3-M2 (DDPM pipeline) |
+
+```
+VAE output (rough) → add noise → U-Net denoise → clean spectrogram → audio
+
+Exactly what Stable Diffusion does, but on spectrograms instead of images!
+```
+
+### After advanced generation — record results
+
+```
+┌──────────────────────────────────────────────┐
+│ ADVANCED GENERATION                          │
+│ Dog→Cat interpolation smooth?   Yes/No       │
+│ 3-way mix sounds natural?       Yes/No       │
+│ Longest sequence generated:     ??? seconds   │
+│ Diffusion quality improvement:  +???%        │
+│ Best approach overall:          ???           │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 7 — Re-practice All Techniques on the Generator 🔲
+
+**Goal:** Apply every technique from your NSFW project (and PyTorch course) to the generative model. Same concepts, different domain — this solidifies your understanding.
+
+Each sub-phase takes your working VAE generator and improves it with a technique you've already learned:
+
+### 7a — Transfer Learning for the Generator
+
+**You learned:** ResNet18 freeze/fine-tune/full retrain on images (NSFW Phase 4, L2-M2)  
+**Now apply:** Use a pretrained audio encoder (PANNs) as the encoder part of your autoencoder
+
+| Strategy | What you do | Expected result |
+|----------|------------|----------------|
+| Freeze pretrained encoder | Only train decoder | Fast, decent quality (encoder already knows audio features) |
+| Fine-tune later layers | Train last encoder layers + full decoder | Best balance — adapts features for reconstruction |
+| Full retrain | Train everything with small LR | Might overfit on 600 clips (same lesson as NSFW!) |
+
+```python
+# PANNs (Pretrained Audio Neural Networks)
+# Trained on AudioSet (2M YouTube audio clips, 527 classes)
+# Download: CNN14 weights from https://github.com/qiuqiangkong/audioset_tagging_cnn
+
+# Replace your encoder:
+pretrained_encoder = load_panns_encoder("cnn14.pth")
+# Freeze all
+for param in pretrained_encoder.parameters():
+    param.requires_grad = False
+# Your decoder stays the same — learns to decode from PANNs features
+model = ConditionalVAE(encoder=pretrained_encoder, decoder=your_decoder)
+```
+
+**Compare:** Did PANNs encoder + your decoder beat your from-scratch autoencoder?
+
+---
+
+### 7b — Optuna Tuning for the Generator
+
+**You learned:** Search CNN architecture, lr, dropout for classifier (NSFW Phase 3, L2-M1)  
+**Now apply:** Search VAE hyperparameters for best generation quality
+
+| Parameter | Search space | What it controls |
+|-----------|-------------|-----------------|
+| Latent dim | 32, 64, 128, 256 | How compressed the sound representation is |
+| Encoder depth | 2-6 conv layers | How many features extracted |
+| Decoder depth | 2-6 conv layers | How detailed the reconstruction |
+| Learning rate | 1e-5 to 1e-2 | Training speed |
+| KL loss weight (β) | 0.001 to 10.0 | Reconstruction quality vs latent organization |
+| Dropout | 0.1-0.5 | Regularization |
+| Augmentation intensity | SpecAugment params | Data robustness |
+
+```python
+# Optuna objective for GENERATION (not classification)
+def objective(trial):
+    latent_dim = trial.suggest_categorical('latent_dim', [32, 64, 128, 256])
+    kl_weight = trial.suggest_float('kl_weight', 0.001, 10.0, log=True)
+    # ... build VAE with these params ...
+    # Metric: reconstruction loss on val set (lower = better)
+    # OR: FAD score (lower = more realistic audio)
+    return val_reconstruction_loss
+```
+
+**New insight:** β (KL weight) is a hyperparameter unique to VAEs — Optuna helps find the sweet spot between sharp but mode-collapsed (β too low) vs diverse but blurry (β too high).
+
+---
+
+### 7c — Skip Connections (U-Net Architecture)
+
+**You learned:** ResidualTunedCNN skip connections `F(x) + x` (NSFW Phase 5, L3-M1)  
+**Now apply:** U-Net skip connections from encoder → decoder (different from ResNet!)
+
+```python
+# ResNet skip:   output = F(x) + x          ← same spatial size
+# U-Net skip:    encoder features → concat → decoder  ← across different levels
+
+# Your autoencoder loses fine details through pooling.
+# U-Net copies encoder features to decoder via skip connections:
+
+# Encoder:  conv1 → pool → conv2 → pool → conv3 → pool → latent
+#              ↓ skip         ↓ skip         ↓ skip
+# Decoder:  up  ← concat ← up  ← concat ← up   ← latent
+```
+
+**Compare:** U-Net reconstruction quality vs basic autoencoder. Same lesson as NSFW — skip connections preserve information that would otherwise be lost.
+
+---
+
+### 7d — Grad-CAM on Spectrograms
+
+**You learned:** Grad-CAM on images, what pixels matter for classification (NSFW Phase 6, L3-M2)  
+**Now apply:** Grad-CAM on spectrograms — what frequencies and time regions matter
+
+```python
+# Same Grad-CAM code, but overlay on spectrogram instead of image
+# For classifier:  "Why did the model predict dog?"
+#   → Grad-CAM highlights LOW frequencies (bark is low-pitched)
+
+# For VAE decoder: "Why did the decoder generate this frequency?"
+#   → Grad-CAM shows which latent dimensions activate which frequencies
+#   → Debug: if decoder ignores high frequencies, that's why bird sounds fail
+```
+
+**What you'll discover:**
+```
+Dog bark:  Grad-CAM focuses on LOW frequencies + sharp temporal onset
+Cat meow:  Grad-CAM focuses on MID frequencies + sustained tone
+Bird:      Grad-CAM focuses on HIGH frequencies + rapid patterns
+Frog:      Grad-CAM focuses on narrow frequency band + repetitive
+
+On your GENERATOR:
+If dog generation has weak low frequencies → decoder didn't learn dog's spectral profile
+→ Fix: add frequency-weighted loss or more data augmentation
+```
+
+---
+
+### 7e — Pruning + Quantization on the Generator
+
+**You learned:** Pruning removes small weights, quantization shrinks to INT8 (NSFW Phase 7b/7c, L3-M4)  
+**Now apply:** Shrink your generator for real-time sound generation
+
+```python
+# Prune the decoder (the part that runs at inference time)
+for module in generator.decoder.modules():
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        prune.l1_unstructured(module, name="weight", amount=0.3)
+
+# Fine-tune to recover quality (same as NSFW)
+# 3-5 epochs, small LR
+
+# Quantize for INT8 inference
+quantized = torch.quantization.quantize_dynamic(
+    generator, {nn.Linear}, dtype=torch.qint8
+)
+```
+
+**Measure:**
+```
+┌──────────────────────────────────────────────┐
+│ GENERATOR OPTIMIZATION                       │
+│ Original:    ??? ms per sound                │
+│ Pruned 30%:  ??? ms  Quality drop: ???%      │
+│ Quantized:   ??? ms  Quality drop: ???%      │
+│ Real-time capable? (< 100ms per sound)       │
+│                                              │
+│ Same lesson as NSFW: small models don't      │
+│ benefit much from pruning. Big models do.    │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+### Phase 7 Summary
+
+After completing all sub-phases, compare everything:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ GENERATOR COMPARISON (Audio Quality / 10)                │
+│                                                          │
+│ Phase 4:  Basic VAE (from scratch)               ???/10  │
+│ Phase 7a: VAE + PANNs transfer encoder          ???/10  │
+│ Phase 7b: VAE + Optuna-tuned architecture        ???/10  │
+│ Phase 7c: U-Net VAE + skip connections           ???/10  │
+│ Phase 7d: (diagnostic — not a model change)         —    │
+│ Phase 7e: Pruned + Quantized                     ???/10  │
+│                                                          │
+│ Best model:  ???                                         │
+│ Best approach: ???                                       │
+│ Same lessons as NSFW:                                    │
+│   - Transfer learning helps but may overfit              │
+│   - Skip connections improve generation quality          │
+│   - Small models don't benefit much from pruning         │
+│   - Optuna finds non-obvious architectures               │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 8 — Deployment (Web App) 🔲
 
 **Goal:** Deploy a web app where users click an animal button and hear generated sounds.
 
@@ -774,14 +646,13 @@ OUTPUT: High-quality animal sound
 ```
 ┌─────────────────────────────────────┐
 │   🐾 Animal Sound Generator        │
-│   Model: VAE-UNet  Size: 2.1 MB    │
+│   Model: VAE-UNet  Size: ??? MB    │
 │                                     │
 │  🐶 Dog    🐱 Cat    🐔 Rooster    │
 │  🐷 Pig    🐄 Cow    🐸 Frog       │
 │  🦗 Cricket 🐑 Sheep 🐦 Crow      │
 │                                     │
 │  Temperature: ████░░ 0.7           │
-│  Duration:    ██░░░░ 2.0s          │
 │                                     │
 │  ┌───────────────────────────────┐  │
 │  │  ▶ [Generated waveform]      │  │
@@ -809,28 +680,27 @@ animal_sound_generator/
 ├── requirements.txt
 ├── src/
 │   ├── data_loader.py             # Phase 1: Audio loading, spectrograms, dataset
-│   ├── model.py                   # Phase 2: Audio classifier (1D + 2D CNN)
-│   ├── train.py                   # Phase 2: Training pipeline (config-driven)
+│   ├── model.py                   # Phase 2: Audio classifier (2D CNN)
+│   ├── train.py                   # Phase 2: Training pipeline
 │   ├── evaluate.py                # Phase 2: Classifier evaluation
-│   ├── transfer_audio.py          # Phase 3: Transfer learning (PANNs, VGGish)
-│   ├── tuning.py                  # Phase 4: Optuna hyperparameter search
-│   ├── grad_cam_audio.py          # Phase 5: Grad-CAM on spectrograms
-│   ├── autoencoder.py             # Phase 6: Basic autoencoder
-│   ├── unet_autoencoder.py        # Phase 7: U-Net with skip connections
-│   ├── generator.py               # Phase 8: Conditional generation
-│   ├── vae.py                     # Phase 9: Variational autoencoder
-│   ├── evaluate_gen.py            # Phase 10: Generation quality metrics
-│   ├── latent_mixing.py           # Phase 11: Latent space mixing
-│   ├── sequential_generator.py    # Phase 12: Longer + sequential sounds
-│   ├── diffusion_refine.py        # Phase 13: Diffusion refinement
-│   ├── optimize.py                # Phase 14: Pruning + Quantization
-│   ├── export_onnx.py             # Phase 15: Export to ONNX
+│   ├── autoencoder.py             # Phase 3: Basic autoencoder
+│   ├── vae.py                     # Phase 4: Conditional VAE (generator)
+│   ├── evaluate_gen.py            # Phase 5: Generation quality metrics
+│   ├── latent_mixing.py           # Phase 6a: Latent space mixing
+│   ├── sequential_generator.py    # Phase 6b: Longer + sequential sounds
+│   ├── diffusion_refine.py        # Phase 6c: Diffusion refinement
+│   ├── transfer_generator.py      # Phase 7a: Transfer learning on generator
+│   ├── tuning.py                  # Phase 7b: Optuna for generator
+│   ├── unet_vae.py                # Phase 7c: U-Net skip connections
+│   ├── grad_cam_audio.py          # Phase 7d: Grad-CAM on spectrograms
+│   ├── optimize.py                # Phase 7e: Pruning + Quantization
+│   ├── export_onnx.py             # Phase 8: Export to ONNX
 │   └── helper_utils.py            # Shared utilities
 │
 ├── client/
-│   ├── server.py                  # Phase 15: FastAPI backend
-│   ├── start.py                   # Phase 15: One-command launcher
-│   └── frontend/                  # Phase 15: React frontend
+│   ├── server.py                  # Phase 8: FastAPI backend
+│   ├── start.py                   # Phase 8: One-command launcher
+│   └── frontend/                  # Phase 8: React frontend
 │
 ├── documents/                     # Learning notes per phase
 ├── models/                        # Saved checkpoints
@@ -845,21 +715,19 @@ animal_sound_generator/
 | Phase | Description | File | Course Reference | Status |
 |-------|------------|------|-----------------|--------|
 | 1 | Audio data loading & spectrograms | `data_loader.py` | L1-M3 (datasets) | 🔲 |
-| 2a | Audio classifier (2D CNN) | `model.py`, `train.py` | L1-M4 (CNN) | 🔲 |
-| 2b | Evaluate classifier | `evaluate.py` | L3-M2 (interpreting) | 🔲 |
-| 3 | Transfer learning (PANNs/VGGish) | `transfer_audio.py` | L2-M2 (transfer_learning) | 🔲 |
-| 4 | Optuna hyperparameter tuning | `tuning.py` | L2-M1 (optuna) | 🔲 |
-| 5 | Grad-CAM for audio | `grad_cam_audio.py` | L3-M2 (saliency_and_class_activation_map) | 🔲 |
-| 6 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | 🔲 |
-| 7 | U-Net with skip connections | `unet_autoencoder.py` | L3-M1 (resnet) | 🔲 |
-| 8 | Conditional generation | `generator.py` | L3-M3 (decoder, conditioning) | 🔲 |
-| 9 | VAE (diverse generation) | `vae.py` | L3-M2 (noise, sampling) | 🔲 |
-| 10 | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics) | 🔲 |
-| 11 | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion) | 🔲 |
-| 12 | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
-| 13 | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
-| 14 | Pruning + Quantization | `optimize.py` | L3-M4 (pruning, quantization) | 🔲 |
-| 15 | Deployment (web app) | `client/` | L3-M4 (ONNX, MLflow, deployment) | 🔲 |
+| 2 | Audio classifier baseline | `model.py`, `train.py`, `evaluate.py` | L1-M4 (CNN) | 🔲 |
+| 3 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | 🔲 |
+| 4 | Conditional VAE (generate by class) | `vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | 🔲 |
+| 5 | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | 🔲 |
+| 6a | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
+| 6b | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
+| 6c | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
+| 7a | Transfer learning (PANNs encoder) | `transfer_generator.py` | L2-M2 (transfer_learning) | 🔲 |
+| 7b | Optuna tuning (generator architecture) | `tuning.py` | L2-M1 (optuna) | 🔲 |
+| 7c | U-Net skip connections | `unet_vae.py` | L3-M1 (resnet) | 🔲 |
+| 7d | Grad-CAM on spectrograms | `grad_cam_audio.py` | L3-M2 (saliency_and_class_activation_map) | 🔲 |
+| 7e | Pruning + Quantization | `optimize.py` | L3-M4 (pruning, quantization) | 🔲 |
+| 8 | Deployment (web app) | `client/` | L3-M4 (ONNX, MLflow, deployment) | 🔲 |
 
 ---
 
@@ -878,15 +746,15 @@ pandas>=2.0          # ESC-50 metadata CSV
 scikit-learn>=1.3    # Metrics, t-SNE
 
 # Training
-optuna>=3.4          # Hyperparameter tuning (Phase 4)
-mlflow>=2.8          # Experiment tracking (all phases)
+optuna>=3.4          # Phase 7b: Hyperparameter tuning
+mlflow>=2.8          # All phases: Experiment tracking
 
 # Audio
 librosa>=0.10        # Advanced audio processing
 soundfile>=0.12      # Save .wav files
 
 # Transfer learning
-panns-inference>=0.1 # PANNs pretrained models (Phase 3)
+panns-inference>=0.1 # Phase 7a: PANNs pretrained models
 
 # Deployment
 fastapi>=0.104
@@ -908,10 +776,11 @@ python-multipart>=0.0.6
 | No decoder needed | Decoder is the core component |
 | 2D convolutions on images | 2D conv on spectrograms OR 1D conv on waveforms |
 | Last layer: Linear(256, 5) | Last layer: ConvTranspose2d (expand to full spectrogram) |
-| ResNet18 transfer learning | PANNs/VGGish transfer learning |
-| Residual connections (ResidualTunedCNN) | U-Net skip connections (encoder → decoder) |
-| Grad-CAM on images | Grad-CAM on spectrograms |
-| Pruning/Quantization on classifier | Pruning/Quantization on generator |
+| ResNet18 transfer learning | PANNs transfer learning (Phase 7a) |
+| ResidualTunedCNN skip connections | U-Net skip connections (Phase 7c) |
+| Grad-CAM on images | Grad-CAM on spectrograms (Phase 7d) |
+| Optuna for classifier | Optuna for generator (Phase 7b) |
+| Pruning/Quantization on classifier | Pruning/Quantization on generator (Phase 7e) |
 
 ---
 
@@ -923,20 +792,13 @@ Same as NSFW project:
 Listen → measure → improve → listen again
 
 Phase 1:  Understand the data (spectrograms, waveforms)
-Phase 2:  Baseline classifier (what features matter?)
-Phase 3:  Transfer learning (biggest accuracy jump?)
-Phase 4:  Optuna tuning (push architecture to its limit)
-Phase 5:  Grad-CAM (what does the model focus on?)
-Phase 6:  Autoencoder (can we compress and reconstruct?)
-Phase 7:  U-Net (do skip connections help?)
-Phase 8:  Conditional generation (can we generate BY CLASS?)
-Phase 9:  VAE (can we generate DIFFERENT sounds?)
-Phase 10: Quality evaluation (how GOOD are they?)
-Phase 11: Mixing (can we blend animals?)
-Phase 12: Sequences (can we make longer sounds?)
-Phase 13: Diffusion (can we make them even better?)
-Phase 14: Optimize (can we make generation faster?)
-Phase 15: Deploy (can anyone use it?)
+Phase 2:  Baseline classifier (what features matter? reusable evaluator)
+Phase 3:  Autoencoder (can we compress and reconstruct?)
+Phase 4:  Conditional VAE (can we generate BY CLASS? diverse?)
+Phase 5:  Evaluation (how GOOD are they?)
+Phase 6:  Advanced (mixing, longer, diffusion)
+Phase 7:  Re-practice ALL techniques on the generator
+Phase 8:  Deploy (can anyone use it?)
 ```
 
-Every phase builds on the previous one. The classifier from Phase 2 becomes the evaluator in Phase 10. The autoencoder from Phase 6 becomes the generator in Phase 8. The U-Net from Phase 7 becomes the denoiser in Phase 13.
+Every phase builds on the previous one. The classifier from Phase 2 becomes the evaluator in Phase 5. The autoencoder from Phase 3 becomes the generator in Phase 4. Phase 7 applies every technique from your NSFW project to the new domain — same concepts, deeper understanding.
