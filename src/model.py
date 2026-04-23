@@ -89,54 +89,31 @@ class SimpleAudioCNN(nn.Module):
         return x
 
 
-# ==================== 
-"""
-    SimpleEncoderBlock — one building block for the Audio Autoencoder (spectrogram version)
+class SimpleEncoderBlock(nn.Module):
+    """
+    Encoder building block: Conv2d(stride=2) → BatchNorm → ReLU
     
-    ────────────────────────────────────────────────────────────────
-    KEY CONCEPT FOR AUDIO (exactly like the image case you already know)
-    ────────────────────────────────────────────────────────────────
-    A mel-spectrogram is treated as a grayscale "image":
+    Uses stride=2 in Conv2d instead of MaxPool2d to downsample.
     
-        Input shape: [batch, 1, 64, 552]
+    WHY: MaxPool2d keeps only the MAX value in each 2×2 window →
+         throws away 75% of values irreversibly. The decoder can never
+         recover what MaxPool discarded, which hurts reconstruction.
     
-        • Height = 64  → Number of Mel-frequency bins
-          (This is the vertical axis = frequency information)
-          The Mel scale splits the frequency range in a way that mimics
-          how human ears hear (more detail at low frequencies).
-    
-        • Width  = 552 → Number of time frames
-          (This is the horizontal axis = time information)
-          Comes from 5-second audio @ 22,050 Hz sample rate + typical
-          hop_length ≈ 200 samples per frame.
-          Result: each column represents roughly ~9 ms of audio.
-    
-    Analogy to regular images:
-        Photo      → [B, 3, 128, 128]  (128 vertical pixels × 128 horizontal pixels)
-        Spectrogram→ [B, 1,  64, 552]  ( 64 frequency "pixels" × 552 time "pixels")
-    
-    The CNN doesn't know it's audio — it just sees a 64×552 grayscale picture!
-    ────────────────────────────────────────────────────────────────
-    
-    What this block actually does:
-      Conv2d (3×3, padding=1) → BatchNorm2d → ReLU → MaxPool2d(2,2)
+         Conv2d with stride=2 lets the model LEARN what to keep.
+         It's a learned downsampling instead of a hardcoded max rule.
     
     Effect on dimensions (starting from 64×552):
-      After 1 block → height/2, width/2  → 32×276
+      After 1 block → 32×276    (stride=2 halves both dims)
       After 2 blocks → 16×138
       After 3 blocks → 8×69
-      After 4 blocks → 4×34   (this is what the autoencoder encoder uses)
+      After 4 blocks → 4×35
     """
-# ==================== 
-
-class SimpleEncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
         super(SimpleEncoderBlock, self).__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=2, padding=padding),
             nn.BatchNorm2d(num_features=out_channels),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2),
         )
     
     def forward(self, x):
@@ -161,30 +138,27 @@ class SimpleDecoderBlock(nn.Module):
 
 class SimpleAudioAutoencoder(nn.Module):
     """
-    All input spectrograms are [B, 1, 64, 552] (64 mel bins, 552 time frames for 5s @ 22050Hz).
+    Autoencoder: spectrogram → encoder → latent vector → decoder → reconstructed spectrogram.
 
-    ENCODER:
-      Input:                          [B, 1, 64, 552]
-      EncoderBlock(1→32)   MaxPool   [B, 32, 32, 276]
-      EncoderBlock(32→64)  MaxPool   [B, 64, 16, 138]
-      EncoderBlock(64→128) MaxPool   [B, 128, 8, 69]
-      EncoderBlock(128→256)MaxPool   [B, 256, 4, 34]
-      Flatten:                        [B, 256*4*34] = [B, 34,816]
+    ENCODER (stride=2 Conv2d — no MaxPool, so model learns what to keep):
+      Input:                              [B, 1, 64, 552]    35,328 px
+      EncoderBlock(1→32)     stride=2    [B, 32, 32, 276]   8,832 px
+      EncoderBlock(32→64)    stride=2    [B, 64, 16, 138]   3,532 px
+      EncoderBlock(64→128)   stride=2    [B, 128, 8, 69]    1,766 px
+      EncoderBlock(128→256)  stride=2    [B, 256, 4, 35]    896 px
+      Flatten:                            [B, 256×4×35] = [B, 35,840]
 
-    LATENT:
-      Linear(34,816 → latent_dim):   [B, 256]        ← compressed!
+    BOTTLENECK (where information is compressed):
+      fc_encode: Linear(35,840 → 1024)   [B, 1024]   ← 35× compression (was 138× with dim=256)
+      fc_decode: Linear(1024 → 35,840)   [B, 35,840]
+      Reshape:                            [B, 256, 4, 35]   tiny blurry thumbnail
 
-    DECODER:
-      Linear(latent_dim → 34,816):   [B, 34,816]
-      Reshape:                        [B, 256, 4, 34]
-      DecoderBlock(256→128):          [B, 128, 8, 68]    ← 34*2=68, not 69!
-      DecoderBlock(128→64):           [B, 64, 16, 136]   ← 68*2=136, not 138!
-      DecoderBlock(64→32):            [B, 32, 32, 272]   ← 136*2=272, not 276!
-      DecoderBlock(32→1):             [B, 1, 64, 544]    ← 272*2=544, not 552!
-
-      ⚠️ 544 ≠ 552 — off by 8 time frames. Fix needed!
-      # After DecoderBlock(32→1): [B, 1, 64, 544]
-      output = nn.functional.interpolate(output, size=(64, 552), mode='bilinear')
+    DECODER (ConvTranspose2d doubles dimensions each step):
+      DecoderBlock(256→128):              [B, 128, 8, 70]
+      DecoderBlock(128→64):               [B, 64, 16, 140]
+      DecoderBlock(64→32):                [B, 32, 32, 280]
+      DecoderBlock(32→1):                 [B, 1, 64, 560]
+      Interpolate:                        [B, 1, 64, 552]   ← stretch 560→552 to match input
     """
     def __init__(self, latent_dim=256):
         super(SimpleAudioAutoencoder, self).__init__()
@@ -195,7 +169,7 @@ class SimpleAudioAutoencoder(nn.Module):
             SimpleEncoderBlock(128, 256),
         )
 
-        self.flat_dim = 256 * 4 * 34
+        self.flat_dim = 256 * 4 * 35  # 35,840 (stride=2: 552→276→138→69→35)
         self.fc_encode = nn.Linear(self.flat_dim, latent_dim)
         self.fc_decode = nn.Linear(latent_dim, self.flat_dim)
 
@@ -217,7 +191,7 @@ class SimpleAudioAutoencoder(nn.Module):
 
         # Decode
         z = self.fc_decode(z)
-        z = z.view(-1, 256, 4, 34)
+        z = z.view(-1, 256, 4, 35)
         z = self.decode(z)
 
         # Fix size mismatch (544 -> 552)
