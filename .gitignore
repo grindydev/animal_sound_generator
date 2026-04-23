@@ -1,0 +1,58 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Environment
+.env
+.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (too large for git)
+data/esc50_audio/
+data/fsd50k_metadata/clips/
+data/animal_audio/
+
+# Model checkpoints (large binary files)
+models/*.pth
+models/*.onnx
+models/*.onnx.data
+models/*.pkl
+models/*.db
+
+# Generated outputs
+outputs/
+generated_audio/
+grad_cam_results/
+
+# MLflow
+mlruns/
+
+# Frontend
+client/frontend/node_modules/
+client/frontend/dist/
+
+# Logs
+*.log
+*.sqlite
+*.sqlite3

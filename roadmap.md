@@ -17,37 +17,39 @@ This is a **generative modeling** task — fundamentally different from classifi
 
 ## Dataset
 
-**ESC-50: Dataset for Environmental Sound Classification**
+**FSD50K: Larger and richer than ESC-50**
 
-- 2,000 audio recordings, 50 classes, 5 seconds each
-- We'll use the animal subset (~600 clips): `dog`, `rooster`, `pig`, `cow`, `frog`, `cat`, `hen`, `insects`, `sheep`, `crow`
-- Download: https://github.com/karolpiczak/ESC-50
+- 51,197 audio recordings with human-labeled sound events
+- We use an animal sound subset (3,001 clips): `Dog`, `Cat`, `Rooster`, `Frog`, `Crow`, `Insect`, `Hen`, `Noise`
+- Variable-length clips (1–30 seconds, no cropping)
+- Download script: `python scripts/download_data.py` (pulls only needed files via Git LFS)
 
-```bash
-mkdir -p data
-cd data
-wget https://github.com/karolpiczak/ESC-50/archive/master.zip
-unzip master.zip
-mv ESC-50-master/audio esc50_audio
-rm -rf ESC-50-master master.zip
-```
-
-Expected structure:
 ```
 data/
-└── esc50_audio/
-    ├── 1-100032-A-0.wav      ← {fold}-{id}-{take}-{class_id}.wav
-    ├── 1-100038-A-14.wav
-    └── ...
+├── animal_audio/              # Playable .wav files organized by class
+│   ├── metadata.csv           # fname, label, split
+│   ├── Dog/       (750 files)
+│   ├── Cat/       (303 files)
+│   ├── Rooster/   (136 files)
+│   ├── Frog/       (61 files)
+│   ├── Crow/       (72 files)
+│   ├── Insect/    (371 files)
+│   ├── Hen/        (86 files)
+│   └── Noise/    (1222 files)
+└── fsd50k_metadata/           # FSD50K repo (labels, LFS cache)
 ```
 
-Class mapping in ESC-50 CSV (we'll filter to animal classes):
+Class mapping (AudioSet mids → display name):
 ```
-0: dog, 1: rooster, 2: pig, 3: cow, 4: frog,
-5: cat, 6: hen, 7: insects, 8: sheep, 9: crow
+Dog:      /m/0bt9lr (Dog), /m/05tny_ (Bark)
+Cat:      /m/01yrx (Cat), /m/07qrkrw (Meow)
+Rooster:  /m/09b5t (Chicken_and_rooster)
+Frog:     /m/09ld4 (Frog)
+Crow:     /m/04s8yn (Crow)
+Insect:   /m/03vt0 (Insect), /m/09xqv (Cricket)
+Hen:      /m/025rv6n (Fowl)
+Noise:    /m/0btp2 (Traffic), /m/06mb1 (Rain), /m/0ngt1 (Thunder), /m/03m9d0z (Wind)
 ```
-
-**Important:** Crop all clips to 2 seconds (loudest part) for faster training.
 
 ---
 
@@ -113,50 +115,63 @@ Audio generation introduces concepts your NSFW project didn't cover:
 
 ---
 
-## Phase 1 — Understand Audio Data 🔲
+## Phase 1 — Understand Audio Data ✅
 
 **Goal:** Learn to load, visualize, and transform audio files. Build a dataset.
 
-**Build this file:** `data_loader.py`
+**Build this file:** `data_loader.py` ✅
 
-### What you'll practice
+### What you practiced
 
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Loading .wav files | `data_loader.py` — `torchaudio.load()` | New (not in course) |
-| Waveform visualization | `data_loader.py` — matplotlib | — |
-| Mel-spectrogram conversion | `data_loader.py` — `torchaudio.transforms.MelSpectrogram` | New — audio's equivalent of image transforms |
-| STFT (Short-Time Fourier Transform) | Theory — sliding window FFT | New |
-| Log-mel scaling | `data_loader.py` — `AmplitudeToDB()` | Like normalization in NSFW (mean/std) |
-| Custom AudioDataset | `data_loader.py` — `__getitem__` returns (spectrogram, label) | L1-M3 `data_management/main.py` |
-| Train/val/test split | Same as NSFW project | L1-M3 |
-| Crop to 2 seconds | Energy-based windowing (loudest 2s) | New |
-| Audio augmentation | Time shift, noise, pitch shift, SpecAugment | L1-M3 (augmentation) |
+| Concept | Where | Status |
+|---------|-------|--------|
+| Loading .wav files | `data_loader.py` — `torchaudio.load()` | ✅ |
+| Mel-spectrogram conversion | `data_loader.py` — `T.MelSpectrogram()` in `get_transformations()` | ✅ |
+| Log-mel scaling | `data_loader.py` — `T.AmplitudeToDB()` in `get_transformations()` | ✅ |
+| Custom AudioDataset | `data_loader.py` — `__getitem__` returns (waveform, label) | ✅ |
+| Train/val/test split | `get_dataloaders()` — `random_split()` seeded with manual_seed(42) | ✅ |
+| Variable-length audio | `collate_fn()` pads waveforms to batch max length (no cropping!) | ✅ |
+| Audio augmentation | Time shift, noise, SpecAugment — TODO in `get_transformations()` | 🔲 later |
+| Waveform visualization | matplotlib — TODO (optional, for learning) | 🔲 later |
 
-### Key insight: Audio as Images
+### Architecture Decision: Option B — Pad waveforms, batch transform on GPU
+
+Instead of cropping all clips to a fixed 2 seconds (losing data), we keep the full
+audio and pad variable-length waveforms in `collate_fn`. The MelSpectrogram transform
+runs on GPU in the training loop for speed.
 
 ```
-Image:   [3 channels × height × width]    → 2D convolutions
-Audio:   [1 channel  × freq   × time ]    → 2D convolutions on spectrogram
-         OR
-Audio:   [1 channel × samples         ]    → 1D convolutions on raw waveform
-
-Spectrogram = 2D image where:
-  Y-axis = frequency (low → high)
-  X-axis = time
-  Pixel brightness = energy at that frequency & time
+Flow:
+  __getitem__()       → raw waveform [1, variable_samples]
+      ↓
+  collate_fn()        → pad to [batch, 1, max_samples_in_batch]
+      ↓
+  train.py:
+    train_tfm()       → MelSpectrogram + AmplitudeToDB on GPU
+                       → [batch, 1, 128, time_frames]
+      ↓
+  model()             → CNN → AdaptiveAvgPool → classifier
 ```
 
-### After this phase — record observations
+### Observations
 
 ```
 ┌──────────────────────────────────────────────┐
-│ AUDIO DATA EXPLORATION                       │
-│ Sample rate:     ??? Hz (usually 44100)       │
-│ Duration:        2 seconds (cropped)          │
-│ Spectrogram shape: [1, 128 mel bins, ??? frames] │
-│ Animal classes:  5-10                         │
-│ Clips per class: ~60                          │
+│ AUDIO DATA EXPLORATION — RESULTS             │
+│ Dataset: FSD50K (not ESC-50 — richer!)       │
+│ Sample rate:     44100 Hz                    │
+│ Duration:        variable (1–30s, no crop)   │
+│ Spectrogram:     [batch, 1, 128, time]       │
+│ Value range:     -57.4 to 40.6 dB            │
+│ Classes:         8 (Dog, Cat, Rooster,       │
+│                  Frog, Crow, Insect,         │
+│                  Hen, Noise)                  │
+│ Total samples:   3,001                       │
+│   Train: 2,100 (70%)                         │
+│   Val:     450 (15%)                         │
+│   Test:    451 (15%)                         │
+│ Per class:  61–1,222 files                   │
+│ Download: scripts/download_data.py           │
 └──────────────────────────────────────────────┘
 ```
 
@@ -679,7 +694,7 @@ animal_sound_generator/
 ├── README.md
 ├── requirements.txt
 ├── src/
-│   ├── data_loader.py             # Phase 1: Audio loading, spectrograms, dataset
+│   ├── data_loader.py             # Phase 1: ✅ Audio loading, spectrograms, variable-length padding, dataset
 │   ├── model.py                   # Phase 2: Audio classifier (2D CNN)
 │   ├── train.py                   # Phase 2: Training pipeline
 │   ├── evaluate.py                # Phase 2: Classifier evaluation
@@ -705,7 +720,8 @@ animal_sound_generator/
 ├── documents/                     # Learning notes per phase
 ├── models/                        # Saved checkpoints
 └── data/
-    └── esc50_audio/               # ESC-50 dataset
+    ├── animal_audio/            # FSD50K animal clips (3,001 files)
+    └── fsd50k_metadata/         # FSD50K labels & LFS cache
 ```
 
 ---
@@ -714,7 +730,7 @@ animal_sound_generator/
 
 | Phase | Description | File | Course Reference | Status |
 |-------|------------|------|-----------------|--------|
-| 1 | Audio data loading & spectrograms | `data_loader.py` | L1-M3 (datasets) | 🔲 |
+| 1 | Audio data loading & spectrograms | `data_loader.py` | L1-M3 (datasets) | ✅ |
 | 2 | Audio classifier baseline | `model.py`, `train.py`, `evaluate.py` | L1-M4 (CNN) | 🔲 |
 | 3 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | 🔲 |
 | 4 | Conditional VAE (generate by class) | `vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | 🔲 |
@@ -742,7 +758,7 @@ numpy>=1.24
 matplotlib>=3.7
 
 # Data
-pandas>=2.0          # ESC-50 metadata CSV
+pandas>=2.0          # data handling
 scikit-learn>=1.3    # Metrics, t-SNE
 
 # Training
