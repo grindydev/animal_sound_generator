@@ -3,44 +3,57 @@
 download_data.py — Download animal sound clips from FSD50K
 ===========================================================
 
-Pulls only the files you need via Git LFS and organizes them into
-data/animal_audio/{Class}/ folders with a metadata.csv.
-
-Edit the CONFIG section below to change which classes and how many
-files per class to download.
+Downloads ONLY the files for the 8 configured animal classes directly
+via HTTP from HuggingFace. No git clone, no Git LFS — just the files
+you actually need.
 
 Usage:
-    # Download everything available (default):
-    python scripts/download_data.py
-
-    # Already cloned, just re-run to change counts:
     python scripts/download_data.py
 
 Requirements:
-    - git and git-lfs installed (brew install git-lfs)
+    - Python 3.10+
+    - requests (pip install requests)
 """
 
 import csv
+import io
 import os
-import shutil
-import subprocess
+import socket
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import requests
+except ImportError:
+    print("ERROR: 'requests' is required. Install with: pip install requests")
+    sys.exit(1)
+
+# Force IPv4 — avoids slow IPv6 timeouts when connecting to HF CDN
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_only
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  CONFIG — edit this to change what gets downloaded          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-# FSD50K HuggingFace repo
-FSD50K_REPO = "https://huggingface.co/datasets/Fhrozen/FSD50k"
+# FSD50K HuggingFace repo (used for HTTP download URLs)
+HF_REPO = "Fhrozen/FSD50k"
+HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main"
 
-# Where data lives (relative to project root)
+# Where to put output (relative to project root)
 DATA_DIR = "data"
-FSD50K_DIR = os.path.join(DATA_DIR, "fsd50k_metadata")
+LABELS_DIR = os.path.join(DATA_DIR, "fsd50k_labels")
 OUTPUT_DIR = os.path.join(DATA_DIR, "animal_audio")
 
 # Classes to download
 # Each entry: { display_name: [list of FSD50K AudioSet mids] }
-# Find more mids in: data/fsd50k_metadata/labels/vocabulary.csv
 CLASS_MIDS = {
     "Dog":      ["/m/0bt9lr", "/m/05tny_"],          # Dog, Bark
     "Cat":      ["/m/01yrx", "/m/07qrkrw"],           # Cat, Meow
@@ -52,27 +65,11 @@ CLASS_MIDS = {
     "Noise":    ["/m/0btp2", "/m/06mb1", "/m/0ngt1", "/m/03m9d0z"],  # Traffic, Rain, Thunder, Wind
 }
 
-# Maximum files available per class in FSD50K (as of 2024):
-#
-#   Class      Total    Max train  Max val  Max test   Source labels
-#   ─────────  ───────  ─────────  ───────  ────────   ──────────────────────────────
-#   Dog          750       525       112      113       Dog (/m/0bt9lr), Bark (/m/05tny_)
-#   Noise      1,222       855       183      184       Traffic, Rain, Thunder, Wind
-#   Insect       371       259        55       57       Insect (/m/03vt0), Cricket (/m/09xqv)
-#   Cat          303       212        45       46       Cat (/m/01yrx), Meow (/m/07qrkrw)
-#   Rooster      136        95        20       21       Chicken_and_rooster (/m/09b5t)
-#   Hen           86        60        12       14       Fowl (/m/025rv6n)
-#   Crow          72        50        10       12       Crow (/m/04s8yn)
-#   Frog          61        42         9       10       Frog (/m/09ld4)
-#   ─────────  ───────  ─────────  ───────  ────────
-#   TOTAL      3,001     2,098      446      457
-#
-# These are the hard limits. If FILES_PER_CLASS exceeds them, you just get the max.
-
-# Files per class — set to None to download ALL available.
-# If you set a number, that class will be capped.
-# Example:  {"Dog": None, "Frog": 50}  → all dogs, max 50 frogs
+# Files per class — set to None for ALL available, or an int to cap.
 FILES_PER_CLASS = None
+
+# Parallel download threads (increase for faster networks)
+DOWNLOAD_WORKERS = 8
 
 # How to split each class's files into train/val/test (percentages)
 SPLIT_RATIOS = {
@@ -86,39 +83,57 @@ SPLIT_RATIOS = {
 # ╚══════════════════════════════════════════════════════════════╝
 
 
-def run(cmd: str, check: bool = True) -> str:
-    """Run shell command and return output."""
-    print(f"  $ {cmd}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        print(f"  ERROR: {result.stderr.strip()}")
-        sys.exit(1)
-    return result.stdout.strip()
-
-
 def find_project_root() -> str:
-    """Find project root by looking for roadmap.md."""
+    """Find project root by walking up from this script."""
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.dirname(here)
 
 
-def clone_fsd50k(fsd50k_dir: str):
-    """Clone FSD50K repo if not already present."""
-    if os.path.exists(fsd50k_dir):
-        print(f"✓ FSD50K repo already exists at {fsd50k_dir}")
-        return
-
-    print(f"\n[1/4] Cloning FSD50K repo (metadata only, no audio yet)...")
-    run(f"git clone {FSD50K_REPO} {fsd50k_dir}")
-    print("  Clone done.")
+def download_text(url: str, desc: str = "") -> str:
+    """Download a text file from URL. Returns content as string."""
+    if desc:
+        print(f"  Downloading {desc}...")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
-def init_lfs(fsd50k_dir: str):
-    """Ensure Git LFS is installed and initialized."""
-    print(f"\n[2/4] Setting up Git LFS...")
-    run("git lfs version", check=True)
-    run(f"cd {fsd50k_dir} && git lfs install")
-    print("  LFS ready.")
+# Shared session for connection pooling
+_session = requests.Session()
+_session.headers.update({"User-Agent": "animal-sound-downloader/1.0"})
+
+
+def download_file(url: str, dest: str) -> tuple[str, bool]:
+    """Download a binary file. Returns (fname, success)."""
+    fname = os.path.basename(dest)
+    try:
+        resp = _session.get(url, timeout=60, stream=True)
+        resp.raise_for_status()
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+        return (fname, True)
+    except Exception as e:
+        print(f"    FAILED {fname}: {e}")
+        return (fname, False)
+
+
+def fetch_labels_csv(labels_dir: str) -> str:
+    """Ensure dev.csv is available locally. Download if missing."""
+    dev_csv = os.path.join(labels_dir, "dev.csv")
+    if os.path.exists(dev_csv):
+        print(f"  Using cached {dev_csv}")
+        with open(dev_csv) as f:
+            return f.read()
+
+    print(f"  Fetching dev.csv from HuggingFace (~2 MB)...")
+    content = download_text(f"{HF_BASE_URL}/labels/dev.csv", "dev.csv")
+    os.makedirs(labels_dir, exist_ok=True)
+    with open(dev_csv, "w") as f:
+        f.write(content)
+    print(f"  Saved to {dev_csv}")
+    return content
 
 
 def resolve_limit(label: str) -> int | None:
@@ -132,9 +147,12 @@ def resolve_limit(label: str) -> int | None:
     return None
 
 
-def build_subset(fsd50k_dir: str) -> list[tuple[str, str, str]]:
-    """Build list of (fname, label, split) from FSD50K dev.csv."""
-    print(f"\n[3/4] Selecting files from FSD50K labels...")
+def build_subset(csv_text: str) -> list[tuple[str, str, str]]:
+    """Parse dev.csv and select files matching our classes.
+
+    Returns list of (fname, label, split).
+    """
+    print("\n  Selecting files for target classes...")
 
     # Build mid → label lookup
     mid_to_label: dict[str, str] = {}
@@ -142,55 +160,45 @@ def build_subset(fsd50k_dir: str) -> list[tuple[str, str, str]]:
         for mid in mids:
             mid_to_label[mid] = label
 
-    dev_csv = os.path.join(fsd50k_dir, "labels", "dev.csv")
-    if not os.path.exists(dev_csv):
-        print(f"  ERROR: {dev_csv} not found. Did the clone succeed?")
-        sys.exit(1)
+    # Collect matching files grouped by label
+    by_label: dict[str, list[str]] = {}
+    seen: set[str] = set()
 
-    # Collect all matching files, grouped by label
-    by_label: dict[str, list[str]] = {}  # label → [fname, ...]
-    seen_fnames: set[str] = set()
-
-    with open(dev_csv) as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            fname = row[0]
-            mids = row[2].split(",")
-            if fname in seen_fnames:
-                continue
-            for mid in mids:
-                if mid in mid_to_label:
-                    label = mid_to_label[mid]
-                    by_label.setdefault(label, []).append(fname)
-                    seen_fnames.add(fname)
-                    break
+    reader = csv.reader(io.StringIO(csv_text))
+    next(reader)  # skip header
+    for row in reader:
+        fname = row[0]
+        mids = row[2].split(",")
+        if fname in seen:
+            continue
+        for mid in mids:
+            if mid in mid_to_label:
+                label = mid_to_label[mid]
+                by_label.setdefault(label, []).append(fname)
+                seen.add(fname)
+                break
 
     # Split ratios
-    ratio_train = SPLIT_RATIOS["train"]
-    ratio_val = SPLIT_RATIOS["val"]
-    ratio_test = SPLIT_RATIOS["test"]
-    ratio_sum = ratio_train + ratio_val + ratio_test
+    rt = SPLIT_RATIOS["train"]
+    rv = SPLIT_RATIOS["val"]
+    rsum = rt + rv + SPLIT_RATIOS["test"]
 
-    # Select & split per class
     result: list[tuple[str, str, str]] = []
     print()
     for label in sorted(by_label.keys()):
         fnames = by_label[label]
         limit = resolve_limit(label)
 
-        # Cap if limit set
         if limit is not None and limit < len(fnames):
             fnames = fnames[:limit]
             capped = f" (capped from {len(by_label[label])})"
         else:
             capped = ""
 
-        # Split into train/val/test
         n = len(fnames)
-        n_train = int(n * ratio_train / ratio_sum)
-        n_val = int(n * ratio_val / ratio_sum)
-        n_test = n - n_train - n_val  # remainder goes to test
+        n_train = int(n * rt / rsum)
+        n_val = int(n * rv / rsum)
+        n_test = n - n_train - n_val
 
         for fname in fnames[:n_train]:
             result.append((fname, label, "train"))
@@ -199,52 +207,53 @@ def build_subset(fsd50k_dir: str) -> list[tuple[str, str, str]]:
         for fname in fnames[n_train + n_val:]:
             result.append((fname, label, "test"))
 
-        print(f"  {label:10s}  {n:4d} files  ({n_train} train + {n_val} val + {n_test} test){capped}")
+        print(f"    {label:10s}  {n:4d} files  ({n_train} train + {n_val} val + {n_test} test){capped}")
 
-    print(f"  {'TOTAL':10s}  {len(result):4d} files")
+    print(f"    {'TOTAL':10s}  {len(result):4d} files")
     return result
 
 
-def pull_and_organize(fsd50k_dir: str, output_dir: str, subset: list[tuple[str, str, str]]):
-    """Git LFS pull selected files, then copy to organized folders."""
-    print(f"\n[4/4] Downloading & organizing audio files...")
+def download_audio(output_dir: str, subset: list[tuple[str, str, str]]):
+    """Download WAV files in parallel directly from HuggingFace."""
+    print(f"\n  Downloading audio files via HTTP ({DOWNLOAD_WORKERS} workers)...\n")
 
-    audio_src = os.path.join(fsd50k_dir, "clips", "dev")
-
-    # Build list of files that need pulling
-    to_pull: list[str] = []
-    for fname, _, _ in subset:
-        path = os.path.join(audio_src, f"{fname}.wav")
-        if not os.path.exists(path) or os.path.getsize(path) < 200:
-            to_pull.append(f"clips/dev/{fname}.wav")
-
-    # Pull via LFS in batches if many files (shell argument length limit)
-    if to_pull:
-        print(f"  Pulling {len(to_pull)} files via Git LFS...")
-        batch_size = 200
-        for i in range(0, len(to_pull), batch_size):
-            batch = to_pull[i:i + batch_size]
-            include_str = ",".join(batch)
-            run(f"cd {fsd50k_dir} && git lfs pull --include=\"{include_str}\"")
-        print("  LFS pull done.")
-    else:
-        print("  All files already downloaded.")
-
-    # Copy to organized output
+    # Clear previous output
     if os.path.exists(output_dir):
+        import shutil
         shutil.rmtree(output_dir)
 
-    skipped = 0
-    for fname, label, split in subset:
-        src = os.path.join(audio_src, f"{fname}.wav")
-        dest_dir = os.path.join(output_dir, label)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, f"{fname}.wav")
+    total = len(subset)
+    done = 0
+    failed = 0
+    t0 = time.time()
 
-        if os.path.exists(src) and os.path.getsize(src) > 200:
-            shutil.copy2(src, dest)
-        else:
-            skipped += 1
+    def _job(item):
+        fname, label, split = item
+        dest_dir = os.path.join(output_dir, label)
+        dest = os.path.join(dest_dir, f"{fname}.wav")
+        url = f"{HF_BASE_URL}/clips/dev/{fname}.wav"
+        return download_file(url, dest)
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = {pool.submit(_job, item): item for item in subset}
+        for future in as_completed(futures):
+            done += 1
+            fname, ok = future.result()
+            if not ok:
+                failed += 1
+            if done % 50 == 0 or done == total:
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                print(f"    [{done * 100 // total:3d}%] {done}/{total} done, "
+                      f"{rate:.1f} files/s, ETA {eta:.0f}s")
+
+    elapsed = time.time() - t0
+    rate = done / elapsed if elapsed > 0 else 0
+    print(f"\n    Done: {done - failed}/{total} files in {elapsed:.0f}s ({rate:.1f} files/s)")
+
+    if failed:
+        print(f"    ⚠  {failed} files failed to download")
 
     # Write metadata.csv
     meta_path = os.path.join(output_dir, "metadata.csv")
@@ -253,19 +262,20 @@ def pull_and_organize(fsd50k_dir: str, output_dir: str, subset: list[tuple[str, 
         writer.writerow(["fname", "label", "split"])
         for fname, label, split in subset:
             writer.writerow([fname, label, split])
+    print(f"    metadata.csv written")
 
-    if skipped:
-        print(f"  ⚠ Skipped {skipped} files (still LFS pointers — pull may have failed)")
 
-    # Summary
+def print_summary(output_dir: str):
+    """Print final summary."""
     print(f"\n  Organized into: {os.path.abspath(output_dir)}/")
     for label in sorted(CLASS_MIDS.keys()):
         folder = os.path.join(output_dir, label)
-        n = len([f for f in os.listdir(folder) if f.endswith(".wav")]) if os.path.exists(folder) else 0
-        print(f"    {label:10s}  {n:4d} files")
-
-    print(f"    metadata.csv written")
-    print(f"\n✅ Done! Open {os.path.abspath(output_dir)} to listen.")
+        if os.path.exists(folder):
+            n = len([f for f in os.listdir(folder) if f.endswith(".wav")])
+        else:
+            n = 0
+        print(f"    {label:10s}  {n:4d} .wav files")
+    print()
 
 
 def main():
@@ -275,23 +285,35 @@ def main():
     print("=" * 60)
     print("Animal Sound Generator — Data Download")
     print("=" * 60)
-    print(f"Classes:     {list(CLASS_MIDS.keys())}")
+    print(f"  Classes:     {', '.join(CLASS_MIDS.keys())}")
+    print(f"  Workers:     {DOWNLOAD_WORKERS} parallel downloads")
     if FILES_PER_CLASS is None:
-        print(f"Per class:   ALL available")
-    elif isinstance(FILES_PER_CLASS, int):
-        print(f"Per class:   max {FILES_PER_CLASS}")
+        print(f"  Per class:   ALL available")
     else:
-        print(f"Per class:   {FILES_PER_CLASS}")
-    print(f"Split:       {SPLIT_RATIOS['train']:.0%} train / {SPLIT_RATIOS['val']:.0%} val / {SPLIT_RATIOS['test']:.0%} test")
-    print(f"Output:      {OUTPUT_DIR}")
+        print(f"  Per class:   {FILES_PER_CLASS}")
+    print(f"  Split:       {SPLIT_RATIOS['train']:.0%} train / {SPLIT_RATIOS['val']:.0%} val / {SPLIT_RATIOS['test']:.0%} test")
+    print(f"  Output:      {OUTPUT_DIR}")
+    print()
 
-    fsd50k_dir = os.path.abspath(FSD50K_DIR)
+    # Step 1: Get labels CSV (tiny download, ~2 MB)
+    print("[1/3] Fetching labels...")
+    labels_dir = os.path.abspath(LABELS_DIR)
+    csv_text = fetch_labels_csv(labels_dir)
+
+    # Step 2: Build subset of files we need
+    print("\n[2/3] Selecting target files...")
+    subset = build_subset(csv_text)
+    if not subset:
+        print("  ERROR: No matching files found. Check your CLASS_MIDS config.")
+        sys.exit(1)
+
+    # Step 3: Download only those files
+    print("\n[3/3] Downloading audio (only the files above)...")
     output_dir = os.path.abspath(OUTPUT_DIR)
+    download_audio(output_dir, subset)
 
-    clone_fsd50k(fsd50k_dir)
-    init_lfs(fsd50k_dir)
-    subset = build_subset(fsd50k_dir)
-    pull_and_organize(fsd50k_dir, output_dir, subset)
+    print_summary(output_dir)
+    print("✅ Done!")
 
 
 if __name__ == "__main__":

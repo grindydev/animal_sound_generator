@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore")
 # Same pattern as NSFW main.py — all settings in one place.
 # Switch mode between "test" (fast dev) and "train" (full training).
 CONFIG = {
-    "mode": "test",                    # "test" = fast dev mode, "train" = full training
+    "mode": "train",                    # "test" = fast dev mode, "train" = full training
     "device": "auto",                  # "auto", "cuda", "mps", or "cpu"
     "train_fraction": 0.6,
     "val_fraction": 0.2,

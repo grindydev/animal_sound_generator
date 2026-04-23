@@ -38,17 +38,27 @@ ARCHITECTURE DECISION — Option B: Pad waveforms, batch transform on GPU
 import os
 from typing import List, Tuple
 
+import numpy as np
 from torch import nn
 from torch.utils.data import Dataset, random_split, DataLoader
 from pathlib import Path
 import torch
 import torchaudio
 import torchaudio.transforms as T
+import torchaudio.functional as F_audio
+import soundfile as sf
 
 
 # ── Config ────────────────────────────────────────────────────
 # Path to data — relative to project root (parent of src/)
 path_dataset = Path(__file__).resolve().parent.parent / 'data' / 'animal_audio'
+
+# Target sample rate and max clip length
+# 5 seconds @ 22050 Hz = 110250 samples → spectrogram ~550 time frames
+# This keeps GPU memory manageable (spectrogram ~17 MB for batch=16)
+TARGET_SR = 22050
+MAX_SECONDS = 5
+MAX_SAMPLES = TARGET_SR * MAX_SECONDS  # 110250
 
 
 # ── Collate Function ──────────────────────────────────────────
@@ -111,7 +121,27 @@ class AnimalSoundDataset(Dataset):
         files (44100 Hz) so we don't store it.
         """
         filepath, label = self.samples[index]
-        waveform, _sr = torchaudio.load(filepath)
+        data, sr = sf.read(filepath, dtype='float32')
+        waveform = torch.from_numpy(data)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)  # (1, samples)
+        else:
+            waveform = waveform.T             # (channels, samples)
+
+        # Resample to target SR if needed
+        if sr != TARGET_SR:
+            waveform = F_audio.resample(waveform, sr, TARGET_SR)
+
+        # Fix length: pad short clips, crop long clips
+        n = waveform.shape[-1]
+        if n < MAX_SAMPLES:
+            pad = torch.zeros(1, MAX_SAMPLES - n)
+            waveform = torch.cat([waveform, pad], dim=-1)
+        elif n > MAX_SAMPLES:
+            # Random crop during training, center crop otherwise
+            start = torch.randint(0, n - MAX_SAMPLES + 1, (1,)).item()
+            waveform = waveform[:, start:start + MAX_SAMPLES]
+
         return waveform, label
 
     def _make_dataset(self) -> List[Tuple[str, int]]:
@@ -211,13 +241,13 @@ def get_transformations():
             • (SpecAugment = FrequencyMasking + TimeMasking)
     """
     train_transform = nn.Sequential(
-        T.MelSpectrogram(),                          # waveform → mel spectrogram
-        T.AmplitudeToDB(stype='power', top_db=80),   # linear → log scale (dB)
+        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),   # waveform → mel spectrogram
+        T.AmplitudeToDB(stype='power', top_db=80),            # linear → log scale (dB)
         # TODO: add SpecAugment here later
     )
 
     eval_transform = nn.Sequential(
-        T.MelSpectrogram(),
+        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),
         T.AmplitudeToDB(stype='power', top_db=80),
     )
 

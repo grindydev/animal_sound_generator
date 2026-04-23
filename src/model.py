@@ -20,10 +20,10 @@ COURSE REFERENCE:
   • L1-M4 nature_classification — full image classification pipeline
 
 MODEL ARCHITECTURE:
-  Input: [batch, 1, 128, variable_time]  (128 mel bins × variable time frames)
-    → ConvBlock(1, 32)   → [batch, 32, 64, time/2]
-    → ConvBlock(32, 64)  → [batch, 64, 32, time/4]
-    → ConvBlock(64, 128) → [batch, 128, 16, time/8]
+  Input: [batch, 1, 64, variable_time]  (64 mel bins × variable time frames)
+    → ConvBlock(1, 32)   → [batch, 32, 32, time/2]
+    → ConvBlock(32, 64)  → [batch, 64, 16, time/4]
+    → ConvBlock(64, 128) → [batch, 128, 8, time/8]
     → AdaptiveAvgPool2d  → [batch, 128, 1, 1]    ← squashes to fixed size
     → Flatten            → [batch, 128]
     → Linear(128, 128)   → ReLU → Dropout
