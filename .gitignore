@@ -31,13 +31,6 @@ ENV/
 # Data (too large for git — run scripts/download_data.py to get it)
 data/
 
-# Model checkpoints (large binary files)
-models/*.pth
-models/*.onnx
-models/*.onnx.data
-models/*.pkl
-models/*.db
-
 # Generated outputs
 outputs/
 generated_audio/
