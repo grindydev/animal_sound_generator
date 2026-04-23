@@ -69,19 +69,21 @@ class SimpleAudioCNN(nn.Module):
         self.conv_block1 = SimpleAudioCNNBlock(1, 32)    # 1 channel (mel spec) → 32
         self.conv_block2 = SimpleAudioCNNBlock(32, 64)    # 32 → 64
         self.conv_block3 = SimpleAudioCNNBlock(64, 128)   # 64 → 128
+        self.conv_block4 = SimpleAudioCNNBlock(128, 256) 
 
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),    # [batch, 128, H, W] → [batch, 128, 1, 1]
             nn.Flatten(start_dim=1),          # [batch, 128, 1, 1] → [batch, 128]
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
         x = self.conv_block1(x)
         x = self.conv_block2(x)
         x = self.conv_block3(x)
+        x = self.conv_block4(x)
         x = self.classifier(x)
         return x

@@ -48,6 +48,9 @@ import torchaudio.transforms as T
 import torchaudio.functional as F_audio
 import soundfile as sf
 
+# Import smart_crop from scripts/
+from smart_crop import smart_crop
+
 
 # ── Config ────────────────────────────────────────────────────
 # Path to data — relative to project root (parent of src/)
@@ -59,7 +62,17 @@ path_dataset = Path(__file__).resolve().parent.parent / 'data' / 'animal_audio'
 TARGET_SR = 22050
 MAX_SECONDS = 5
 MAX_SAMPLES = TARGET_SR * MAX_SECONDS  # 110250
+#     Mean: -30.8645
+#     Std:  21.1952
 
+class SimpleNormalize(nn.Module):
+    def __init__(self, mean = -30.8645, std = 21.1952):
+        super().__init__()
+        self.mean = mean
+        self.std = std
+    
+    def forward(self, x):
+        return (x - self.mean) / self.std
 
 # ── Collate Function ──────────────────────────────────────────
 def collate_fn(batch):
@@ -104,7 +117,9 @@ class AnimalSoundDataset(Dataset):
         # Map class name → index: {'Dog': 0, 'Cat': 1, ...}
         self.class_to_idx = {cls: idx for idx, cls in enumerate(self.CLASSES)}
         # Scan all .wav files and store (filepath, label) pairs
-        self.samples: List[Tuple[str, int]] = self._make_dataset()
+        # Each sample: (filepath, label, crop_idx, num_crops)
+        # Long files with multiple activity regions → multiple entries
+        self.samples = self._make_dataset()
 
     def __len__(self):
         return len(self.samples)
@@ -120,7 +135,7 @@ class AnimalSoundDataset(Dataset):
         We only need the waveform. Sample rate is the same for all FSD50K
         files (44100 Hz) so we don't store it.
         """
-        filepath, label = self.samples[index]
+        filepath, label, crop_idx, num_crops = self.samples[index]
         data, sr = sf.read(filepath, dtype='float32')
         waveform = torch.from_numpy(data)
         if waveform.dim() == 1:
@@ -132,29 +147,22 @@ class AnimalSoundDataset(Dataset):
         if sr != TARGET_SR:
             waveform = F_audio.resample(waveform, sr, TARGET_SR)
 
-        # Fix length: pad short clips, crop long clips
-        n = waveform.shape[-1]
-        if n < MAX_SAMPLES:
-            pad = torch.zeros(1, MAX_SAMPLES - n)
-            waveform = torch.cat([waveform, pad], dim=-1)
-        elif n > MAX_SAMPLES:
-            # Random crop during training, center crop otherwise
-            start = torch.randint(0, n - MAX_SAMPLES + 1, (1,)).item()
-            waveform = waveform[:, start:start + MAX_SAMPLES]
+        # Smart crop: get all activity-region crops, pick the one for this index
+        crops = smart_crop(waveform, crop_samples=MAX_SAMPLES, threshold_db=-30.0,
+                           num_crops=num_crops)
+        waveform = crops[min(crop_idx, len(crops) - 1)]
 
         return waveform, label
 
-    def _make_dataset(self) -> List[Tuple[str, int]]:
+    def _make_dataset(self):
         """
         Scan the folder structure and collect all .wav files.
         
-        Expected layout:
-            data/animal_audio/
-                Dog/1.wav, Dog/2.wav, ...
-                Cat/1.wav, Cat/2.wav, ...
-                ...
+        Long files are expanded into multiple samples — one per activity region.
+        A 20s clip with 3 detectable regions becomes 3 training samples.
+        A 3s clip stays as 1 sample (padded later).
         
-        Returns list of (absolute_path, class_index) tuples.
+        Each entry: (filepath, label, crop_idx, num_crops)
         """
         samples = []
         for class_name in self.CLASSES:
@@ -163,7 +171,13 @@ class AnimalSoundDataset(Dataset):
                 continue
             for entry in os.scandir(class_dir):
                 if entry.is_file() and entry.name.lower().endswith(('.wav', '.mp3')):
-                    samples.append((entry.path, self.class_to_idx[class_name]))
+                    label = self.class_to_idx[class_name]
+                    # Estimate crops from duration (sf.info is fast — header only)
+                    info = sf.info(entry.path)
+                    duration = info.duration
+                    num_crops = max(1, int(duration) // MAX_SECONDS)
+                    for i in range(num_crops):
+                        samples.append((entry.path, label, i, num_crops))
         return samples
 
 
@@ -243,28 +257,44 @@ def get_transformations():
     train_transform = nn.Sequential(
         T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),   # waveform → mel spectrogram
         T.AmplitudeToDB(stype='power', top_db=80),            # linear → log scale (dB)
+        SimpleNormalize(),
         # TODO: add SpecAugment here later
     )
 
     eval_transform = nn.Sequential(
         T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),
         T.AmplitudeToDB(stype='power', top_db=80),
+        SimpleNormalize(),
     )
 
     return train_transform, eval_transform
 
 
-# # ── Smoke Test ────────────────────────────────────────────────
-# if __name__ == "__main__":
+def get_mean_std(dataset: Dataset):
+    train_tfm, _ = get_transformations()                                                                                                                                                                                            
+    all_specs = []                                                                                                                                                                                                                  
+    for waveforms, _ in dataset:                                                                                                                                                                                               
+        specs = train_tfm(waveforms)                                                                                                                                                                                                
+        all_specs.append(specs)                                                                                                                                                                                                     
+    all_specs = torch.cat(all_specs, dim=0)                                                                                                                                                                                         
+    print(f"Mean: {all_specs.mean():.4f}")                                                                                                                                                                                          
+    print(f"Std:  {all_specs.std():.4f}")  
+
+# ── Smoke Test ────────────────────────────────────────────────
+if __name__ == "__main__":
+
 #     print("=" * 60)
 #     print("data_loader.py smoke test")
 #     print("=" * 60)
 
 #     # 1) Test dataset
-#     dataset = AnimalSoundDataset(path_dataset)
+      dataset = AnimalSoundDataset(path_dataset)
 #     print(f"\nDataset: {len(dataset)} samples, {dataset.num_classes} classes")
 #     print(f"Classes: {dataset.CLASSES}")
 #     print(f"Class map: {dataset.class_to_idx}")
+#     get_mean_std(dataset)
+#     Mean: -30.8645
+#     Std:  21.1952
 
 #     # Load one sample
 #     waveform, label = dataset[0]
