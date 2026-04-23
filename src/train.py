@@ -4,7 +4,7 @@ train.py — Phase 2: Training Pipeline for Audio Classifier
 
 WHAT YOU'LL BUILD:
   • CONFIG dict — lr, weight_decay, batch_size, epochs (like NSFW main.py)
-  • Training loop with epoch-level progress output
+  • Training loop with progress bars (NestedProgressBar from helper_utils)
   • Early stopping + Cosine LR scheduler
   • Best model checkpointing (saved to disk when val accuracy improves)
   • Device-aware: CUDA / MPS / CPU auto-detect
@@ -37,6 +37,7 @@ from torch.amp import autocast, GradScaler
 from data_loader import get_dataloaders, get_transformations
 from model import SimpleAudioCNN
 import helper_utils
+
 warnings.filterwarnings("ignore")
 
 # ==================== CONFIG (EDIT ONLY THIS SECTION) ====================
@@ -45,7 +46,8 @@ warnings.filterwarnings("ignore")
 CONFIG = {
     "mode": "test",                    # "test" = fast dev mode, "train" = full training
     "device": "auto",                  # "auto", "cuda", "mps", or "cpu"
-    "val_fraction": 0.15,
+    "train_fraction": 0.6,
+    "val_fraction": 0.2,
     "lr": 1e-3,
     "weight_decay": 0.05,
     "label_smoothing": 0.1,
@@ -57,6 +59,7 @@ CONFIG = {
         "num_epochs": 5,
         "batch_size": 16,
         "patience": 3,
+        "num_workers": 1,
     },
 
     # Full training mode
@@ -64,6 +67,7 @@ CONFIG = {
         "num_epochs": 40,
         "batch_size": 16,
         "patience": 8,
+        "num_workers": 4,
     }
 }
 
@@ -74,6 +78,8 @@ SETTINGS = CONFIG[MODE]
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
 PATIENCE = SETTINGS["patience"]
+NUM_WORKERS = SETTINGS["num_workers"]
+TRAIN_FRACTION = CONFIG["train_fraction"]
 VAL_FRACTION = CONFIG["val_fraction"]
 LR = CONFIG["lr"]
 WEIGHT_DECAY = CONFIG["weight_decay"]
@@ -83,7 +89,7 @@ LABEL_SMOOTHING = CONFIG["label_smoothing"]
 BEST_MODEL_PATH = f"models/best_audio_cnn_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE")
-print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Patience: {PATIENCE}")
+print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Patience: {PATIENCE} | Workers: {NUM_WORKERS}")
 print(f"   Best model → {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
@@ -107,7 +113,9 @@ else:
 # ==================== LOAD DATA ====================
 train_loader, val_loader, test_loader, num_classes = get_dataloaders(
     batch_size=BATCH_SIZE,
+    train_fraction=TRAIN_FRACTION,
     val_fraction=VAL_FRACTION,
+    num_workers=NUM_WORKERS,
 )
 
 print(f"✅ Data loaded: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val / {len(test_loader.dataset)} test")
@@ -140,9 +148,10 @@ eval_transform = eval_transform.to(device)
 
 # ==================== TRAINING FUNCTIONS ====================
 
-def train_epoch(model, train_loader, loss_function, optimizer, device, train_transform, scaler, use_amp):
+def train_epoch(model, train_loader, loss_function, optimizer, device, train_transform,
+                scaler, use_amp, pbar=None):
     """
-    Train one epoch.
+    Train one epoch with optional progress bar.
     
     Flow per batch:
       1. Move raw waveforms to device [batch, 1, max_samples]
@@ -153,7 +162,7 @@ def train_epoch(model, train_loader, loss_function, optimizer, device, train_tra
     model.train()
     running_loss = 0.0
 
-    for waveforms, labels in train_loader:
+    for batch_idx, (waveforms, labels) in enumerate(train_loader):
         waveforms, labels = waveforms.to(device), labels.to(device)
 
         # Transform raw waveforms → mel spectrograms on GPU
@@ -178,12 +187,16 @@ def train_epoch(model, train_loader, loss_function, optimizer, device, train_tra
 
         running_loss += loss.item() * waveforms.size(0)
 
+        # Update batch progress bar
+        if pbar:
+            pbar.update_batch(batch_idx + 1, postfix_dict={"loss": f"{loss.item():.4f}"})
+
     return running_loss / len(train_loader.dataset)
 
 
-def validate_epoch(model, val_loader, loss_function, device, eval_transform):
+def validate_epoch(model, val_loader, loss_function, device, eval_transform, pbar=None):
     """
-    Validate one epoch.
+    Validate one epoch with optional progress bar.
     
     torch.no_grad() — don't build computation graph (saves memory, faster)
     model.eval() — disable dropout, use running batchnorm stats
@@ -193,7 +206,7 @@ def validate_epoch(model, val_loader, loss_function, device, eval_transform):
     correct = total = 0
 
     with torch.no_grad():
-        for waveforms, labels in val_loader:
+        for batch_idx, (waveforms, labels) in enumerate(val_loader):
             waveforms, labels = waveforms.to(device), labels.to(device)
             waveforms = eval_transform(waveforms)
 
@@ -206,6 +219,10 @@ def validate_epoch(model, val_loader, loss_function, device, eval_transform):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
+            # Update batch progress bar
+            if pbar:
+                pbar.update_batch(batch_idx + 1)
+
     return (running_loss / len(val_loader.dataset)), (100.0 * correct / total)
 
 
@@ -215,10 +232,10 @@ def training_loop(model, train_loader, val_loader, loss_function, optimizer, sch
                   num_epochs, device, train_transform, eval_transform, scaler, use_amp):
     """
     Full training loop with:
+      • NestedProgressBar — epoch + batch level progress
       • Early stopping (patience from CONFIG)
       • Best model checkpointing (saved to disk immediately when improved)
       • Cosine LR scheduling
-      • Progress output per epoch
     """
     model.to(device)
 
@@ -235,23 +252,43 @@ def training_loop(model, train_loader, val_loader, loss_function, optimizer, sch
     print("=" * 70)
 
     for epoch in range(num_epochs):
-        # Train
+        # Create progress bars for this epoch
+        train_pbar = helper_utils.NestedProgressBar(
+            total_epochs=num_epochs,
+            total_batches=len(train_loader),
+            mode="train",
+        )
+        # Update the epoch bar to current epoch
+        train_pbar.update_epoch(epoch + 1)
+
+        # ── Train ──
         epoch_loss = train_epoch(model, train_loader, loss_function, optimizer, device,
-                                 train_transform, scaler, use_amp)
-        # Validate
+                                 train_transform, scaler, use_amp, pbar=train_pbar)
+        train_pbar.batch_bar.close()
+
+        # ── Validate ──
+        val_pbar = helper_utils.NestedProgressBar(
+            total_epochs=1,
+            total_batches=len(val_loader),
+            mode="eval",
+        )
         epoch_val_loss, epoch_accuracy = validate_epoch(model, val_loader, loss_function, device,
-                                                        eval_transform)
+                                                        eval_transform, pbar=val_pbar)
+        val_pbar.close()
 
         train_losses.append(epoch_loss)
         val_losses.append(epoch_val_loss)
         val_accuracies.append(epoch_accuracy)
 
         current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch [{epoch+1:3d}/{num_epochs}] | "
-              f"Train Loss: {epoch_loss:.4f} | "
-              f"Val Loss: {epoch_val_loss:.4f} | "
-              f"Val Acc: {epoch_accuracy:6.2f}% | "
-              f"LR: {current_lr:.6f}")
+
+        # Update epoch bar with final metrics for this epoch
+        train_pbar.update_epoch(epoch + 1, postfix_dict={
+            "train_loss": f"{epoch_loss:.4f}",
+            "val_loss": f"{epoch_val_loss:.4f}",
+            "val_acc": f"{epoch_accuracy:.1f}%",
+            "lr": f"{current_lr:.6f}",
+        })
 
         # Step the LR scheduler
         scheduler.step()

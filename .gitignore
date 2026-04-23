@@ -28,10 +28,8 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data (too large for git)
-data/esc50_audio/
-data/fsd50k_metadata/clips/
-data/animal_audio/
+# Data (too large for git — run scripts/download_data.py to get it)
+data/
 
 # Model checkpoints (large binary files)
 models/*.pth
@@ -56,3 +54,4 @@ client/frontend/dist/
 *.log
 *.sqlite
 *.sqlite3
+

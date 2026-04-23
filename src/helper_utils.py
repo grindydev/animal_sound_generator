@@ -45,6 +45,71 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+class NestedProgressBar:
+    """
+    Nested progress bars for training: outer bar = epochs, inner bar = batches.
+    Same as NSFW project.
+
+    Usage:
+        pbar = NestedProgressBar(total_epochs=10, total_batches=50, mode="train")
+        for epoch in range(1, 11):
+            for batch in range(1, 51):
+                pbar.update_batch(batch)
+            pbar.update_epoch(epoch, postfix_dict={"loss": "0.5"})
+        pbar.close()
+    """
+    def __init__(self, total_epochs, total_batches, mode="train"):
+        from tqdm.auto import tqdm as tqdm_impl
+        self.tqdm = tqdm_impl
+        self.mode = mode
+        self.total_epochs_raw = total_epochs
+        self.total_batches_raw = total_batches
+
+        if self.mode == "train":
+            self.epoch_bar = self.tqdm(total=total_epochs, desc="Epoch", position=0, leave=True)
+            self.batch_bar = self.tqdm(total=total_batches, desc="Batch", position=1, leave=False)
+        elif self.mode == "eval":
+            self.epoch_bar = None
+            self.batch_bar = self.tqdm(total=total_batches, desc="Evaluating", position=0, leave=False)
+
+        self._last_epoch = -1
+        self._last_batch = -1
+
+    def update_epoch(self, epoch, postfix_dict=None):
+        step = epoch - 1  # 0-indexed
+        if step != self._last_epoch:
+            self.epoch_bar.update(1)
+            self._last_epoch = step
+        if self.mode == "train":
+            self.epoch_bar.set_description(f"Epoch {epoch}/{self.total_epochs_raw}")
+        if postfix_dict:
+            self.epoch_bar.set_postfix(postfix_dict)
+        # Reset batch bar for next epoch
+        if self.batch_bar:
+            self.batch_bar.reset()
+            self._last_batch = -1
+
+    def update_batch(self, batch, postfix_dict=None):
+        step = batch - 1
+        if step != self._last_batch:
+            self.batch_bar.update(1)
+            self._last_batch = step
+        if self.mode == "train":
+            self.batch_bar.set_description(f"  Batch {batch}/{self.total_batches_raw}")
+        elif self.mode == "eval":
+            self.batch_bar.set_description(f"  Eval Batch {batch}/{self.total_batches_raw}")
+        if postfix_dict:
+            self.batch_bar.set_postfix(postfix_dict)
+
+    def close(self, last_message=None):
+        if self.mode == "train" and self.epoch_bar:
+            self.epoch_bar.close()
+        if self.batch_bar:
+            self.batch_bar.close()
+        if last_message:
+            print(last_message)
+
+
 def plot_training_metrics(metrics):
     """
     Plot training curves from training_loop() output.
