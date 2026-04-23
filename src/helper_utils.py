@@ -153,3 +153,25 @@ def plot_training_metrics(metrics):
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_confusion_matrix(cm, class_names):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(cm, cmap=plt.cm.Blues)
+    plt.title('Final Confusion Matrix')
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'), ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    filename = 'data/confusion_matrix.png'
+    plt.savefig(filename, dpi=200)
+    plt.show()
+    return filename

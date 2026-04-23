@@ -177,30 +177,32 @@ Flow:
 
 ---
 
-## Phase 2 — Audio Classifier (Baseline) 🔲
+## Phase 2 — Audio Classifier (Baseline) ✅
 
 **Goal:** Build a classifier as a warm-up (same pattern as NSFW Phase 1-2). This teaches you what features matter for animal sounds, AND you'll reuse this classifier in Phase 5 to evaluate your generator.
 
 **Build these files:** `model.py`, `train.py`, `evaluate.py`
 
-### What you'll practice
+### What you practiced
 
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| 2D CNN on spectrograms | `model.py` — same CNN architecture as NSFW | L1-M4 `cnn/main.py` |
-| Config-driven training | `train.py` — CONFIG dict | Same as NSFW |
-| Confusion matrix + F1 | `evaluate.py` | Same as NSFW |
-| MLflow tracking | `train.py` — log params, metrics | L3-M4 `MLflow/main.py` |
-| Early stopping + LR scheduler | `train.py` | L2-M1 `scheduler/main.py` |
+| Concept | Where | Status |
+|---------|-------|--------|
+| 2D CNN on spectrograms | `model.py` — 4 conv blocks + AdaptiveAvgPool | ✅ |
+| Config-driven training | `train.py` — CONFIG dict (test/train mode) | ✅ |
+| Confusion matrix + F1 | `evaluate.py` | ✅ |
+| Early stopping + Cosine LR | `train.py` | ✅ |
+| Smart cropping (energy-based VAD) | `smart_crop.py` — crop loudest activity regions | ✅ |
+| Spectrogram normalization | `data_loader.py` — SimpleNormalize | ✅ |
+| NestedProgressBar | `helper_utils.py` — epoch + batch progress | ✅ |
 
-### After classification — record results
+### Results
 
 ```
 ┌──────────────────────────────────────────────┐
 │ AUDIO CLASSIFIER BASELINE                    │
-│ Test Accuracy:  ??%                          │
-│ Hardest classes: ???                         │
-│ Easy classes:    ???                         │
+│ Test Accuracy:  92%                          │
+│ Hardest classes: Rooster, Crow               │
+│ Easy classes:    Noise, Dog, Insect          │
 │ Best model saved for Phase 5 evaluation      │
 └──────────────────────────────────────────────┘
 ```
@@ -731,7 +733,7 @@ animal_sound_generator/
 | Phase | Description | File | Course Reference | Status |
 |-------|------------|------|-----------------|--------|
 | 1 | Audio data loading & spectrograms | `data_loader.py` | L1-M3 (datasets) | ✅ |
-| 2 | Audio classifier baseline | `model.py`, `train.py`, `evaluate.py` | L1-M4 (CNN) | 🔲 |
+| 2 | Audio classifier baseline | `model.py`, `train.py`, `evaluate.py`, `smart_crop.py` | L1-M4 (CNN) | ✅ |
 | 3 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | 🔲 |
 | 4 | Conditional VAE (generate by class) | `vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | 🔲 |
 | 5 | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | 🔲 |

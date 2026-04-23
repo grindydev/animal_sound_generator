@@ -281,14 +281,14 @@ def get_mean_std(dataset: Dataset):
     print(f"Std:  {all_specs.std():.4f}")  
 
 # ── Smoke Test ────────────────────────────────────────────────
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
 #     print("=" * 60)
 #     print("data_loader.py smoke test")
 #     print("=" * 60)
 
 #     # 1) Test dataset
-      dataset = AnimalSoundDataset(path_dataset)
+# dataset = AnimalSoundDataset(path_dataset)
 #     print(f"\nDataset: {len(dataset)} samples, {dataset.num_classes} classes")
 #     print(f"Classes: {dataset.CLASSES}")
 #     print(f"Class map: {dataset.class_to_idx}")
