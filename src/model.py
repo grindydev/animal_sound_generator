@@ -121,13 +121,13 @@ class SimpleEncoderBlock(nn.Module):
         return x
     
 class SimpleDecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, activation=True):
         super(SimpleDecoderBlock, self).__init__()
 
         self.block = nn.Sequential(
             nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
             nn.BatchNorm2d(num_features=out_channels),
-            nn.ReLU(),
+             nn.ReLU() if activation else nn.Identity(),
         )
     
 
@@ -160,7 +160,7 @@ class SimpleAudioAutoencoder(nn.Module):
       DecoderBlock(32→1):                 [B, 1, 64, 560]
       Interpolate:                        [B, 1, 64, 552]   ← stretch 560→552 to match input
     """
-    def __init__(self, latent_dim=256):
+    def __init__(self, latent_dim=1024):
         super(SimpleAudioAutoencoder, self).__init__()
         self.encode = nn.Sequential(
             SimpleEncoderBlock(1, 32),
@@ -177,7 +177,7 @@ class SimpleAudioAutoencoder(nn.Module):
             SimpleDecoderBlock(256, 128),
             SimpleDecoderBlock(128, 64),
             SimpleDecoderBlock(64, 32),
-            SimpleDecoderBlock(32, 1),
+            SimpleDecoderBlock(32, 1, activation=False),
         )
         
     

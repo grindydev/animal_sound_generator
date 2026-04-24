@@ -39,8 +39,8 @@ CONFIG = {
     "train_fraction": 0.6,
     "val_fraction": 0.2,
     "lr": 1e-3,
-    "weight_decay": 0.05,
-    "latent_dim": 256,
+    "weight_decay": 1e-3,
+    "latent_dim": 1024,
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
