@@ -176,9 +176,26 @@ if os.path.exists(ae_checkpoint_path):
 
     model.load_state_dict(vae_state)
 
+    # ── Initialize fc_mu with tiny weights so μ starts near 0 ──
+    #
+    # WHY: The pretrained encoder produces large features (after BN + ReLU through
+    # 4 layers). A random Linear(35840, 1024) with default init produces
+    # μ ≈ ±50 → KL = 0.5 × 1024 × 50² ≈ 1.3M. Even β=0.001 × 1.3M = 1,300
+    # gradient → instant destruction.
+    #
+    # Fix: init with very small weights so μ starts near 0 → KL ≈ small.
+    # The model will learn the right μ scale during warmup (β=0).
+    #
+    with torch.no_grad():
+        model.fc_mu.weight.normal_(std=0.001)
+        model.fc_mu.bias.zero_()
+        model.fc_log_var.weight.normal_(std=0.001)
+        model.fc_log_var.bias.zero_()
+
     print(f"✅ Loaded pretrained autoencoder weights from {ae_checkpoint_path}")
     print(f"   Copied:   {len(copied)} layers (encoder + decoder + fc_decode)")
-    print(f"   Skipped:  {len(skipped)} layers (fc_encode, fc_mu, fc_log_var, class_embed → learn from scratch)")
+    print(f"   Skipped:  {len(skipped)} layers (fc_encode → not copied, VAE heads init tiny)")
+    print(f"   fc_mu:    tiny init (std=0.001) → μ starts near 0 → KL starts small")
     print(f"   Source:   epoch {ae_ckpt.get('epoch', '?')}, val_mse={ae_ckpt.get('val_mse', '?')}")
 else:
     print(f"⚠️  No pretrained autoencoder found at {ae_checkpoint_path}")
@@ -378,11 +395,22 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
     for epoch in range(num_epochs):
 
-        # ── β annealing ──
-        if epoch < WARMUP_EPOCHS:
-            beta = BETA_START + (BETA - BETA_START) * (epoch / max(WARMUP_EPOCHS, 1))
-        else:
-            beta = BETA
+    # ── β annealing ──
+    #
+    # Two-phase schedule:
+    #   Phase A (warmup):    β = 0.0 EXACTLY, encoder+decoder frozen
+    #   Phase B (ramp):      β ramps from 0 → target over WARMUP_EPOCHS, all unfrozen
+    #
+    # WHY β must stay at 0 during warmup:
+    #   Even β=0.001 × KL(600K) = 600 gradient → destroys fc_mu instantly.
+    #   During warmup, fc_mu must learn WITHOUT any KL pressure.
+    #
+    if epoch < WARMUP_EPOCHS:
+        beta = 0.0  # ALWAYS 0 during warmup — no ramp!
+    else:
+        ramp_epochs = WARMUP_EPOCHS  # ramp over same number of epochs after warmup
+        ramp_progress = min(1.0, (epoch - WARMUP_EPOCHS) / ramp_epochs)
+        beta = BETA * ramp_progress
 
         # ── Phase transition: unfreeze after warmup ──
         if epoch == WARMUP_EPOCHS and os.path.exists(ae_checkpoint_path):
