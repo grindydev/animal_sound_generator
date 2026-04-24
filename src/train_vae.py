@@ -56,7 +56,7 @@ warnings.filterwarnings("ignore")
 
 # ==================== CONFIG (EDIT ONLY THIS SECTION) ====================
 CONFIG = {
-    "mode": "test",                      # "test" = fast dev, "train" = full training
+    "mode": "train",                      # "test" = fast dev, "train" = full training
     "device": "auto",                    # "auto", "cuda", "mps", or "cpu"
     "train_fraction": 0.6,
     "val_fraction": 0.2,
@@ -177,11 +177,40 @@ if os.path.exists(ae_checkpoint_path):
         else:
             skipped.append(key)
 
+    # ── Initialize VAE heads from autoencoder's fc_encode ──
+    #
+    # THE PROBLEM THIS SOLVES:
+    #   Autoencoder: fc_encode (trained) → fc_decode (trained) = MSE 0.051
+    #   VAE (before this fix): fc_mu (RANDOM) → fc_decode (trained) = MSE 0.210
+    #   VAE (after this fix):  fc_mu (from fc_encode) → fc_decode (trained) ≈ MSE 0.051
+    #
+    # The autoencoder's fc_encode maps flat_features → latent_dim.
+    # The VAE's fc_mu does the EXACT SAME thing — it's just renamed.
+    # By copying fc_encode's weights to fc_mu, the VAE starts with
+    # the same z distribution the autoencoder produced.
+    # fc_decode already expects that distribution → instant compatibility.
+    #
+    # fc_log_var is initialized to zeros → log_var=0 → σ=1 → small noise.
+    # The model starts nearly deterministic (like the autoencoder)
+    # and gradually learns to add randomness as KL warmup kicks in.
+    #
+    ae_fc_encode_weight = ae_state.get('fc_encode.weight')
+    ae_fc_encode_bias = ae_state.get('fc_encode.bias')
+    if ae_fc_encode_weight is not None:
+        # Copy fc_encode → fc_mu (same shape: latent_dim × flat_dim)
+        vae_state['fc_mu.weight'] = ae_fc_encode_weight
+        vae_state['fc_mu.bias'] = ae_fc_encode_bias
+        # Initialize fc_log_var to zeros → σ=1, near-deterministic start
+        vae_state['fc_log_var.weight'] = torch.zeros_like(vae_state['fc_log_var.weight'])
+        vae_state['fc_log_var.bias'] = torch.zeros_like(vae_state['fc_log_var.bias'])
+        print(f"   🔑 Initialized fc_mu from autoencoder's fc_encode")
+        print(f"   🔑 Initialized fc_log_var to zeros (σ=1, near-deterministic start)")
+
     model.load_state_dict(vae_state)
 
     print(f"✅ Loaded pretrained autoencoder weights from {ae_checkpoint_path}")
     print(f"   Copied:   {len(copied)} layers ({', '.join(copied[:5])}...)")
-    print(f"   Skipped:  {len(skipped)} layers (VAE-specific: fc_mu, fc_log_var, class_embed, class_project)")
+    print(f"   Skipped:  {len(skipped)} layers (fc_encode — used to init VAE heads instead)")
     print(f"   Source:   epoch {ae_ckpt.get('epoch', '?')}, val_mse={ae_ckpt.get('val_mse', '?')}")
 else:
     print(f"⚠️  No pretrained autoencoder found at {ae_checkpoint_path}")
@@ -245,8 +274,16 @@ def vae_loss(reconstructed, target, mu, log_var, beta):
 
     # KL divergence — NEW for VAE
     # sum over latent_dim, mean over batch
+    #
+    # FIX: clamp log_var before exp() to prevent float16 overflow under AMP.
+    # When using CUDA mixed precision (autocast), log_var is float16.
+    # float16 max = 65504. exp(11.1) ≈ 66514 > 65504 → overflow → Inf → NaN.
+    # Clamping to max=10 keeps exp() safe: exp(10) = 22026 << 65504.
+    # This has negligible impact on training (σ > exp(5) ≈ 148 is already extreme).
+    #
+    log_var_clamped = torch.clamp(log_var, max=10)
     kl_loss = -0.5 * torch.mean(
-        torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+        torch.sum(1 + log_var_clamped - mu.pow(2) - log_var_clamped.exp(), dim=1)
     )
 
     # Combined
@@ -505,9 +542,10 @@ if __name__ == "__main__":
         use_amp=use_amp,
     )
 
-    # Plot training curves
+    # Plot training curves (only pass first 2 lists — train/val loss)
     try:
-        helper_utils.plot_training_metrics(training_metrics)
+        train_losses, val_losses = training_metrics[0], training_metrics[1]
+        helper_utils.plot_training_metrics([train_losses, val_losses, val_losses])
     except Exception as e:
         print(f"⚠️ Plotting failed: {e}")
 

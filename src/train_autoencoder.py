@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore")
 
 # ==================== CONFIG (EDIT ONLY THIS SECTION) ====================
 CONFIG = {
-    "mode": "test",                      # "test" = fast dev, "train" = full training
+    "mode": "train",                      # "test" = fast dev, "train" = full training
     "device": "auto",                    # "auto", "cuda", "mps", or "cpu"
     "train_fraction": 0.6,
     "val_fraction": 0.2,
