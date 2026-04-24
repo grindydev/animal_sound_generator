@@ -544,6 +544,18 @@ def objective(trial):
 # Decoder:  up  ← concat ← up  ← concat ← up   ← latent
 ```
 
+📄 **Detailed implementation guide:** [`documents/autoencoder_improvement_plan.md`](documents/autoencoder_improvement_plan.md)
+
+This document covers 5 improvement steps for the autoencoder (applied here in Phase 7c but also relevant to Phase 3 understanding):
+
+| Step | Change | Why | Expected Impact |
+|------|--------|-----|----------------|
+| 1 | **Skip connections (U-Net)** | Fine detail lost through encoder can't be recovered — skips bypass the bottleneck | **Highest** — MSE from ~0.065 to ~0.02–0.04 |
+| 2 | Multi-layer bottleneck | Single linear layer compression is too harsh — add hidden layers for gradual compression | Medium |
+| 3 | Remove decoder BatchNorm | BN constrains output range and adds batch-dependent noise to reconstruction | Low–Medium |
+| 4 | Fix `F.interpolate` with input padding | Bilinear interpolation blurs output — pad input to multiple of 16 instead | Low (cleaner) |
+| 5 | MSE + L1 combined loss | MSE produces blurry output — L1 preserves sharp edges and fine detail | Medium |
+
 **Compare:** U-Net reconstruction quality vs basic autoencoder. Same lesson as NSFW — skip connections preserve information that would otherwise be lost.
 
 ---
