@@ -11,28 +11,27 @@ COMPARED TO train_autoencoder.py, WHAT CHANGES:
   │  forward() input   │  (spectrograms)           │  (spectrograms, labels)       │
   │  forward() output  │  reconstructed             │  reconstructed, μ, log_var   │
   │  Loss              │  MSE only                 │  MSE + β * KL_divergence      │
-  │  Early stopping    │  val MSE (lower=better)   │  val total_loss (lower=better)│
+  │  Early stopping    │  val MSE (lower=better)   │  val MSE (lower=better)       │
   │  After training    │  (nothing — can't generate)│  Generate new sounds!         │
   └────────────────────┴──────────────────────────┴───────────────────────────────┘
 
-THE KEY NEW CONCEPT — KL DIVERGENCE LOSS:
+TRAINING STRATEGY (3 phases):
 
-  KL divergence measures how different two probability distributions are.
+  Phase A — Warmup (epochs 1 to warmup_epochs):
+    - Encoder + decoder FROZEN (pretrained autoencoder weights)
+    - Only train: fc_mu, fc_log_var, class_embed, class_project
+    - β starts at 0, slowly increases
+    - WHY: Let the new VAE heads learn to produce μ near 0 and σ near 1
+      while keeping the pretrained feature extraction intact.
+      Without freezing, the KL gradient would destroy the encoder.
 
-  We want: q(z|x) ≈ N(0, 1)   (encoder output close to standard normal)
-  Why?     So the latent space is SMOOTH and CONTINUOUS:
-           - Nearby points → similar sounds
-           - Any random point from N(0,1) produces a meaningful sound
-           - This is what makes generation possible!
+  Phase B — Fine-tune (epochs warmup_epochs+1 to end):
+    - All layers unfrozen
+    - β at target value
+    - WHY: Now that the bottleneck is stable, fine-tune everything together.
 
-  Formula: KL = -0.5 * Σ(1 + log(σ²) - μ² - σ²)
-  When μ=0 and σ²=1 (perfect standard normal): KL = 0 (minimum)
-  The model is penalized when the learned distribution drifts from N(0,1)
-
-  β (beta) controls the TRADEOFF:
-    - β too small → good reconstruction, but latent space is messy → can't generate
-    - β too large → latent space is very organized, but reconstruction is blurry
-    - Typical starting value: 0.01 (reconstruction quality first, organization second)
+  Early stopping tracks MSE (not total loss) because total loss is
+  dominated by β × KL which changes during warmup.
 
 COURSE REFERENCE:
   • train_autoencoder.py — same structure, this file is adapted from it
@@ -63,10 +62,10 @@ CONFIG = {
     "lr": 1e-3,
     "weight_decay": 1e-3,
     "latent_dim": 1024,
-    "embed_dim": 64,                     # NEW: class embedding size
+    "embed_dim": 64,                     # class embedding size
     "beta": 0.01,                        # Target KL weight after warmup
-    "beta_start": 0.0,                  # β annealing: start with no KL (pure autoencoder)
-    "warmup_epochs": 10,                # β annealing: gradually increase β over N epochs
+    "beta_start": 0.0,                   # β annealing: start with no KL
+    "warmup_epochs": 10,                 # β annealing + frozen encoder/decoder duration
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -138,27 +137,25 @@ train_loader, val_loader, test_loader, num_classes = get_dataloaders(
 
 print(f"✅ Data loaded: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val / {len(test_loader.dataset)} test")
 
-# ==================== MODEL, LOSS, OPTIMIZER, SCHEDULER ====================
+# ==================== MODEL ====================
 model = SimpleAudioVAE(latent_dim=LATENT_DIM, num_classes=num_classes, embed_dim=EMBED_DIM)
 
-# ── #2: Load pretrained autoencoder encoder weights ──
+# ── Load pretrained autoencoder weights ──
 #
-# WHY: The VAE encoder is identical to the autoencoder encoder.
-# Instead of learning feature extraction from scratch (slow, harder),
-# we start from a trained encoder that already knows how to compress
-# spectrograms. Only the VAE-specific parts (μ, log_var, class embedding)
-# start random — the model only needs to learn the new probabilistic bottleneck.
+# We copy encoder conv blocks + decoder conv blocks + fc_decode from the
+# autoencoder. These are the "feature extraction" and "spectrogram generation"
+# parts that transfer directly.
 #
-# WHAT GETS COPIED:
-#   encode.*           → encoder conv blocks (feature extraction)
-#   decode.*           → decoder conv blocks (spectrogram generation)
-#   fc_decode.*        → decoder linear layer
+# We do NOT copy fc_encode → fc_mu because:
+#   - fc_encode was trained without KL constraint → produces large μ values (~60)
+#   - Large μ → KL = 0.5 × Σ(μ²) ≈ 2,000,000
+#   - Even tiny β creates enormous gradients → destroys training
+#   - Instead, fc_mu starts random and learns to produce μ near 0
 #
-# WHAT STAYS RANDOM (VAE-specific, must learn from scratch):
-#   fc_mu.*            → mean head (new)
-#   fc_log_var.*       → log-variance head (new)
-#   class_embed.*      → class embedding table (new)
-#   class_project.*    → class projection layer (new)
+# During warmup (first 10 epochs), encoder + decoder are FROZEN.
+# Only fc_mu, fc_log_var, class_embed, class_project are trained.
+# This lets the new VAE heads adapt to the pretrained features
+# without the KL gradient destroying the encoder.
 #
 ae_checkpoint_path = f"models/best_autoencoder_{MODE}.pth"
 if os.path.exists(ae_checkpoint_path):
@@ -177,50 +174,23 @@ if os.path.exists(ae_checkpoint_path):
         else:
             skipped.append(key)
 
-    # ── Initialize VAE heads from autoencoder's fc_encode ──
-    #
-    # THE PROBLEM THIS SOLVES:
-    #   Autoencoder: fc_encode (trained) → fc_decode (trained) = MSE 0.051
-    #   VAE (before this fix): fc_mu (RANDOM) → fc_decode (trained) = MSE 0.210
-    #   VAE (after this fix):  fc_mu (from fc_encode) → fc_decode (trained) ≈ MSE 0.051
-    #
-    # The autoencoder's fc_encode maps flat_features → latent_dim.
-    # The VAE's fc_mu does the EXACT SAME thing — it's just renamed.
-    # By copying fc_encode's weights to fc_mu, the VAE starts with
-    # the same z distribution the autoencoder produced.
-    # fc_decode already expects that distribution → instant compatibility.
-    #
-    # fc_log_var is initialized to zeros → log_var=0 → σ=1 → small noise.
-    # The model starts nearly deterministic (like the autoencoder)
-    # and gradually learns to add randomness as KL warmup kicks in.
-    #
-    ae_fc_encode_weight = ae_state.get('fc_encode.weight')
-    ae_fc_encode_bias = ae_state.get('fc_encode.bias')
-    if ae_fc_encode_weight is not None:
-        # Copy fc_encode → fc_mu (same shape: latent_dim × flat_dim)
-        vae_state['fc_mu.weight'] = ae_fc_encode_weight
-        vae_state['fc_mu.bias'] = ae_fc_encode_bias
-        # Initialize fc_log_var to zeros → σ=1, near-deterministic start
-        vae_state['fc_log_var.weight'] = torch.zeros_like(vae_state['fc_log_var.weight'])
-        vae_state['fc_log_var.bias'] = torch.zeros_like(vae_state['fc_log_var.bias'])
-        print(f"   🔑 Initialized fc_mu from autoencoder's fc_encode")
-        print(f"   🔑 Initialized fc_log_var to zeros (σ=1, near-deterministic start)")
-
     model.load_state_dict(vae_state)
 
     print(f"✅ Loaded pretrained autoencoder weights from {ae_checkpoint_path}")
-    print(f"   Copied:   {len(copied)} layers ({', '.join(copied[:5])}...)")
-    print(f"   Skipped:  {len(skipped)} layers (fc_encode — used to init VAE heads instead)")
+    print(f"   Copied:   {len(copied)} layers (encoder + decoder + fc_decode)")
+    print(f"   Skipped:  {len(skipped)} layers (fc_encode, fc_mu, fc_log_var, class_embed → learn from scratch)")
     print(f"   Source:   epoch {ae_ckpt.get('epoch', '?')}, val_mse={ae_ckpt.get('val_mse', '?')}")
 else:
     print(f"⚠️  No pretrained autoencoder found at {ae_checkpoint_path}")
     print(f"   Run 'python src/train_autoencoder.py' first for best results")
     print(f"   Training VAE from scratch (still works, just needs more epochs)")
 
+# ==================== LOSS, OPTIMIZER, SCHEDULER ====================
+
 # VAE uses MSE for reconstruction — same as autoencoder
 reconstruction_loss = nn.MSELoss()
 
-# Optimizer + scheduler — same as autoencoder
+# Optimizer + scheduler
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
@@ -240,48 +210,17 @@ def vae_loss(reconstructed, target, mu, log_var, beta):
     """
     VAE loss = reconstruction_loss + beta * KL_divergence.
 
-    Compared to autoencoder which only has MSE, VAE adds KL divergence.
-
-    WHY TWO LOSSES:
-      - Reconstruction (MSE):  "make the output look like the input"
-        → drives the encoder/decoder to preserve spectrogram details
-      - KL divergence:         "keep latent space organized as N(0,1)"
-        → ensures we can sample random z at generation time
-
-    WHY β (beta):
-      These two losses compete — MSE wants z to encode EVERYTHING (max info),
-      KL wants z to be standard normal (min info). β balances them.
-      Start small (0.01) so reconstruction quality stays good.
-
-    KL formula: -0.5 * Σ(1 + log(σ²) - μ² - σ²)
-      When μ=0, σ²=1:  -0.5 * Σ(1 + 0 - 0 - 1) = 0  ← perfect, no penalty
-      When μ=5, σ²=1:  -0.5 * Σ(1 + 0 - 25 - 1) = 12.5  ← far from N(0,1), big penalty
-
-    Args:
-        reconstructed: model output [B, 1, 64, W]
-        target:        original spectrogram [B, 1, 64, W]
-        mu:            latent mean [B, latent_dim]
-        log_var:       latent log variance [B, latent_dim]
-        beta:          weight for KL loss (default from CONFIG)
+    The log_var is clamped to [-10, 10] to prevent float16 overflow under AMP.
+    Without clamping, exp(log_var) overflows float16 when log_var > 11.
 
     Returns:
-        total_loss:     scalar (reconstruction + β * KL)
-        recon_loss_val: scalar (MSE only, for logging)
-        kl_loss_val:    scalar (KL only, for logging)
+        total_loss, recon_loss_val, kl_loss_val
     """
-    # Reconstruction — same as autoencoder
+    # Reconstruction
     recon_loss = reconstruction_loss(reconstructed, target)
 
-    # KL divergence — NEW for VAE
-    # sum over latent_dim, mean over batch
-    #
-    # FIX: clamp log_var before exp() to prevent float16 overflow under AMP.
-    # When using CUDA mixed precision (autocast), log_var is float16.
-    # float16 max = 65504. exp(11.1) ≈ 66514 > 65504 → overflow → Inf → NaN.
-    # Clamping to max=10 keeps exp() safe: exp(10) = 22026 << 65504.
-    # This has negligible impact on training (σ > exp(5) ≈ 148 is already extreme).
-    #
-    log_var_clamped = torch.clamp(log_var, max=10)
+    # KL divergence with clamped log_var for numerical stability
+    log_var_clamped = torch.clamp(log_var, min=-10, max=10)
     kl_loss = -0.5 * torch.mean(
         torch.sum(1 + log_var_clamped - mu.pow(2) - log_var_clamped.exp(), dim=1)
     )
@@ -292,18 +231,47 @@ def vae_loss(reconstructed, target, mu, log_var, beta):
     return total, recon_loss.item(), kl_loss.item()
 
 
+# ==================== FREEZE / UNFREEZE HELPERS ====================
+
+def freeze_pretrained(model):
+    """
+    Freeze encoder + decoder during warmup.
+
+    WHY: The pretrained encoder/decoder already work well. If we train them
+    from epoch 1, the KL gradient (even with small β) will distort the feature
+    extraction before the VAE heads have learned to produce reasonable μ/σ.
+
+    By freezing, the VAE heads (fc_mu, fc_log_var, class_embed, class_project)
+    learn to map the pretrained features to a N(0,1)-compatible latent space
+    without disturbing the feature extraction.
+    """
+    for param in model.encode.parameters():
+        param.requires_grad = False
+    for param in model.decode.parameters():
+        param.requires_grad = False
+    for param in model.fc_decode.parameters():
+        param.requires_grad = False
+    print("❄️  Frozen: encoder + decoder + fc_decode (only training VAE heads)")
+
+
+def unfreeze_all(model):
+    """
+    Unfreeze all layers after warmup.
+
+    WHY: Now that the VAE heads produce reasonable μ/σ, we can fine-tune
+    the entire model end-to-end. The encoder/decoder adapt to work with
+    the new probabilistic bottleneck.
+    """
+    for param in model.parameters():
+        param.requires_grad = True
+    print("🔥 Unfrozen: all layers (full fine-tuning)")
+
+
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_transform,
                 scaler, use_amp, beta, pbar=None):
-    """
-    Train one epoch.
-
-    DIFFERENCES from autoencoder train_epoch:
-      1. model(spectrograms, labels) — labels are NOW used (for conditioning)
-      2. model returns (reconstructed, mu, log_var) — need all three
-      3. vae_loss() instead of simple MSE — includes KL divergence
-    """
+    """Train one epoch."""
     model.train()
     running_loss = 0.0
     running_recon = 0.0
@@ -313,7 +281,6 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
         waveforms = waveforms.to(device)
         labels = labels.to(device)
 
-        # Transform raw waveforms → mel spectrograms on GPU
         spectrograms = train_transform(waveforms)
 
         optimizer.zero_grad(set_to_none=True)
@@ -380,12 +347,19 @@ def validate_epoch(model, val_loader, device, eval_transform, beta, pbar=None):
 def training_loop(model, train_loader, val_loader, optimizer, scheduler,
                   num_epochs, device, train_transform, eval_transform, scaler, use_amp):
     """
-    Full training loop — same structure as autoencoder, but tracks 3 losses.
-    Early stopping on LOWEST total val loss (reconstruction + β * KL).
+    Full training loop with 3-phase strategy:
+
+      Phase A (warmup): Frozen encoder/decoder, β ramps 0→target
+      Phase B (finetune): All unfrozen, β at target
+      Early stopping on val MSE (not total loss!)
     """
     model.to(device)
 
-    best_val_loss = float("inf")
+    # ── Phase A: Freeze pretrained layers during warmup ──
+    if os.path.exists(ae_checkpoint_path):
+        freeze_pretrained(model)
+
+    best_val_mse = float("inf")
     best_model_state = None
     best_epoch = 0
     patience_counter = 0
@@ -398,30 +372,22 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print(f"🚀 VAE TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {num_epochs}")
     print(f"   β annealing: {BETA_START} → {BETA} over {WARMUP_EPOCHS} epochs")
+    print(f"   Early stopping: val MSE (patience={PATIENCE})")
     print(f"   Best model → {BEST_MODEL_PATH}")
     print("=" * 70)
 
     for epoch in range(num_epochs):
 
-        # ── #1: β annealing (KL warmup) ──
-        #
-        # WHY: The VAE has two competing objectives — reconstruction (MSE) and
-        # latent space organization (KL). Learning both simultaneously is hard.
-        #
-        # Solution: learn them sequentially.
-        #   Epochs 1-10:  β ≈ 0 → pure autoencoder, learn reconstruction first
-        #   Epochs 11-20: β ramps up → gradually introduce KL, organize latent space
-        #   Epochs 21+:   β = 0.01 → full VAE training
-        #
-        # This is the standard training approach for VAEs, used by:
-        #   - Stable Diffusion (linear KL warmup over first 10K steps)
-        #   - VQ-VAE-2 (progressive training)
-        #   - NVIDIA NeMo (default audio VAE training)
-        #
+        # ── β annealing ──
         if epoch < WARMUP_EPOCHS:
-            beta = BETA_START + (BETA - BETA_START) * (epoch / WARMUP_EPOCHS)
+            beta = BETA_START + (BETA - BETA_START) * (epoch / max(WARMUP_EPOCHS, 1))
         else:
             beta = BETA
+
+        # ── Phase transition: unfreeze after warmup ──
+        if epoch == WARMUP_EPOCHS and os.path.exists(ae_checkpoint_path):
+            unfreeze_all(model)
+
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
             total_batches=len(train_loader),
@@ -457,20 +423,27 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
         current_lr = scheduler.get_last_lr()[0]
 
+        phase = "❄️ warmup" if epoch < WARMUP_EPOCHS else "🔥 finetune"
         train_pbar.update_epoch(epoch + 1, postfix_dict={
+            "phase": phase,
             "train": f"{epoch_loss:.4f}",
-            "val": f"{epoch_val_loss:.4f}",
-            "mse": f"{epoch_val_recon:.4f}",
-            "kl": f"{epoch_val_kl:.4f}",
+            "val_mse": f"{epoch_val_recon:.4f}",
+            "kl": f"{epoch_val_kl:.2f}",
             "β": f"{beta:.5f}",
-            "lr": f"{current_lr:.6f}",
         })
 
         scheduler.step()
 
-        # === Save best model when val loss improves (LOWER is better!) ===
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
+        # === Early stopping on val MSE (not total loss!) ===
+        #
+        # WHY track MSE not total loss:
+        #   total = MSE + β × KL
+        #   During warmup β goes 0→0.01, so total loss keeps increasing
+        #   even if MSE improves. Epoch 1 (β=0) would always "win".
+        #   MSE is the actual reconstruction quality — that's what we care about.
+        #
+        if epoch_val_recon < best_val_mse:
+            best_val_mse = epoch_val_recon
             best_epoch = epoch + 1
             best_model_state = copy.deepcopy(model.state_dict())
 
@@ -480,18 +453,18 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
                 'embed_dim': EMBED_DIM,
                 'num_classes': num_classes,
                 'beta': BETA,
-                'val_loss': best_val_loss,
+                'val_mse': best_val_mse,
                 'epoch': best_epoch,
                 'mode': MODE,
             }, BEST_MODEL_PATH)
 
-            print(f"  → ✅ New best model saved (loss={best_val_loss:.6f}, "
-                  f"mse={epoch_val_recon:.4f}, kl={epoch_val_kl:.4f} at epoch {best_epoch})")
+            print(f"  → ✅ New best model saved (mse={best_val_mse:.6f}, "
+                  f"kl={epoch_val_kl:.2f}, β={beta:.5f} at epoch {best_epoch})")
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                print(f"\n⏹️ Early stopping: {patience_counter} epochs without improvement")
+                print(f"\n⏹️ Early stopping: {patience_counter} epochs without MSE improvement")
                 break
 
     if best_model_state:
@@ -505,7 +478,6 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 def generate_demo(model, device, eval_transform):
     """
     After training, generate sample sounds from each class.
-    This is the exciting part — the model creates sounds it has NEVER seen!
     """
     print("\n" + "=" * 70)
     print("🎨 GENERATION DEMO — Creating new animal sounds!")
@@ -515,7 +487,6 @@ def generate_demo(model, device, eval_transform):
 
     model.eval()
     for class_idx, class_name in enumerate(class_names):
-        # Generate 3 samples per class to show diversity
         spectrograms = model.sample(
             label=class_idx,
             num_samples=3,
@@ -523,7 +494,10 @@ def generate_demo(model, device, eval_transform):
         )
         print(f"  {class_name}: generated {spectrograms.shape[0]} spectrograms "
               f"shape={spectrograms.shape[2:]}")
-        # In Phase 5, we'll convert these to playable audio with Griffin-Lim
+
+    # Interpolation demo: dog → cat
+    print("\n  🔀 Interpolation demo: Dog → Cat (5 steps)")
+    print("     (Requires test samples — will show in Phase 5 evaluation)")
 
 
 # ==================== RUN ====================
@@ -542,7 +516,7 @@ if __name__ == "__main__":
         use_amp=use_amp,
     )
 
-    # Plot training curves (only pass first 2 lists — train/val loss)
+    # Plot training curves
     try:
         train_losses, val_losses = training_metrics[0], training_metrics[1]
         helper_utils.plot_training_metrics([train_losses, val_losses, val_losses])
