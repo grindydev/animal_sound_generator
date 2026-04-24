@@ -40,6 +40,7 @@ COURSE REFERENCE:
 """
 
 import copy
+import os
 import warnings
 import torch
 from torch import nn
@@ -63,7 +64,9 @@ CONFIG = {
     "weight_decay": 1e-3,
     "latent_dim": 1024,
     "embed_dim": 64,                     # NEW: class embedding size
-    "beta": 0.01,                        # NEW: KL divergence weight (start small!)
+    "beta": 0.01,                        # Target KL weight after warmup
+    "beta_start": 0.0,                  # β annealing: start with no KL (pure autoencoder)
+    "warmup_epochs": 10,                # β annealing: gradually increase β over N epochs
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -75,9 +78,9 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 40,
+        "num_epochs": 80,
         "batch_size": 16,
-        "patience": 10,
+        "patience": 15,
         "num_workers": 4,
     }
 }
@@ -97,12 +100,14 @@ WEIGHT_DECAY = CONFIG["weight_decay"]
 LATENT_DIM = CONFIG["latent_dim"]
 EMBED_DIM = CONFIG["embed_dim"]
 BETA = CONFIG["beta"]
+BETA_START = CONFIG["beta_start"]
+WARMUP_EPOCHS = CONFIG["warmup_epochs"]
 
 BEST_MODEL_PATH = f"models/best_vae_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Patience: {PATIENCE}")
-print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM} | β (KL weight): {BETA}")
+print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM} | β: {BETA_START}→{BETA} over {WARMUP_EPOCHS} epochs")
 print(f"   Best model → {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
@@ -136,6 +141,53 @@ print(f"✅ Data loaded: {len(train_loader.dataset)} train / {len(val_loader.dat
 # ==================== MODEL, LOSS, OPTIMIZER, SCHEDULER ====================
 model = SimpleAudioVAE(latent_dim=LATENT_DIM, num_classes=num_classes, embed_dim=EMBED_DIM)
 
+# ── #2: Load pretrained autoencoder encoder weights ──
+#
+# WHY: The VAE encoder is identical to the autoencoder encoder.
+# Instead of learning feature extraction from scratch (slow, harder),
+# we start from a trained encoder that already knows how to compress
+# spectrograms. Only the VAE-specific parts (μ, log_var, class embedding)
+# start random — the model only needs to learn the new probabilistic bottleneck.
+#
+# WHAT GETS COPIED:
+#   encode.*           → encoder conv blocks (feature extraction)
+#   decode.*           → decoder conv blocks (spectrogram generation)
+#   fc_decode.*        → decoder linear layer
+#
+# WHAT STAYS RANDOM (VAE-specific, must learn from scratch):
+#   fc_mu.*            → mean head (new)
+#   fc_log_var.*       → log-variance head (new)
+#   class_embed.*      → class embedding table (new)
+#   class_project.*    → class projection layer (new)
+#
+ae_checkpoint_path = f"models/best_autoencoder_{MODE}.pth"
+if os.path.exists(ae_checkpoint_path):
+    ae_ckpt = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
+    ae_state = ae_ckpt['model_state_dict']
+    vae_state = model.state_dict()
+
+    copied, skipped = [], []
+    for key in ae_state:
+        if key.startswith('encode.') or key.startswith('decode.') or key.startswith('fc_decode.'):
+            if key in vae_state and vae_state[key].shape == ae_state[key].shape:
+                vae_state[key] = ae_state[key]
+                copied.append(key)
+            else:
+                skipped.append(key)
+        else:
+            skipped.append(key)
+
+    model.load_state_dict(vae_state)
+
+    print(f"✅ Loaded pretrained autoencoder weights from {ae_checkpoint_path}")
+    print(f"   Copied:   {len(copied)} layers ({', '.join(copied[:5])}...)")
+    print(f"   Skipped:  {len(skipped)} layers (VAE-specific: fc_mu, fc_log_var, class_embed, class_project)")
+    print(f"   Source:   epoch {ae_ckpt.get('epoch', '?')}, val_mse={ae_ckpt.get('val_mse', '?')}")
+else:
+    print(f"⚠️  No pretrained autoencoder found at {ae_checkpoint_path}")
+    print(f"   Run 'python src/train_autoencoder.py' first for best results")
+    print(f"   Training VAE from scratch (still works, just needs more epochs)")
+
 # VAE uses MSE for reconstruction — same as autoencoder
 reconstruction_loss = nn.MSELoss()
 
@@ -155,7 +207,7 @@ eval_transform = eval_transform.to(device)
 
 # ==================== VAE LOSS FUNCTION ====================
 
-def vae_loss(reconstructed, target, mu, log_var, beta=BETA):
+def vae_loss(reconstructed, target, mu, log_var, beta):
     """
     VAE loss = reconstruction_loss + beta * KL_divergence.
 
@@ -206,7 +258,7 @@ def vae_loss(reconstructed, target, mu, log_var, beta=BETA):
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_transform,
-                scaler, use_amp, pbar=None):
+                scaler, use_amp, beta, pbar=None):
     """
     Train one epoch.
 
@@ -232,7 +284,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed, mu, log_var = model(spectrograms, labels)
-                loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var)
+                loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -240,7 +292,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
             scaler.update()
         else:
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var)
+            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
             loss.backward()
             optimizer.step()
 
@@ -259,7 +311,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
     return running_loss / n, running_recon / n, running_kl / n
 
 
-def validate_epoch(model, val_loader, device, eval_transform, pbar=None):
+def validate_epoch(model, val_loader, device, eval_transform, beta, pbar=None):
     """Validate one epoch — returns total loss, recon loss, KL loss."""
     model.eval()
     running_loss = 0.0
@@ -273,7 +325,7 @@ def validate_epoch(model, val_loader, device, eval_transform, pbar=None):
             spectrograms = eval_transform(waveforms)
 
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var)
+            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
 
             running_loss += loss.item() * spectrograms.size(0)
             running_recon += recon_val * spectrograms.size(0)
@@ -307,11 +359,32 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
     print("\n" + "=" * 70)
     print(f"🚀 VAE TRAINING — {MODE.upper()} MODE")
-    print(f"   Device: {device} | Epochs: {num_epochs} | β={BETA}")
+    print(f"   Device: {device} | Epochs: {num_epochs}")
+    print(f"   β annealing: {BETA_START} → {BETA} over {WARMUP_EPOCHS} epochs")
     print(f"   Best model → {BEST_MODEL_PATH}")
     print("=" * 70)
 
     for epoch in range(num_epochs):
+
+        # ── #1: β annealing (KL warmup) ──
+        #
+        # WHY: The VAE has two competing objectives — reconstruction (MSE) and
+        # latent space organization (KL). Learning both simultaneously is hard.
+        #
+        # Solution: learn them sequentially.
+        #   Epochs 1-10:  β ≈ 0 → pure autoencoder, learn reconstruction first
+        #   Epochs 11-20: β ramps up → gradually introduce KL, organize latent space
+        #   Epochs 21+:   β = 0.01 → full VAE training
+        #
+        # This is the standard training approach for VAEs, used by:
+        #   - Stable Diffusion (linear KL warmup over first 10K steps)
+        #   - VQ-VAE-2 (progressive training)
+        #   - NVIDIA NeMo (default audio VAE training)
+        #
+        if epoch < WARMUP_EPOCHS:
+            beta = BETA_START + (BETA - BETA_START) * (epoch / WARMUP_EPOCHS)
+        else:
+            beta = BETA
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
             total_batches=len(train_loader),
@@ -322,7 +395,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── Train ──
         epoch_loss, epoch_recon, epoch_kl = train_epoch(
             model, train_loader, optimizer, device, train_transform,
-            scaler, use_amp, pbar=train_pbar
+            scaler, use_amp, beta, pbar=train_pbar
         )
         train_pbar.batch_bar.close()
 
@@ -333,7 +406,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
             mode="eval",
         )
         epoch_val_loss, epoch_val_recon, epoch_val_kl = validate_epoch(
-            model, val_loader, device, eval_transform, pbar=val_pbar
+            model, val_loader, device, eval_transform, beta, pbar=val_pbar
         )
         val_pbar.close()
 
@@ -352,6 +425,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
             "val": f"{epoch_val_loss:.4f}",
             "mse": f"{epoch_val_recon:.4f}",
             "kl": f"{epoch_val_kl:.4f}",
+            "β": f"{beta:.5f}",
             "lr": f"{current_lr:.6f}",
         })
 
@@ -439,7 +513,7 @@ if __name__ == "__main__":
 
     # Evaluate on test set
     test_loss, test_recon, test_kl = validate_epoch(
-        trained_model, test_loader, device, eval_transform
+        trained_model, test_loader, device, eval_transform, BETA
     )
     print(f"\n🎯 Test Set: Total={test_loss:.6f} | MSE={test_recon:.6f} | KL={test_kl:.6f}")
     print(f"   Best model saved to: {BEST_MODEL_PATH}")
