@@ -224,6 +224,14 @@ class SimpleAudioVAE(nn.Module):
         Returns:
             z: sampled latent vector                   [B, latent_dim]
         """
+        # Clamp log_var to prevent float16 overflow under AMP.
+        # Without this, log_var can reach ±24 after one optimizer step (because
+        # fc_log_var is initialized to zeros and the gradient from the
+        # reparameterization can cause large updates). In float16,
+        # exp(0.5 * 24) = exp(12) ≈ 162,755 > 65,504 (float16 max) → Inf → NaN.
+        # Clamping to [-10, 10] keeps std in [exp(-5), exp(5)] = [0.007, 148],
+        # which is more than enough range for practical training.
+        log_var = torch.clamp(log_var, min=-10, max=10)
         std = torch.exp(0.5 * log_var)  # σ = sqrt(exp(log_var))
         eps = torch.randn_like(std)      # ε ~ N(0,1), same shape as std
         return mu + std * eps             # z = μ + σ * ε
