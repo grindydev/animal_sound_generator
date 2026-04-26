@@ -65,7 +65,8 @@ CONFIG = {
     "embed_dim": 64,                     # class embedding size
     "beta": 0.01,                        # Target KL weight after warmup
     "beta_start": 0.0,                   # β annealing: start with no KL
-    "warmup_epochs": 10,                 # β annealing + frozen encoder/decoder duration
+    "warmup_epochs": 10,                 # frozen encoder/decoder duration
+    "ramp_epochs": 30,                   # β ramps 0→target over N epochs AFTER warmup
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -77,9 +78,9 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 80,
+        "num_epochs": 100,
         "batch_size": 16,
-        "patience": 15,
+        "patience": 20,
         "num_workers": 4,
     }
 }
@@ -101,12 +102,13 @@ EMBED_DIM = CONFIG["embed_dim"]
 BETA = CONFIG["beta"]
 BETA_START = CONFIG["beta_start"]
 WARMUP_EPOCHS = CONFIG["warmup_epochs"]
+RAMP_EPOCHS = CONFIG["ramp_epochs"]
 
 BEST_MODEL_PATH = f"models/best_vae_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Patience: {PATIENCE}")
-print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM} | β: {BETA_START}→{BETA} over {WARMUP_EPOCHS} epochs")
+print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM} | β: 0→{BETA} over {WARMUP_EPOCHS}+{RAMP_EPOCHS} epochs")
 print(f"   Best model → {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
@@ -388,29 +390,34 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print("\n" + "=" * 70)
     print(f"🚀 VAE TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {num_epochs}")
-    print(f"   β annealing: {BETA_START} → {BETA} over {WARMUP_EPOCHS} epochs")
+    print(f"   β schedule: {WARMUP_EPOCHS} warmup (frozen, β=0) → {RAMP_EPOCHS} ramp → β={BETA}")
     print(f"   Early stopping: val MSE (patience={PATIENCE})")
     print(f"   Best model → {BEST_MODEL_PATH}")
     print("=" * 70)
 
     for epoch in range(num_epochs):
 
-    # ── β annealing ──
-    #
-    # Two-phase schedule:
-    #   Phase A (warmup):    β = 0.0 EXACTLY, encoder+decoder frozen
-    #   Phase B (ramp):      β ramps from 0 → target over WARMUP_EPOCHS, all unfrozen
-    #
-    # WHY β must stay at 0 during warmup:
-    #   Even β=0.001 × KL(600K) = 600 gradient → destroys fc_mu instantly.
-    #   During warmup, fc_mu must learn WITHOUT any KL pressure.
-    #
-    if epoch < WARMUP_EPOCHS:
-        beta = 0.0  # ALWAYS 0 during warmup — no ramp!
-    else:
-        ramp_epochs = WARMUP_EPOCHS  # ramp over same number of epochs after warmup
-        ramp_progress = min(1.0, (epoch - WARMUP_EPOCHS) / ramp_epochs)
-        beta = BETA * ramp_progress
+        # ── β schedule ──
+        #
+        # Three phases:
+        #   Epochs  1-10:  β=0,      frozen (learn VAE heads for reconstruction)
+        #   Epochs 11-40:  β 0→0.01, unfrozen (gradual transition, decoder adapts)
+        #   Epochs 41+:    β=0.01,   full VAE training
+        #
+        # WHY 30 epochs for ramp (not 10):
+        #   During warmup fc_mu learns large μ (KL≈5M, no penalty since β=0).
+        #   When β starts, KL gradient pushes μ toward 0. If β ramps too fast
+        #   (10 epochs), μ collapses in 1-2 epochs → decoder suddenly gets
+        #   completely different z → MSE jumps 4×. With 30 epochs, μ shrinks
+        #   gradually giving the decoder time to adapt to the changing z.
+        #
+        if epoch < WARMUP_EPOCHS:
+            beta = 0.0
+        elif epoch < WARMUP_EPOCHS + RAMP_EPOCHS:
+            ramp_progress = (epoch - WARMUP_EPOCHS) / RAMP_EPOCHS
+            beta = BETA * ramp_progress
+        else:
+            beta = BETA
 
         # ── Phase transition: unfreeze after warmup ──
         if epoch == WARMUP_EPOCHS and os.path.exists(ae_checkpoint_path):
