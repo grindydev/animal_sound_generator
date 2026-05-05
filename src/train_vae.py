@@ -422,6 +422,14 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── Phase transition: unfreeze after warmup ──
         if epoch == WARMUP_EPOCHS and os.path.exists(ae_checkpoint_path):
             unfreeze_all(model)
+            # Reset early stopping so it doesn't compare against warmup MSE.
+            # KL pressure will temporarily worsen MSE during the ramp phase;
+            # we want to give the model room to recover.
+            best_val_mse = float("inf")
+            best_model_state = None
+            best_epoch = 0
+            patience_counter = 0
+            print(f"  → 🔄 Early stopping reset (KL pressure starts now, patience={PATIENCE} epochs)")
 
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
