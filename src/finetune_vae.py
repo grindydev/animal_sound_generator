@@ -54,7 +54,7 @@ CONFIG = {
     "beta": 0.005,                       # Target KL weight after warmup
     "free_bits": 0.1,                    # Minimum KL per latent dim (0 = disabled)
     "warmup_epochs": 10,                 # Frozen encoder/decoder, β=0
-    "ramp_epochs": 50,                   # β ramps 0→target over N epochs AFTER warmup (exponential)
+    "ramp_epochs": 30,                   # β exponential ramp (10+30=40, then 10 epochs full β)
     "beta_k": 3,                         # Curve steepness for exponential ramp (higher = faster)
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
@@ -66,7 +66,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 100,
+        "num_epochs": 50,
         "batch_size": 16,
         "num_workers": 4,
     }
