@@ -126,7 +126,7 @@ FREE_BITS = CONFIG["free_bits"]
 BEST_MODEL_PATH = f"models/best_vae_scratch_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE (FROM SCRATCH — BEST PRACTICES)")
-print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} (warmup: {LR_WARMUP_EPOCHS}) | Patience: {PATIENCE}")
+print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} (warmup: {LR_WARMUP_EPOCHS})")
 print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM}")
 print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → exp ramp over {BETA_RAMP_EPOCHS} epochs → target={BETA}")
 print(f"   Free bits: {FREE_BITS} per dim ({'ON' if FREE_BITS > 0 else 'OFF'})")
