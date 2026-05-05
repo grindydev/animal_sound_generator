@@ -471,6 +471,18 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── β schedule ──
         beta_val = get_beta(epoch)
 
+        # ── Reset early stopping at end of free phase (β=0 → β ramp) ──
+        # During β=0, MSE is artificially low (no KL pressure).
+        # The "best" model from epoch 9 is a glorified autoencoder
+        # with chaotic latent space → can't generate.
+        # Reset best tracking so we pick the best GENERATIVE model.
+        if epoch == BETA_FREE_EPOCHS:
+            best_val_mse = float("inf")
+            best_model_state = None
+            best_epoch = 0
+            patience_counter = 0
+            print(f"  → 🔄 Early stopping reset (β ramp starts, patience={PATIENCE} epochs)")
+
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
             total_batches=len(train_loader),
