@@ -63,10 +63,10 @@ CONFIG = {
     "weight_decay": 1e-3,
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
-    "beta": 0.01,                        # Target KL weight after warmup
+    "beta": 0.005,                       # Target KL weight after warmup (lower = better reconstruction quality)
     "beta_start": 0.0,                   # β annealing: start with no KL
     "warmup_epochs": 10,                 # frozen encoder/decoder duration
-    "ramp_epochs": 30,                   # β ramps 0→target over N epochs AFTER warmup
+    "ramp_epochs": 50,                   # β ramps 0→target over N epochs AFTER warmup (longer = smoother transition)
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -80,7 +80,7 @@ CONFIG = {
     "train": {
         "num_epochs": 100,
         "batch_size": 16,
-        "patience": 20,
+        "patience": 50,
         "num_workers": 4,
     }
 }
@@ -400,15 +400,15 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── β schedule ──
         #
         # Three phases:
-        #   Epochs  1-10:  β=0,      frozen (learn VAE heads for reconstruction)
-        #   Epochs 11-40:  β 0→0.01, unfrozen (gradual transition, decoder adapts)
-        #   Epochs 41+:    β=0.01,   full VAE training
+        #   Epochs  1-10:  β=0,       frozen (learn VAE heads for reconstruction)
+        #   Epochs 11-60:  β 0→0.005, unfrozen (gradual transition, decoder adapts)
+        #   Epochs 61+:    β=0.005,   full VAE training
         #
-        # WHY 30 epochs for ramp (not 10):
-        #   During warmup fc_mu learns large μ (KL≈5M, no penalty since β=0).
+        # WHY 50 epochs for ramp (not 30):
+        #   During warmup fc_mu learns large μ (KL≈4.5M, no penalty since β=0).
         #   When β starts, KL gradient pushes μ toward 0. If β ramps too fast
         #   (10 epochs), μ collapses in 1-2 epochs → decoder suddenly gets
-        #   completely different z → MSE jumps 4×. With 30 epochs, μ shrinks
+        #   completely different z → MSE jumps 4×. With 50 epochs, μ shrinks
         #   gradually giving the decoder time to adapt to the changing z.
         #
         if epoch < WARMUP_EPOCHS:
