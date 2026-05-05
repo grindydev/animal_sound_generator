@@ -27,7 +27,7 @@ COURSE REFERENCE:
   • L3-M2 stable_diffusion — the math behind VAEs and latent spaces
 """
 
-import copy
+import math
 import os
 import warnings
 import torch
@@ -49,27 +49,25 @@ CONFIG = {
     "train_fraction": 0.6,
     "val_fraction": 0.2,
     "lr": 1e-3,
-    "weight_decay": 1e-3,
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
-    "beta": 0.005,                       # Target KL weight after warmup (lower = better reconstruction quality)
-    "beta_start": 0.0,                   # β annealing: start with no KL
-    "warmup_epochs": 10,                 # frozen encoder/decoder duration
-    "ramp_epochs": 50,                   # β ramps 0→target over N epochs AFTER warmup (longer = smoother transition)
-    "optimizer": "AdamW",
+    "beta": 0.005,                       # Target KL weight after warmup
+    "free_bits": 0.1,                    # Minimum KL per latent dim (0 = disabled)
+    "warmup_epochs": 10,                 # Frozen encoder/decoder, β=0
+    "ramp_epochs": 50,                   # β ramps 0→target over N epochs AFTER warmup (exponential)
+    "beta_k": 3,                         # Curve steepness for exponential ramp (higher = faster)
+    "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
 
     "test": {
         "num_epochs": 5,
         "batch_size": 16,
-        "patience": 5,
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 100,
         "batch_size": 16,
-        "patience": 50,
         "num_workers": 4,
     }
 }
@@ -80,25 +78,25 @@ SETTINGS = CONFIG[MODE]
 
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
-PATIENCE = SETTINGS["patience"]
 NUM_WORKERS = SETTINGS["num_workers"]
 TRAIN_FRACTION = CONFIG["train_fraction"]
 VAL_FRACTION = CONFIG["val_fraction"]
 LR = CONFIG["lr"]
-WEIGHT_DECAY = CONFIG["weight_decay"]
 LATENT_DIM = CONFIG["latent_dim"]
 EMBED_DIM = CONFIG["embed_dim"]
 BETA = CONFIG["beta"]
-BETA_START = CONFIG["beta_start"]
+FREE_BITS = CONFIG["free_bits"]
 WARMUP_EPOCHS = CONFIG["warmup_epochs"]
 RAMP_EPOCHS = CONFIG["ramp_epochs"]
+BETA_K = CONFIG["beta_k"]
 
 BEST_MODEL_PATH = f"models/best_vae_finetune_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE")
-print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Patience: {PATIENCE}")
-print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM} | β: 0→{BETA} over {WARMUP_EPOCHS}+{RAMP_EPOCHS} epochs")
-print(f"   Best model → {BEST_MODEL_PATH}")
+print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR}")
+print(f"   Latent dim: {LATENT_DIM} | β: 0→{BETA} over {WARMUP_EPOCHS}+{RAMP_EPOCHS} epochs (exp ramp, k={BETA_K})")
+print(f"   Free bits: {FREE_BITS} | Optimizer: {CONFIG['optimizer']}")
+print(f"   Model saved to: {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
 if CONFIG["device"] == "auto":
@@ -198,8 +196,8 @@ else:
 # VAE uses MSE for reconstruction — same as autoencoder
 reconstruction_loss = nn.MSELoss()
 
-# Optimizer + scheduler
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+# Adam (not AdamW) — weight decay conflicts with KL regularization
+optimizer = optim.Adam(model.parameters(), lr=LR)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
 # ==================== MIXED PRECISION ====================
@@ -214,12 +212,14 @@ eval_transform = eval_transform.to(device)
 
 # ==================== VAE LOSS FUNCTION ====================
 
-def vae_loss(reconstructed, target, mu, log_var, beta):
+def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0):
     """
     VAE loss = reconstruction_loss + beta * KL_divergence.
 
-    The log_var is clamped to [-10, 10] to prevent float16 overflow under AMP.
-    Without clamping, exp(log_var) overflows float16 when log_var > 11.
+    free_bits: minimum KL per latent dimension (prevents posterior collapse).
+               Set to 0.0 to disable, 0.1 is a common value.
+
+    log_var is clamped to [-10, 10] to prevent float16 overflow under AMP.
 
     Returns:
         total_loss, recon_loss_val, kl_loss_val
@@ -229,9 +229,15 @@ def vae_loss(reconstructed, target, mu, log_var, beta):
 
     # KL divergence with clamped log_var for numerical stability
     log_var_clamped = torch.clamp(log_var, min=-10, max=10)
-    kl_loss = -0.5 * torch.mean(
-        torch.sum(1 + log_var_clamped - mu.pow(2) - log_var_clamped.exp(), dim=1)
-    )
+    kl_per_dim = -0.5 * (1 + log_var_clamped - mu.pow(2) - log_var_clamped.exp())
+    kl_per_sample = torch.sum(kl_per_dim, dim=1)
+
+    # Free bits: ensure each dim contributes at least free_bits of KL
+    if free_bits > 0:
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+        kl_loss = torch.mean(torch.sum(kl_per_dim, dim=1))
+    else:
+        kl_loss = torch.mean(kl_per_sample)
 
     # Combined
     total = recon_loss + beta * kl_loss
@@ -278,7 +284,7 @@ def unfreeze_all(model):
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_transform,
-                scaler, use_amp, beta, pbar=None):
+                scaler, use_amp, beta, free_bits=0.0, pbar=None):
     """Train one epoch."""
     model.train()
     running_loss = 0.0
@@ -296,7 +302,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed, mu, log_var = model(spectrograms, labels)
-                loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
+                loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta, free_bits)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -304,7 +310,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
             scaler.update()
         else:
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
+            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta, free_bits)
             loss.backward()
             optimizer.step()
 
@@ -323,7 +329,7 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
     return running_loss / n, running_recon / n, running_kl / n
 
 
-def validate_epoch(model, val_loader, device, eval_transform, beta, pbar=None):
+def validate_epoch(model, val_loader, device, eval_transform, beta, free_bits=0.0, pbar=None):
     """Validate one epoch — returns total loss, recon loss, KL loss."""
     model.eval()
     running_loss = 0.0
@@ -337,7 +343,7 @@ def validate_epoch(model, val_loader, device, eval_transform, beta, pbar=None):
             spectrograms = eval_transform(waveforms)
 
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta)
+            loss, recon_val, kl_val = vae_loss(reconstructed, spectrograms, mu, log_var, beta, free_bits)
 
             running_loss += loss.item() * spectrograms.size(0)
             running_recon += recon_val * spectrograms.size(0)
@@ -355,22 +361,26 @@ def validate_epoch(model, val_loader, device, eval_transform, beta, pbar=None):
 def training_loop(model, train_loader, val_loader, optimizer, scheduler,
                   num_epochs, device, train_transform, eval_transform, scaler, use_amp):
     """
-    Full training loop with 3-phase strategy:
+    Full training loop with 3-phase β schedule:
 
-      Phase A (warmup): Frozen encoder/decoder, β ramps 0→target
-      Phase B (finetune): All unfrozen, β at target
-      Early stopping on val MSE (not total loss!)
+      Phase A — Warmup (epochs 0 to warmup_epochs-1):
+        Encoder + decoder FROZEN (protect pretrained weights)
+        β = 0 (MSE only — VAE heads learn to reconstruct)
+
+      Phase B — Ramp (warmup_epochs to warmup_epochs+ramp_epochs-1):
+        All layers UNFROZEN
+        β grows 0 → target via EXPONENTIAL curve (gentle start)
+
+      Phase C — Full VAE (remaining epochs):
+        β = target, full VAE training
+
+    No early stopping — saves the last epoch model (best generative VAE).
     """
     model.to(device)
 
     # ── Phase A: Freeze pretrained layers during warmup ──
     if os.path.exists(ae_checkpoint_path):
         freeze_pretrained(model)
-
-    best_val_mse = float("inf")
-    best_model_state = None
-    best_epoch = 0
-    patience_counter = 0
 
     train_losses, val_losses = [], []
     train_recons, val_recons = [], []
@@ -379,46 +389,30 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print("\n" + "=" * 70)
     print(f"🚀 VAE TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {num_epochs}")
-    print(f"   β schedule: {WARMUP_EPOCHS} warmup (frozen, β=0) → {RAMP_EPOCHS} ramp → β={BETA}")
-    print(f"   Early stopping: val MSE (patience={PATIENCE})")
-    print(f"   Best model → {BEST_MODEL_PATH}")
+    print(f"   β schedule: {WARMUP_EPOCHS} frozen (β=0) → {RAMP_EPOCHS} exp ramp → β={BETA}")
+    print(f"   Free bits: {FREE_BITS} | Optimizer: Adam (no weight decay)")
+    print(f"   No early stopping — saving last epoch model")
     print("=" * 70)
 
     for epoch in range(num_epochs):
 
-        # ── β schedule ──
+        # ── β schedule (exponential ramp) ──
         #
-        # Three phases:
-        #   Epochs  1-10:  β=0,       frozen (learn VAE heads for reconstruction)
-        #   Epochs 11-60:  β 0→0.005, unfrozen (gradual transition, decoder adapts)
-        #   Epochs 61+:    β=0.005,   full VAE training
-        #
-        # WHY 50 epochs for ramp (not 30):
-        #   During warmup fc_mu learns large μ (KL≈4.5M, no penalty since β=0).
-        #   When β starts, KL gradient pushes μ toward 0. If β ramps too fast
-        #   (10 epochs), μ collapses in 1-2 epochs → decoder suddenly gets
-        #   completely different z → MSE jumps 4×. With 50 epochs, μ shrinks
-        #   gradually giving the decoder time to adapt to the changing z.
-        #
+        # Compared to linear: exp starts much gentler, giving the decoder
+        # time to adapt as KL pressure slowly increases. Critical for the
+        # frozen→unfrozen transition — the pretrained weights need time
+        # to adjust without shock.
         if epoch < WARMUP_EPOCHS:
             beta = 0.0
         elif epoch < WARMUP_EPOCHS + RAMP_EPOCHS:
-            ramp_progress = (epoch - WARMUP_EPOCHS) / RAMP_EPOCHS
-            beta = BETA * ramp_progress
+            ramp_epoch = epoch - WARMUP_EPOCHS
+            beta = BETA * (1 - math.exp(-BETA_K * ramp_epoch / RAMP_EPOCHS))
         else:
             beta = BETA
 
         # ── Phase transition: unfreeze after warmup ──
         if epoch == WARMUP_EPOCHS and os.path.exists(ae_checkpoint_path):
             unfreeze_all(model)
-            # Reset early stopping so it doesn't compare against warmup MSE.
-            # KL pressure will temporarily worsen MSE during the ramp phase;
-            # we want to give the model room to recover.
-            best_val_mse = float("inf")
-            best_model_state = None
-            best_epoch = 0
-            patience_counter = 0
-            print(f"  → 🔄 Early stopping reset (KL pressure starts now, patience={PATIENCE} epochs)")
 
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
@@ -430,7 +424,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── Train ──
         epoch_loss, epoch_recon, epoch_kl = train_epoch(
             model, train_loader, optimizer, device, train_transform,
-            scaler, use_amp, beta, pbar=train_pbar
+            scaler, use_amp, beta, FREE_BITS, pbar=train_pbar
         )
         train_pbar.batch_bar.close()
 
@@ -441,7 +435,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
             mode="eval",
         )
         epoch_val_loss, epoch_val_recon, epoch_val_kl = validate_epoch(
-            model, val_loader, device, eval_transform, beta, pbar=val_pbar
+            model, val_loader, device, eval_transform, beta, FREE_BITS, pbar=val_pbar
         )
         val_pbar.close()
 
@@ -455,7 +449,12 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
         current_lr = scheduler.get_last_lr()[0]
 
-        phase = "❄️ warmup" if epoch < WARMUP_EPOCHS else "🔥 finetune"
+        if epoch < WARMUP_EPOCHS:
+            phase = "❄️ warmup"
+        elif epoch < WARMUP_EPOCHS + RAMP_EPOCHS:
+            phase = "β ramp"
+        else:
+            phase = "β fixed"
         train_pbar.update_epoch(epoch + 1, postfix_dict={
             "phase": phase,
             "train": f"{epoch_loss:.4f}",
@@ -466,41 +465,16 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
         scheduler.step()
 
-        # === Early stopping on val MSE (not total loss!) ===
-        #
-        # WHY track MSE not total loss:
-        #   total = MSE + β × KL
-        #   During warmup β goes 0→0.01, so total loss keeps increasing
-        #   even if MSE improves. Epoch 1 (β=0) would always "win".
-        #   MSE is the actual reconstruction quality — that's what we care about.
-        #
-        if epoch_val_recon < best_val_mse:
-            best_val_mse = epoch_val_recon
-            best_epoch = epoch + 1
-            best_model_state = copy.deepcopy(model.state_dict())
-
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'latent_dim': LATENT_DIM,
-                'embed_dim': EMBED_DIM,
-                'num_classes': num_classes,
-                'beta': BETA,
-                'val_mse': best_val_mse,
-                'epoch': best_epoch,
-                'mode': MODE,
-            }, BEST_MODEL_PATH)
-
-            print(f"  → ✅ New best model saved (mse={best_val_mse:.6f}, "
-                  f"kl={epoch_val_kl:.2f}, β={beta:.5f} at epoch {best_epoch})")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(f"\n⏹️ Early stopping: {patience_counter} epochs without MSE improvement")
-                break
-
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+    # ── Save last model — the best generative VAE ──
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'latent_dim': LATENT_DIM,
+        'embed_dim': EMBED_DIM,
+        'num_classes': num_classes,
+        'beta': BETA,
+        'mode': MODE,
+    }, BEST_MODEL_PATH)
+    print(f"\n💾 Last epoch model saved to: {BEST_MODEL_PATH}")
 
     return model, [train_losses, val_losses, train_recons, val_recons, train_kls, val_kls]
 
@@ -557,10 +531,10 @@ if __name__ == "__main__":
 
     # Evaluate on test set
     test_loss, test_recon, test_kl = validate_epoch(
-        trained_model, test_loader, device, eval_transform, BETA
+        trained_model, test_loader, device, eval_transform, BETA, FREE_BITS
     )
     print(f"\n🎯 Test Set: Total={test_loss:.6f} | MSE={test_recon:.6f} | KL={test_kl:.6f}")
-    print(f"   Best model saved to: {BEST_MODEL_PATH}")
+    print(f"   Model saved to: {BEST_MODEL_PATH}")
 
     # Generate demo sounds!
     generate_demo(trained_model, device, eval_transform)
