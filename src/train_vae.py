@@ -56,7 +56,6 @@ COURSE REFERENCE:
   • L3-M2 stable_diffusion — VAE math
 """
 
-import copy
 import math
 import os
 import warnings
@@ -94,14 +93,12 @@ CONFIG = {
     "test": {
         "num_epochs": 5,
         "batch_size": 16,
-        "patience": 5,
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 50,                # from-scratch: tight schedule
         "batch_size": 16,
-        "patience": 15,
         "num_workers": 4,
     }
 }
@@ -112,7 +109,6 @@ SETTINGS = CONFIG[MODE]
 
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
-PATIENCE = SETTINGS["patience"]
 NUM_WORKERS = SETTINGS["num_workers"]
 TRAIN_FRACTION = CONFIG["train_fraction"]
 VAL_FRACTION = CONFIG["val_fraction"]
@@ -438,11 +434,6 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     """
     model.to(device)
 
-    best_val_mse = float("inf")
-    best_model_state = None
-    best_epoch = 0
-    patience_counter = 0
-
     train_losses, val_losses = [], []
     train_recons, val_recons = [], []
     train_kls, val_kls = [], []
@@ -453,9 +444,8 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print(f"   LR: warmup {LR_WARMUP_EPOCHS} epochs → cosine decay")
     print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → {BETA_SCHEDULE} ramp over {BETA_RAMP_EPOCHS} epochs → {BETA}")
     print(f"   Free bits: {FREE_BITS} per dim")
-    print(f"   All layers unfrozen from start (no pretrained weights to protect)")
-    print(f"   Early stopping: val MSE (patience={PATIENCE})")
-    print(f"   Best model → {BEST_MODEL_PATH}")
+    print(f"   All layers unfrozen from start")
+    print(f"   Saving last model → {BEST_MODEL_PATH}")
     print("=" * 70)
 
     for epoch in range(num_epochs):
@@ -470,18 +460,6 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
         # ── β schedule ──
         beta_val = get_beta(epoch)
-
-        # ── Reset early stopping at end of free phase (β=0 → β ramp) ──
-        # During β=0, MSE is artificially low (no KL pressure).
-        # The "best" model from epoch 9 is a glorified autoencoder
-        # with chaotic latent space → can't generate.
-        # Reset best tracking so we pick the best GENERATIVE model.
-        if epoch == BETA_FREE_EPOCHS:
-            best_val_mse = float("inf")
-            best_model_state = None
-            best_epoch = 0
-            patience_counter = 0
-            print(f"  → 🔄 Early stopping reset (β ramp starts, patience={PATIENCE} epochs)")
 
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=num_epochs,
@@ -538,35 +516,17 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         if not using_warmup:
             scheduler.step()
 
-        # === Early stopping on val MSE ===
-        if epoch_val_recon < best_val_mse:
-            best_val_mse = epoch_val_recon
-            best_epoch = epoch + 1
-            best_model_state = copy.deepcopy(model.state_dict())
-
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'latent_dim': LATENT_DIM,
-                'embed_dim': EMBED_DIM,
-                'num_classes': num_classes,
-                'beta': BETA,
-                'val_mse': best_val_mse,
-                'epoch': best_epoch,
-                'mode': MODE,
-                'type': 'scratch',
-            }, BEST_MODEL_PATH)
-
-            print(f"  → ✅ New best model saved (mse={best_val_mse:.6f}, "
-                  f"kl={epoch_val_kl:.2f}, β={beta_val:.5f} at epoch {best_epoch})")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(f"\n⏹️ Early stopping: {patience_counter} epochs without MSE improvement")
-                break
-
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+    # ── Save last model (epoch 49) ── the best generative VAE ──
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'latent_dim': LATENT_DIM,
+        'embed_dim': EMBED_DIM,
+        'num_classes': num_classes,
+        'beta': BETA,
+        'mode': MODE,
+        'type': 'scratch',
+    }, BEST_MODEL_PATH)
+    print(f"\n💾 Last epoch model saved to: {BEST_MODEL_PATH}")
 
     return model, [train_losses, val_losses, train_recons, val_recons, train_kls, val_kls]
 
@@ -625,7 +585,7 @@ if __name__ == "__main__":
         trained_model, test_loader, device, eval_transform, BETA, FREE_BITS
     )
     print(f"\n🎯 Test Set: Total={test_loss:.6f} | MSE={test_recon:.6f} | KL={test_kl:.6f}")
-    print(f"   Best model saved to: {BEST_MODEL_PATH}")
+    print(f"   Model saved to: {BEST_MODEL_PATH}")
 
     # Generate demo sounds!
     generate_demo(trained_model, device, eval_transform)
