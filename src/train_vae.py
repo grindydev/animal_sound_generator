@@ -83,9 +83,10 @@ CONFIG = {
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
     "beta": 0.005,                       # Target KL weight (after ramp)
-    "beta_ramp_epochs": 35,              # β ramps exponentially over N epochs
+    "beta_free_epochs": 10,              # Epochs with β=0 (MSE-only head start)
+    "beta_ramp_epochs": 30,              # β ramps over N epochs AFTER free epochs
     "beta_schedule": "exponential",      # "exponential" or "linear"
-    "beta_k": 5,                         # Curve steepness for exponential (higher = faster ramp)
+    "beta_k": 3,                         # Curve steepness for exponential (higher = faster ramp)
     "free_bits": 0.1,                    # Minimum KL per latent dim (0 = disabled)
     "optimizer": "Adam",                 # "Adam" recommended for VAEs (not AdamW)
     "scheduler": "CosineAnnealingLR",
@@ -120,6 +121,7 @@ LR_WARMUP_EPOCHS = CONFIG["lr_warmup_epochs"]
 LATENT_DIM = CONFIG["latent_dim"]
 EMBED_DIM = CONFIG["embed_dim"]
 BETA = CONFIG["beta"]
+BETA_FREE_EPOCHS = CONFIG["beta_free_epochs"]
 BETA_RAMP_EPOCHS = CONFIG["beta_ramp_epochs"]
 BETA_SCHEDULE = CONFIG["beta_schedule"]
 BETA_K = CONFIG["beta_k"]
@@ -130,7 +132,7 @@ BEST_MODEL_PATH = f"models/best_vae_scratch_{MODE}.pth"
 print(f"🔧 CONFIG → {MODE.upper()} MODE (FROM SCRATCH — BEST PRACTICES)")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} (warmup: {LR_WARMUP_EPOCHS}) | Patience: {PATIENCE}")
 print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM}")
-print(f"   β: exp ramp over {BETA_RAMP_EPOCHS} epochs → target={BETA}")
+print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → exp ramp over {BETA_RAMP_EPOCHS} epochs → target={BETA}")
 print(f"   Free bits: {FREE_BITS} per dim ({'ON' if FREE_BITS > 0 else 'OFF'})")
 print(f"   No pretrained weights — training VAE from random initialization")
 print(f"   Best model → {BEST_MODEL_PATH}")
@@ -237,33 +239,40 @@ def get_beta(epoch):
     """
     Calculate β for a given epoch.
 
-    Two schedule options:
+    Three phases:
+      1. Free (epoch < free_epochs): β = 0 (MSE only)
+      2. Ramp (free <= epoch < free+ramp): β grows 0 → target
+      3. Full (epoch >= free+ramp): β = target
+
+    Two schedule options for ramp:
 
     1. Exponential (recommended):
-       β = BETA × (1 - exp(-k × epoch / ramp_epochs))
+       β = BETA × (1 - exp(-k × progress))
        Starts near 0, grows slowly at first, then accelerates.
-       Matches how the model actually learns.
-
-       Example (k=5, ramp=80, BETA=0.005):
-         Epoch  0: β = 0.00000
-         Epoch  5: β = 0.00010   (slow start)
-         Epoch 20: β = 0.00082
-         Epoch 40: β = 0.00290
-         Epoch 60: β = 0.00445
-         Epoch 80: β = 0.00500   (target)
 
     2. Linear:
-       β = BETA × (epoch / ramp_epochs)
+       β = BETA × progress
        Grows at constant speed.
-       Simple but less natural.
+
+    Example (BETA=0.005, BETA_K=3, free=10, ramp=30):
+      Epoch  5: β = 0.00000  (still free phase)
+      Epoch 10: β = 0.00000  (end of free phase)
+      Epoch 15: β = 0.00197  (5 epochs into ramp, ~39%)
+      Epoch 20: β = 0.00316  (10 into ramp, ~63%)
+      Epoch 30: β = 0.00433  (20 into ramp, ~87%)
+      Epoch 40: β = 0.00500  (target reached)
     """
-    if epoch >= BETA_RAMP_EPOCHS:
+    if epoch < BETA_FREE_EPOCHS:
+        return 0.0
+
+    ramp_epoch = epoch - BETA_FREE_EPOCHS
+    if ramp_epoch >= BETA_RAMP_EPOCHS:
         return BETA
 
     if BETA_SCHEDULE == "exponential":
-        return BETA * (1 - math.exp(-BETA_K * epoch / BETA_RAMP_EPOCHS))
+        return BETA * (1 - math.exp(-BETA_K * ramp_epoch / BETA_RAMP_EPOCHS))
     else:  # linear
-        return BETA * (epoch / BETA_RAMP_EPOCHS)
+        return BETA * (ramp_epoch / BETA_RAMP_EPOCHS)
 
 
 # ==================== LR WARMUP ====================
@@ -442,7 +451,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print(f"🚀 VAE FROM-SCRATCH TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {num_epochs} | Batch: {BATCH_SIZE}")
     print(f"   LR: warmup {LR_WARMUP_EPOCHS} epochs → cosine decay")
-    print(f"   β: {BETA_SCHEDULE} ramp over {BETA_RAMP_EPOCHS} epochs → {BETA}")
+    print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → {BETA_SCHEDULE} ramp over {BETA_RAMP_EPOCHS} epochs → {BETA}")
     print(f"   Free bits: {FREE_BITS} per dim")
     print(f"   All layers unfrozen from start (no pretrained weights to protect)")
     print(f"   Early stopping: val MSE (patience={PATIENCE})")
@@ -497,7 +506,13 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
 
         current_lr = optimizer.param_groups[0]['lr']
 
-        phase = "LR warmup" if using_warmup else ("β ramp" if epoch < BETA_RAMP_EPOCHS else "β fixed")
+        ramp_end = BETA_FREE_EPOCHS + BETA_RAMP_EPOCHS
+        if epoch < BETA_FREE_EPOCHS:
+            phase = "β=0"
+        elif epoch < ramp_end:
+            phase = "β ramp"
+        else:
+            phase = "β fixed"
         train_pbar.update_epoch(epoch + 1, postfix_dict={
             "phase": phase,
             "train": f"{epoch_loss:.4f}",
