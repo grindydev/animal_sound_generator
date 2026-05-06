@@ -50,8 +50,9 @@ def get_generator(device: torch.device = None) -> HiFiGANGenerator:
     checkpoint_dir = os.path.join(cfg.checkpoint_dir, "train")  # train mode checkpoints
 
     paths_to_try = [
-        os.path.join(model_dir, "hifigan_generator_train.pth"),
-        os.path.join(model_dir, "hifigan_generator.pth"),  # legacy
+        os.path.join(model_dir, "hifigan_generator_train_best.pth"),  # best val
+        os.path.join(model_dir, "hifigan_generator_train.pth"),        # last epoch
+        os.path.join(model_dir, "hifigan_generator.pth"),              # legacy
     ]
 
     # Check for latest checkpoint

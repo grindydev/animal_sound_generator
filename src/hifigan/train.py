@@ -360,6 +360,9 @@ def training_loop():
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
 
+    best_val_mel = float("inf")
+    BEST_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}_best.pth")
+
     for epoch in range(start_epoch, NUM_EPOCHS):
         train_pbar = helper_utils.NestedProgressBar(
             total_epochs=NUM_EPOCHS,
@@ -395,6 +398,14 @@ def training_loop():
             )
         else:
             val_mel = validate(generator, val_loader, mel_loss_fn)
+
+        # Track best model
+        if val_mel < best_val_mel:
+            best_val_mel = val_mel
+            torch.save(
+                {"generator": generator.state_dict(), "config": cfg.__dict__},
+                BEST_PATH,
+            )
 
         train_pbar.update_epoch(epoch + 1, postfix_dict={
             "G": f"{avg_g:.2f}",
