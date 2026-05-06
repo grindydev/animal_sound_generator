@@ -50,8 +50,8 @@ class PeriodDiscriminator(nn.Module):
         super().__init__()
         self.period = period
 
-        # Layers grow from 1→32→128→512 channels
-        channels = [1, 32, 128, 512]
+        # Layers: slim channels to save GPU memory (~12M params total)
+        channels = [1, 16, 64, 128]
         self.convs = nn.ModuleList()
 
         for i in range(len(channels) - 1):
@@ -67,8 +67,8 @@ class PeriodDiscriminator(nn.Module):
                 )
             )
 
-        # Final: 512 → 1 score per position
-        self.post_conv = nn.Conv2d(512, 1, kernel_size=(3, 1), padding=(1, 0))
+        # Final: 128 → 1 score per position
+        self.post_conv = nn.Conv2d(128, 1, kernel_size=(3, 1), padding=(1, 0))
 
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -158,7 +158,7 @@ class ScaleDiscriminator(nn.Module):
         self.strided_convs = nn.ModuleList()
         current = channel_list[-1]
         for _ in range(3):
-            next_ch = min(current * 2, 512)
+            next_ch = min(current * 2, 256)
             self.strided_convs.append(
                 nn.Sequential(
                     nn.utils.spectral_norm(

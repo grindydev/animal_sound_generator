@@ -34,9 +34,9 @@ class HiFiGANConfig:
     mpd_conv_kernel: int = 5
     msd_scale_count: int = 3                   # MSD scales
     msd_norms: tuple = (
-        (1, 32, 64, 128, 256, 512),          # scale 0: raw
-        (1, 64, 128, 256, 512),               # scale 1: ×2 pooled
-        (1, 128, 256, 512),                   # scale 2: ×4 pooled
+        (1, 16, 32, 64, 128, 256),              # scale 0: raw
+        (1, 16, 32, 64, 128),                     # scale 1: ×2 pooled
+        (1, 16, 32, 64),                          # scale 2: ×4 pooled
     )
 
     # ── Training ──────────────────────────────────────────

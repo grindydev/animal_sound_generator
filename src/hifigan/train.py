@@ -24,7 +24,7 @@ import os
 import sys
 import time
 import torch
-import numpy as np
+import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
@@ -209,8 +209,15 @@ def train_epoch(generator, discriminator, train_loader,
         audio = audio.to(device)
 
         real_mel = compute_mel(audio)
-        target_len = real_mel.shape[-1] * cfg.hop_length
-        real_trim = audio[..., :target_len]
+        n_frames = real_mel.shape[-1]
+        target_len = n_frames * cfg.hop_length
+
+        # Pad real audio to match exact mel frame count (avoids off-by-1 mismatch)
+        if audio.shape[-1] < target_len:
+            real_trim = F.pad(audio, (0, target_len - audio.shape[-1]))
+        else:
+            real_trim = audio[..., :target_len]
+
         fake = generator(real_mel, target_length=target_len)
 
         # ── Discriminator ───────────────────────────────
