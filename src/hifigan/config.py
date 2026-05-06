@@ -40,7 +40,7 @@ class HiFiGANConfig:
     )
 
     # ── Training ──────────────────────────────────────────
-    segment_size: int = 32768                  # 1.49s @ 22050Hz
+    segment_size: int = 16384                  # 0.74s @ 22050Hz (education speed: 2× faster)
     batch_size: int = 8
     learning_rate: float = 2e-4
     lr_decay: float = 0.999                    # per-epoch decay

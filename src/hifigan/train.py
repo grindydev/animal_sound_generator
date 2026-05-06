@@ -62,7 +62,7 @@ CONFIG = {
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 2,       # GTX 1650 (4GB VRAM) — safe limit
+        "batch_size": 4,       # safe for 4GB — 2.1→~3.2GB
         "num_workers": 4,
     },
 }
@@ -290,7 +290,12 @@ def validate(generator, val_loader, mel_loss_fn, pbar=None):
             vm = compute_mel(va)
             vt = vm.shape[-1] * cfg.hop_length
             vf = generator(vm, target_length=vt)
-            total_mel += mel_loss_fn(vf, va[..., :vt]).item()
+            # Pad val audio to match generated length (same fix as train_epoch)
+            if va.shape[-1] < vt:
+                va_trim = F.pad(va, (0, vt - va.shape[-1]))
+            else:
+                va_trim = va[..., :vt]
+            total_mel += mel_loss_fn(vf, va_trim).item()
             if pbar:
                 pbar.update_batch(bi + 1)
 
