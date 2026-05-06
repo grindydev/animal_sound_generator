@@ -49,7 +49,7 @@ class HiFiGANConfig:
     num_workers: int = 4
 
     # ── Loss weights ─────────────────────────────────────
-    lambda_mel: float = 45.0
+    lambda_mel: float = 20.0  # reduced from 45 — slim discriminator, less needed
     lambda_fm: float = 2.0
     lambda_adv: float = 1.0
 

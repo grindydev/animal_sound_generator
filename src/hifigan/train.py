@@ -22,14 +22,15 @@ Run:
 """
 import os
 import sys
-import time
 import torch
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.smart_crop import smart_crop
 from src.hifigan.config import config as cfg
@@ -37,6 +38,7 @@ from src.hifigan.generator import HiFiGANGenerator
 from src.hifigan.discriminator import Discriminator
 from src.hifigan.losses import MelL1Loss, generator_loss, discriminator_loss
 from src.hifigan.utils import save_checkpoint, load_checkpoint
+import helper_utils
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -44,24 +46,23 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "train",         # "test" = quick dev, "train" = full
+    "mode": "test",         # "test" = quick dev, "train" = full
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
     "data_dir": cfg.data_dir,
     "segment_size": cfg.segment_size,
-    "log_interval": cfg.log_interval,
     "save_interval": cfg.save_interval,
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 4,
+        "batch_size": 1,
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 8,
+        "batch_size": 2,       # GTX 1650 (4GB VRAM) — safe limit
         "num_workers": 4,
     },
 }
@@ -197,7 +198,7 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════
 
 def train_epoch(generator, discriminator, train_loader,
-                opt_g, opt_d, mel_loss_fn):
+                opt_g, opt_d, mel_loss_fn, pbar=None):
     """Train one epoch. Returns (avg_g, avg_d, avg_mel)."""
     generator.train()
     discriminator.train()
@@ -268,28 +269,30 @@ def train_epoch(generator, discriminator, train_loader,
         total_d += d_dict["d_total"]
         total_mel += g_dict["g_mel"]
 
-        if bi % CONFIG["log_interval"] == 0:
-            print(
-                f"  [{bi:4d}/{nb}] "
-                f"G={g_loss.item():.4f} D={d_loss.item():.4f} "
-                f"mel={g_dict['g_mel']:.4f} fm={g_dict['g_fm']:.4f} adv={g_dict['g_adv']:.4f}"
-            )
+        if pbar:
+            pbar.update_batch(bi + 1, postfix_dict={
+                "G": f"{g_loss.item():.2f}",
+                "D": f"{d_loss.item():.2f}",
+                "mel": f"{g_dict['g_mel']:.1f}",
+            })
 
     return total_g / nb, total_d / nb, total_mel / nb
 
 
-def validate(generator, val_loader, mel_loss_fn):
+def validate(generator, val_loader, mel_loss_fn, pbar=None):
     """Validate — returns average mel loss."""
     generator.eval()
     total_mel = 0.0
 
     with torch.no_grad():
-        for va in val_loader:
+        for bi, va in enumerate(val_loader):
             va = va.to(device)
             vm = compute_mel(va)
             vt = vm.shape[-1] * cfg.hop_length
             vf = generator(vm, target_length=vt)
             total_mel += mel_loss_fn(vf, va[..., :vt]).item()
+            if pbar:
+                pbar.update_batch(bi + 1)
 
     return total_mel / max(len(val_loader), 1)
 
@@ -358,35 +361,48 @@ def training_loop():
     print(f"{'='*60}\n")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
-        t0 = time.time()
+        train_pbar = helper_utils.NestedProgressBar(
+            total_epochs=NUM_EPOCHS,
+            total_batches=len(train_loader),
+            mode="train",
+        )
+        train_pbar.update_epoch(epoch + 1)
 
         avg_g, avg_d, avg_mel = train_epoch(
             generator, discriminator, train_loader,
-            opt_g, opt_d, mel_loss_fn,
+            opt_g, opt_d, mel_loss_fn, pbar=train_pbar,
         )
+        train_pbar.batch_bar.close()
 
         sched_g.step()
         sched_d.step()
 
-        dt = time.time() - t0
         lr = sched_g.get_last_lr()[0]
-
-        print(
-            f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
-            f"({dt:.0f}s) ── "
-            f"G={avg_g:.4f} D={avg_d:.4f} "
-            f"mel={avg_mel:.4f} lr={lr:.2e}"
-        )
 
         # Validate + save checkpoint
         if epoch % CONFIG["save_interval"] == 0 or epoch == NUM_EPOCHS - 1:
-            val_mel = validate(generator, val_loader, mel_loss_fn)
-            print(f"   Val mel loss: {val_mel:.4f}")
+            val_pbar = helper_utils.NestedProgressBar(
+                total_epochs=1,
+                total_batches=len(val_loader),
+                mode="eval",
+            )
+            val_mel = validate(generator, val_loader, mel_loss_fn, pbar=val_pbar)
+            val_pbar.close()
 
             save_checkpoint(
                 generator, discriminator, opt_g, opt_d,
                 epoch + 1, CHECKPOINT_DIR,
             )
+        else:
+            val_mel = validate(generator, val_loader, mel_loss_fn)
+
+        train_pbar.update_epoch(epoch + 1, postfix_dict={
+            "G": f"{avg_g:.2f}",
+            "D": f"{avg_d:.2f}",
+            "mel": f"{avg_mel:.1f}",
+            "val": f"{val_mel:.1f}",
+            "lr": f"{lr:.1e}",
+        })
 
     # ── Save final ──────────────────────────────────────
     torch.save(
