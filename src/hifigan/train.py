@@ -1,28 +1,34 @@
 """
-train.py — HiFi-GAN training loop.
+train.py — Phase 7a: HiFi-GAN Neural Vocoder Training
+======================================================
 
-Trains on (mel, audio) pairs from real data. Uses smart_crop
-for energy-based segment selection, then computes mel on-the-fly.
+Trains a HiFi-GAN vocoder: learns to convert mel spectrograms back to
+realistic audio waveforms. Uses smart_crop for energy-based segment
+selection, then computes mel on-the-fly.
 
-Two modes (like train_vae.py / finetune_vae.py):
-    test   — 5 epochs, batch=4, 1 worker  → quick dev check
-    train  — 50 epochs, batch=8, 4 workers → full training
+FRAMEWORK (matches train_vae.py / finetune_vae.py):
+  - CONFIG dict at top → mode/test/train settings
+  - Device auto-detection (CUDA > MPS > CPU)
+  - AMP mixed precision on CUDA
+  - Separate functions: train_epoch(), validate(), training_loop()
+  - Checkpoint resume support
 
-Set mode at the top of CONFIG dict below.
+MODES:
+  "test"  — 5 epochs, batch=4  → quick dev smoke test
+  "train" — 50 epochs, batch=8 → full training
 
 Run:
-    python -m src.hifigan.train
+    python src/hifigan/train.py
 """
 import os
 import sys
 import time
 import torch
-import torch.nn as nn
-import torchaudio
 import numpy as np
+import torchaudio
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
 
-# Project path setup
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.smart_crop import smart_crop
@@ -30,34 +36,29 @@ from src.hifigan.config import config as cfg
 from src.hifigan.generator import HiFiGANGenerator
 from src.hifigan.discriminator import Discriminator
 from src.hifigan.losses import MelL1Loss, generator_loss, discriminator_loss
-from src.hifigan.utils import save_checkpoint, load_checkpoint, scan_checkpoints
+from src.hifigan.utils import save_checkpoint, load_checkpoint
 
 
-# ══════════════════════════════════════════════════════════════
-#  CONFIG — change "mode" to switch test ↔ train
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG (EDIT ONLY THIS SECTION)
+# ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    # ── Mode & Device ──────────────────────────────────
-    "mode": "train",         # "test" = quick dev (5 epochs), "train" = full (50 epochs)
+    "mode": "train",         # "test" = quick dev, "train" = full
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
-    # ── Shared (not mode-specific) ─────────────────────
-    "segment_size": cfg.segment_size,
-    "checkpoint_dir": cfg.checkpoint_dir,
-    "model_dir": cfg.model_dir,
+    # ── Shared ──────────────────────────────────────────
     "data_dir": cfg.data_dir,
+    "segment_size": cfg.segment_size,
     "log_interval": cfg.log_interval,
     "save_interval": cfg.save_interval,
 
-    # ── Test mode ──────────────────────────────────────
     "test": {
         "num_epochs": 5,
         "batch_size": 4,
         "num_workers": 1,
     },
 
-    # ── Train mode ─────────────────────────────────────
     "train": {
         "num_epochs": 50,
         "batch_size": 8,
@@ -65,9 +66,9 @@ CONFIG = {
     },
 }
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  APPLY CONFIG
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 MODE = CONFIG["mode"]
 SETTINGS = CONFIG[MODE]
@@ -77,31 +78,49 @@ BATCH_SIZE = SETTINGS["batch_size"]
 NUM_WORKERS = SETTINGS["num_workers"]
 SEGMENT_SIZE = CONFIG["segment_size"]
 
-# Device
-if CONFIG["device"] == "auto":
-    DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-else:
-    DEVICE = torch.device(CONFIG["device"])
-
-BEST_MODEL_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}.pth")
+BEST_MODEL_PATH = f"models/hifigan_generator_{MODE}.pth"
 CHECKPOINT_DIR = os.path.join(cfg.checkpoint_dir, MODE)
 
+# ═══════════════════════════════════════════════════════════════
+#  DEVICE SETUP (matches train_vae.py)
+# ═══════════════════════════════════════════════════════════════
 
-def print_banner():
-    print("=" * 60)
-    print(f"🔧 HiFi-GAN → {MODE.upper()} MODE")
-    print(f"   Device:    {DEVICE}")
-    print(f"   Epochs:    {NUM_EPOCHS}")
-    print(f"   Batch:     {BATCH_SIZE}")
-    print(f"   Workers:   {NUM_WORKERS}")
-    print(f"   Segment:   {SEGMENT_SIZE} samples (~{SEGMENT_SIZE/cfg.sample_rate:.1f}s)")
-    print(f"   Best path: {BEST_MODEL_PATH}")
-    print("=" * 60)
+if CONFIG["device"] == "auto":
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        is_cuda = True
+        print("🚀 Using CUDA (NVIDIA GPU)")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        is_cuda = False
+        print("🍎 Using MPS (Apple Silicon)")
+    else:
+        device = torch.device("cpu")
+        is_cuda = False
+        print("⚠️  Using CPU")
+else:
+    device = torch.device(CONFIG["device"])
+    is_cuda = (CONFIG["device"] == "cuda")
+
+use_amp = is_cuda
+scaler = GradScaler() if use_amp else None
+
+# ═══════════════════════════════════════════════════════════════
+#  BANNER
+# ═══════════════════════════════════════════════════════════════
+
+print(f"\n🔧 HiFi-GAN → {MODE.upper()} MODE")
+if is_cuda:
+    print(f"   GPU:    {torch.cuda.get_device_name(0)}")
+print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS}")
+print(f"   Segment: {SEGMENT_SIZE} samples (~{SEGMENT_SIZE/cfg.sample_rate:.1f}s)")
+print(f"   Mixed precision: {'yes' if use_amp else 'no'}")
+print(f"   Best model → {BEST_MODEL_PATH}")
 
 
-# ══════════════════════════════════════════════════════════════
-#  Dataset — loads audio, smart_crop → audio segments
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  DATASET
+# ═══════════════════════════════════════════════════════════════
 
 class HiFiGANDataset(Dataset):
     """Loads audio files, applies smart_crop for energy-based selection."""
@@ -122,13 +141,7 @@ class HiFiGANDataset(Dataset):
         np.random.seed(42)
         np.random.shuffle(self.files)
         split_idx = int(len(self.files) * 0.9)
-
-        if split == "train":
-            self.files = self.files[:split_idx]
-        else:
-            self.files = self.files[split_idx:]
-
-        print(f"   HiFiGAN {split}: {len(self.files)} files")
+        self.files = self.files[:split_idx] if split == "train" else self.files[split_idx:]
 
     def __len__(self):
         return len(self.files)
@@ -141,8 +154,7 @@ class HiFiGANDataset(Dataset):
             return torch.zeros(1, self.segment_size)
 
         if sr != cfg.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, cfg.sample_rate)
-            wav = resampler(wav)
+            wav = torchaudio.transforms.Resample(sr, cfg.sample_rate)(wav)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
 
@@ -153,50 +165,144 @@ class HiFiGANDataset(Dataset):
             crops = smart_crop(
                 wav, crop_samples=self.segment_size,
                 threshold_db=cfg.smart_crop_threshold_db,
-                num_crops=1,
-                merge_gap_samples=cfg.smart_crop_merge_gap,
+                num_crops=1, merge_gap_samples=cfg.smart_crop_merge_gap,
             )
             wav = crops[0]
 
         return wav  # [1, segment_size]
 
 
-# ══════════════════════════════════════════════════════════════
-#  Mel computation (on-the-fly)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  MEL COMPUTATION (on-the-fly)
+# ═══════════════════════════════════════════════════════════════
 
-def compute_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
+def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     """Compute normalized mel spectrogram matching VAE training."""
     from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
+    d = audio.device
     mel_tfm = MelSpectrogram(
         sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
         hop_length=cfg.hop_length, win_length=cfg.win_length,
         n_mels=cfg.n_mels, f_min=cfg.f_min, f_max=cfg.f_max, power=2,
-    ).to(device)
+    ).to(d)
 
-    db_tfm = AmplitudeToDB(stype='power', top_db=None).to(device)
+    db_tfm = AmplitudeToDB(stype='power', top_db=None).to(d)
     spec = mel_tfm(audio.squeeze(1))
-    spec_db = db_tfm(spec)
-    return (spec_db - cfg.norm_mean) / cfg.norm_std
+    return (db_tfm(spec) - cfg.norm_mean) / cfg.norm_std
 
 
-# ══════════════════════════════════════════════════════════════
-#  Training
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  TRAIN / VALIDATE
+# ═══════════════════════════════════════════════════════════════
 
-def train():
-    print_banner()
+def train_epoch(generator, discriminator, train_loader,
+                opt_g, opt_d, mel_loss_fn):
+    """Train one epoch. Returns (avg_g, avg_d, avg_mel)."""
+    generator.train()
+    discriminator.train()
+
+    total_g, total_d, total_mel = 0.0, 0.0, 0.0
+    nb = len(train_loader)
+
+    for bi, audio in enumerate(train_loader):
+        audio = audio.to(device)
+
+        real_mel = compute_mel(audio)
+        target_len = real_mel.shape[-1] * cfg.hop_length
+        real_trim = audio[..., :target_len]
+        fake = generator(real_mel, target_length=target_len)
+
+        # ── Discriminator ───────────────────────────────
+        opt_d.zero_grad()
+
+        if use_amp:
+            with autocast(device_type="cuda"):
+                r_score, r_feat = discriminator(real_trim)
+                f_score_d, _ = discriminator(fake.detach())
+                d_loss, d_dict = discriminator_loss(r_score, f_score_d)
+            scaler.scale(d_loss).backward()
+            scaler.step(opt_d)
+            scaler.update()
+        else:
+            r_score, r_feat = discriminator(real_trim)
+            f_score_d, _ = discriminator(fake.detach())
+            d_loss, d_dict = discriminator_loss(r_score, f_score_d)
+            d_loss.backward()
+            opt_d.step()
+
+        # ── Generator ───────────────────────────────────
+        opt_g.zero_grad()
+
+        if use_amp:
+            with autocast(device_type="cuda"):
+                f_score_g, f_feat_g = discriminator(fake)
+                g_loss, g_dict = generator_loss(
+                    fake, real_trim, f_score_g, f_feat_g, r_feat, mel_loss_fn,
+                    lambda_mel=cfg.lambda_mel,
+                    lambda_fm=cfg.lambda_fm,
+                    lambda_adv=cfg.lambda_adv,
+                )
+            scaler.scale(g_loss).backward()
+            scaler.step(opt_g)
+            scaler.update()
+        else:
+            f_score_g, f_feat_g = discriminator(fake)
+            g_loss, g_dict = generator_loss(
+                fake, real_trim, f_score_g, f_feat_g, r_feat, mel_loss_fn,
+                lambda_mel=cfg.lambda_mel,
+                lambda_fm=cfg.lambda_fm,
+                lambda_adv=cfg.lambda_adv,
+            )
+            g_loss.backward()
+            opt_g.step()
+
+        total_g += g_dict["g_total"]
+        total_d += d_dict["d_total"]
+        total_mel += g_dict["g_mel"]
+
+        if bi % CONFIG["log_interval"] == 0:
+            print(
+                f"  [{bi:4d}/{nb}] "
+                f"G={g_loss.item():.4f} D={d_loss.item():.4f} "
+                f"mel={g_dict['g_mel']:.4f} fm={g_dict['g_fm']:.4f} adv={g_dict['g_adv']:.4f}"
+            )
+
+    return total_g / nb, total_d / nb, total_mel / nb
+
+
+def validate(generator, val_loader, mel_loss_fn):
+    """Validate — returns average mel loss."""
+    generator.eval()
+    total_mel = 0.0
+
+    with torch.no_grad():
+        for va in val_loader:
+            va = va.to(device)
+            vm = compute_mel(va)
+            vt = vm.shape[-1] * cfg.hop_length
+            vf = generator(vm, target_length=vt)
+            total_mel += mel_loss_fn(vf, va[..., :vt]).item()
+
+    return total_mel / max(len(val_loader), 1)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TRAINING LOOP
+# ═══════════════════════════════════════════════════════════════
+
+def training_loop():
+    """Full HiFi-GAN training with test/train mode, AMP, checkpoint resume."""
 
     # ── Models ──────────────────────────────────────────
-    generator = HiFiGANGenerator(cfg).to(DEVICE)
-    discriminator = Discriminator().to(DEVICE)
+    generator = HiFiGANGenerator(cfg).to(device)
+    discriminator = Discriminator().to(device)
 
     g_params = sum(p.numel() for p in generator.parameters())
     d_params = sum(p.numel() for p in discriminator.parameters())
     print(f"\n   Generator:     {g_params:,} params")
     print(f"   Discriminator: {d_params:,} params")
-    print(f"   Total:         {g_params + d_params:,} params\n")
+    print(f"   Total:         {g_params + d_params:,} params")
 
     # ── Optimizers ──────────────────────────────────────
     opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
@@ -210,11 +316,13 @@ def train():
         sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
         hop_length=cfg.hop_length, n_mels=cfg.n_mels,
         f_min=cfg.f_min, f_max=cfg.f_max,
-    ).to(DEVICE)
+    ).to(device)
 
     # ── Data ────────────────────────────────────────────
     train_ds = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="train")
     val_ds = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="val")
+
+    print(f"\n✅ Data loaded: {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -224,100 +332,69 @@ def train():
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=True, drop_last=False,
     )
-    print(f"   Batches/epoch: train={len(train_loader)}, val={len(val_loader)}\n")
 
     # ── Resume ──────────────────────────────────────────
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(cfg.model_dir, exist_ok=True)
     start_epoch = load_checkpoint(
         generator, discriminator, opt_g, opt_d,
-        CHECKPOINT_DIR, DEVICE,
+        CHECKPOINT_DIR, device,
     )
     if start_epoch > 0:
-        print(f"   Resumed from epoch {start_epoch}\n")
+        print(f"   Resumed from epoch {start_epoch}")
 
-    # ── Train loop ──────────────────────────────────────
+    # ── Train ───────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"🚀 HiFi-GAN TRAINING — {MODE.upper()} MODE")
+    print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE}")
+    print(f"   Saving last model → {BEST_MODEL_PATH}")
+    print(f"{'='*60}\n")
+
     for epoch in range(start_epoch, NUM_EPOCHS):
-        generator.train()
-        discriminator.train()
-
-        ep_g, ep_d, ep_mel = 0.0, 0.0, 0.0
         t0 = time.time()
 
-        for bi, audio in enumerate(train_loader):
-            audio = audio.to(DEVICE)
-
-            real_mel = compute_mel(audio, DEVICE)
-            target_len = real_mel.shape[-1] * cfg.hop_length
-            real_trim = audio[..., :target_len]
-
-            fake = generator(real_mel, target_length=target_len)
-
-            # Discriminator
-            opt_d.zero_grad()
-            r_score, r_feat = discriminator(real_trim)
-            f_score_d, _ = discriminator(fake.detach())
-            d_loss, d_dict = discriminator_loss(r_score, f_score_d)
-            d_loss.backward()
-            opt_d.step()
-
-            # Generator
-            opt_g.zero_grad()
-            f_score_g, f_feat_g = discriminator(fake)
-            g_loss, g_dict = generator_loss(
-                fake, real_trim, f_score_g, f_feat_g, r_feat, mel_loss_fn,
-                lambda_mel=cfg.lambda_mel, lambda_fm=cfg.lambda_fm, lambda_adv=cfg.lambda_adv,
-            )
-            g_loss.backward()
-            opt_g.step()
-
-            ep_g += g_dict["g_total"]
-            ep_d += d_dict["d_total"]
-            ep_mel += g_dict["g_mel"]
-
-            if bi % cfg.log_interval == 0:
-                print(
-                    f"  Epoch {epoch+1:3d} | Batch {bi:4d} | "
-                    f"G={g_loss.item():.4f} D={d_loss.item():.4f} "
-                    f"mel={g_dict['g_mel']:.4f} fm={g_dict['g_fm']:.4f} adv={g_dict['g_adv']:.4f}"
-                )
-
-        # Epoch summary
-        nb = len(train_loader)
-        sched_g.step()
-        sched_d.step()
-        dt = time.time() - t0
-        print(
-            f"── Epoch {epoch+1}/{NUM_EPOCHS} "
-            f"({dt:.0f}s) ── "
-            f"G={ep_g/nb:.4f} D={ep_d/nb:.4f} "
-            f"mel={ep_mel/nb:.4f} lr={sched_g.get_last_lr()[0]:.2e}"
+        avg_g, avg_d, avg_mel = train_epoch(
+            generator, discriminator, train_loader,
+            opt_g, opt_d, mel_loss_fn,
         )
 
-        # Validation + save
+        sched_g.step()
+        sched_d.step()
+
+        dt = time.time() - t0
+        lr = sched_g.get_last_lr()[0]
+
+        print(
+            f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+            f"({dt:.0f}s) ── "
+            f"G={avg_g:.4f} D={avg_d:.4f} "
+            f"mel={avg_mel:.4f} lr={lr:.2e}"
+        )
+
+        # Validate + save checkpoint
         if epoch % CONFIG["save_interval"] == 0 or epoch == NUM_EPOCHS - 1:
-            generator.eval()
-            val_mel = 0.0
-            with torch.no_grad():
-                for va in val_loader:
-                    va = va.to(DEVICE)
-                    vm = compute_mel(va, DEVICE)
-                    vt = vm.shape[-1] * cfg.hop_length
-                    vf = generator(vm, target_length=vt)
-                    val_mel += mel_loss_fn(vf, va[..., :vt]).item()
-            val_mel /= max(len(val_loader), 1)
+            val_mel = validate(generator, val_loader, mel_loss_fn)
             print(f"   Val mel loss: {val_mel:.4f}")
 
-            save_checkpoint(generator, discriminator, opt_g, opt_d, epoch + 1, CHECKPOINT_DIR)
-            generator.train()
+            save_checkpoint(
+                generator, discriminator, opt_g, opt_d,
+                epoch + 1, CHECKPOINT_DIR,
+            )
 
-    # Final save
+    # ── Save final ──────────────────────────────────────
     torch.save(
         {"generator": generator.state_dict(), "config": cfg.__dict__},
         BEST_MODEL_PATH,
     )
-    print(f"\n✅ Final model saved: {BEST_MODEL_PATH}")
+    print(f"\n💾 Final model saved to: {BEST_MODEL_PATH}")
+    print("✅ Training complete!")
 
+    return generator
+
+
+# ═══════════════════════════════════════════════════════════════
+#  RUN
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    train()
+    trained_generator = training_loop()

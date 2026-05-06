@@ -106,7 +106,8 @@ def mel_to_waveform(
         waveform: [1, num_samples] mono audio, ready for torchaudio.save()
     """
     if device is None:
-        device = torch.device("cpu")  # CPU inference — fast enough for 5s audio
+        # CPU for inference (avoids MPS tensor limits, fast enough for 5s audio)
+        device = torch.device("cpu")
 
     generator = get_generator(device)
 
