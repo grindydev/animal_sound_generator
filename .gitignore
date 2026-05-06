@@ -49,3 +49,4 @@ client/frontend/dist/
 *.sqlite3
 
 models/
+evaluation_output/
