@@ -46,7 +46,7 @@ import helper_utils
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "test",         # "test" = quick dev, "train" = full
+    "mode": "train",         # "test" = quick dev, "train" = full
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
