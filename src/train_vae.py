@@ -81,12 +81,14 @@ CONFIG = {
     "lr_warmup_epochs": 3,               # LR ramps 0→target over N epochs
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
-    "beta": 0.005,                       # Target KL weight (after ramp)
-    "beta_free_epochs": 10,              # Epochs with β=0 (MSE-only head start)
-    "beta_ramp_epochs": 30,              # β ramps over N epochs AFTER free epochs
+    "beta": 0.002,                       # Target KL weight (after ramp, lower = more class distinct)
+    "beta_free_epochs": 8,               # Epochs with β=0 (MSE-only head start)
+    "beta_ramp_epochs": 27,              # β ramps over N epochs AFTER free epochs
     "beta_schedule": "exponential",      # "exponential" or "linear"
-    "beta_k": 3,                         # Curve steepness for exponential (higher = faster ramp)
-    "free_bits": 0.1,                    # Minimum KL per latent dim (0 = disabled)
+    "beta_k": 3,                         # Curve steepness for exponential
+    "free_bits": 0.0,                    # Disabled — let KL flow freely with lower β
+    "class_loss_weight": 0.1,            # γ — weight for classification supervision loss
+    "classifier_path": "models/best_audio_cnn_train.pth",  # Pretrained classifier for class loss
     "optimizer": "Adam",                 # "Adam" recommended for VAEs (not AdamW)
     "scheduler": "CosineAnnealingLR",
 
@@ -122,6 +124,8 @@ BETA_RAMP_EPOCHS = CONFIG["beta_ramp_epochs"]
 BETA_SCHEDULE = CONFIG["beta_schedule"]
 BETA_K = CONFIG["beta_k"]
 FREE_BITS = CONFIG["free_bits"]
+CLASS_LOSS_WEIGHT = CONFIG["class_loss_weight"]
+CLASSIFIER_PATH = CONFIG["classifier_path"]
 
 BEST_MODEL_PATH = f"models/best_vae_scratch_{MODE}.pth"
 
@@ -129,7 +133,7 @@ print(f"🔧 CONFIG → {MODE.upper()} MODE (FROM SCRATCH — BEST PRACTICES)")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} (warmup: {LR_WARMUP_EPOCHS})")
 print(f"   Latent dim: {LATENT_DIM} | Embed dim: {EMBED_DIM}")
 print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → exp ramp over {BETA_RAMP_EPOCHS} epochs → target={BETA}")
-print(f"   Free bits: {FREE_BITS} per dim ({'ON' if FREE_BITS > 0 else 'OFF'})")
+print(f"   Free bits: {FREE_BITS} | Class loss γ: {CLASS_LOSS_WEIGHT}")
 print(f"   No pretrained weights — training VAE from random initialization")
 print(f"   Best model → {BEST_MODEL_PATH}")
 
@@ -201,7 +205,24 @@ def init_weights(m):
 model.apply(init_weights)
 
 print(f"✅ VAE initialized from scratch (Xavier Linear, Kaiming Conv, tiny bottleneck)")
-print(f"   Strategy: exp β annealing from epoch 0 + LR warmup (no freezing)")
+print(f"   Strategy: exp β annealing from epoch 0 + LR warmup + class supervision")
+
+# ── Load pretrained classifier for supervision loss ──
+# Freeze it — gradients flow THROUGH to VAE but classifier weights don't update
+from model import SimpleAudioCNN
+classifier = SimpleAudioCNN(num_classes=num_classes)
+if os.path.exists(CLASSIFIER_PATH):
+    cls_ckpt = torch.load(CLASSIFIER_PATH, map_location=device, weights_only=True)
+    classifier.load_state_dict(cls_ckpt["model_state_dict"])
+    classifier.to(device)
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad = False
+    print(f"✅ Classifier loaded: epoch={cls_ckpt.get('epoch', '?')}, "
+          f"val_acc={cls_ckpt.get('val_accuracy', '?')}")
+else:
+    classifier = None
+    print(f"⚠️  No classifier at {CLASSIFIER_PATH} — class loss disabled")
 
 # ==================== LOSS, OPTIMIZER, SCHEDULER ====================
 
@@ -291,31 +312,14 @@ def set_lr_warmup(optimizer, epoch):
 
 # ==================== VAE LOSS FUNCTION ====================
 
-def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0):
+def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0,
+            classifier=None, labels=None, class_loss_weight=0.0):
     """
-    VAE loss = reconstruction_loss + beta * KL_divergence.
+    VAE loss = MSE + β·KL + γ·CrossEntropy(classifier(recon), labels)
 
-    KL DIVERGENCE (with free bits):
-      Standard KL pushes every dimension toward N(0,1).
-      But some dimensions might learn to carry NO information
-      (posterior collapse) — they output μ≈0, σ≈1 always.
-
-      Free bits fix: each dimension must have KL ≥ free_bits.
-      KL_eff = max(KL_per_dim, free_bits)
-
-      This forces every latent dimension to carry at least
-      some information. Set free_bits=0 to disable.
-
-    Args:
-        reconstructed: model output [B, 1, H, W]
-        target:        original input [B, 1, H, W]
-        mu:            latent mean [B, latent_dim]
-        log_var:       latent log variance [B, latent_dim]
-        beta:          KL weight
-        free_bits:     minimum KL per dimension (0 = disabled)
-
-    Returns:
-        total_loss, recon_loss_val, kl_loss_val
+    The classifier term (γ) pushes the decoder to produce class-recognizable
+    outputs. The classifier is frozen — gradients flow through it to the VAE
+    but the classifier weights don't change.
     """
     # Reconstruction
     recon_loss = reconstruction_loss(reconstructed, target)
@@ -323,10 +327,8 @@ def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0):
     # KL divergence with clamped log_var for numerical stability
     log_var_clamped = torch.clamp(log_var, min=-10, max=10)
     kl_per_dim = -0.5 * (1 + log_var_clamped - mu.pow(2) - log_var_clamped.exp())
-    # kl_per_dim shape: [B, latent_dim]
 
     if free_bits > 0:
-        # Free bits: each dimension must have KL ≥ free_bits
         kl_per_dim = torch.max(kl_per_dim, torch.full_like(kl_per_dim, free_bits))
 
     kl_loss = torch.mean(torch.sum(kl_per_dim, dim=1))
@@ -334,13 +336,22 @@ def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0):
     # Combined
     total = recon_loss + beta * kl_loss
 
-    return total, recon_loss.item(), kl_loss.item()
+    # Classification supervision loss
+    class_loss_val = 0.0
+    if classifier is not None and labels is not None and class_loss_weight > 0:
+        class_logits = classifier(reconstructed)
+        class_loss = F.cross_entropy(class_logits, labels)
+        class_loss_val = class_loss.item()
+        total = total + class_loss_weight * class_loss
+
+    return total, recon_loss.item(), kl_loss.item(), class_loss_val
 
 
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_transform,
-                scaler, use_amp, beta, free_bits, pbar=None):
+                scaler, use_amp, beta, free_bits, classifier=None,
+                class_loss_weight=0.0, pbar=None):
     """Train one epoch."""
     model.train()
     running_loss = 0.0
@@ -358,8 +369,9 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed, mu, log_var = model(spectrograms, labels)
-                loss, recon_val, kl_val = vae_loss(
-                    reconstructed, spectrograms, mu, log_var, beta, free_bits
+                loss, recon_val, kl_val, cls_val = vae_loss(
+                    reconstructed, spectrograms, mu, log_var, beta, free_bits,
+                    classifier=classifier, labels=labels, class_loss_weight=class_loss_weight
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -368,8 +380,9 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
             scaler.update()
         else:
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(
-                reconstructed, spectrograms, mu, log_var, beta, free_bits
+            loss, recon_val, kl_val, cls_val = vae_loss(
+                reconstructed, spectrograms, mu, log_var, beta, free_bits,
+                classifier=classifier, labels=labels, class_loss_weight=class_loss_weight
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -391,12 +404,14 @@ def train_epoch(model, train_loader, optimizer, device, train_transform,
     return running_loss / n, running_recon / n, running_kl / n
 
 
-def validate_epoch(model, val_loader, device, eval_transform, beta, free_bits, pbar=None):
-    """Validate one epoch — returns total loss, recon loss, KL loss."""
+def validate_epoch(model, val_loader, device, eval_transform, beta, free_bits,
+                  classifier=None, class_loss_weight=0.0, pbar=None):
+    """Validate one epoch — returns total loss, recon loss, KL loss, class loss."""
     model.eval()
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
+    running_cls = 0.0
 
     with torch.no_grad():
         for batch_idx, (waveforms, labels) in enumerate(val_loader):
@@ -405,32 +420,35 @@ def validate_epoch(model, val_loader, device, eval_transform, beta, free_bits, p
             spectrograms = eval_transform(waveforms)
 
             reconstructed, mu, log_var = model(spectrograms, labels)
-            loss, recon_val, kl_val = vae_loss(
-                reconstructed, spectrograms, mu, log_var, beta, free_bits
+            loss, recon_val, kl_val, cls_val = vae_loss(
+                reconstructed, spectrograms, mu, log_var, beta, free_bits,
+                classifier=classifier, labels=labels, class_loss_weight=class_loss_weight
             )
 
             running_loss += loss.item() * spectrograms.size(0)
             running_recon += recon_val * spectrograms.size(0)
             running_kl += kl_val * spectrograms.size(0)
+            running_cls += cls_val * spectrograms.size(0)
 
             if pbar:
                 pbar.update_batch(batch_idx + 1)
 
     n = len(val_loader.dataset)
-    return running_loss / n, running_recon / n, running_kl / n
+    return running_loss / n, running_recon / n, running_kl / n, running_cls / n
 
 
 # ==================== TRAINING LOOP ====================
 
 def training_loop(model, train_loader, val_loader, optimizer, scheduler,
-                  num_epochs, device, train_transform, eval_transform, scaler, use_amp):
+                  num_epochs, device, train_transform, eval_transform, scaler, use_amp,
+                  classifier=None, class_loss_weight=0.0):
     """
     Full training loop for from-scratch VAE training.
 
-    No freezing — all layers train from epoch 1.
-    Two things change over time:
+    Three things change over time:
       - LR: 0 → target (warmup) → cosine decay
       - β:  tiny → target (exponential ramp)
+      - Class loss: constant γ weight applied to CrossEntropy(classifier(recon), label)
     """
     model.to(device)
 
@@ -443,7 +461,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
     print(f"   Device: {device} | Epochs: {num_epochs} | Batch: {BATCH_SIZE}")
     print(f"   LR: warmup {LR_WARMUP_EPOCHS} epochs → cosine decay")
     print(f"   β: β=0 for {BETA_FREE_EPOCHS} epochs → {BETA_SCHEDULE} ramp over {BETA_RAMP_EPOCHS} epochs → {BETA}")
-    print(f"   Free bits: {FREE_BITS} per dim")
+    print(f"   Class loss γ: {class_loss_weight}" if class_loss_weight > 0 else "   Class loss: disabled")
     print(f"   All layers unfrozen from start")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print("=" * 70)
@@ -471,7 +489,8 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         # ── Train ──
         epoch_loss, epoch_recon, epoch_kl = train_epoch(
             model, train_loader, optimizer, device, train_transform,
-            scaler, use_amp, beta_val, FREE_BITS, pbar=train_pbar
+            scaler, use_amp, beta_val, FREE_BITS,
+            classifier=classifier, class_loss_weight=class_loss_weight, pbar=train_pbar
         )
         train_pbar.batch_bar.close()
 
@@ -481,8 +500,9 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
             total_batches=len(val_loader),
             mode="eval",
         )
-        epoch_val_loss, epoch_val_recon, epoch_val_kl = validate_epoch(
-            model, val_loader, device, eval_transform, beta_val, FREE_BITS, pbar=val_pbar
+        epoch_val_loss, epoch_val_recon, epoch_val_kl, epoch_val_cls = validate_epoch(
+            model, val_loader, device, eval_transform, beta_val, FREE_BITS,
+            classifier=classifier, class_loss_weight=class_loss_weight, pbar=val_pbar
         )
         val_pbar.close()
 
@@ -493,6 +513,7 @@ def training_loop(model, train_loader, val_loader, optimizer, scheduler,
         val_recons.append(epoch_val_recon)
         train_kls.append(epoch_kl)
         val_kls.append(epoch_val_kl)
+        # Note: val_cls is only tracked for logging, not used for early stopping
 
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -571,6 +592,8 @@ if __name__ == "__main__":
         eval_transform=eval_transform,
         scaler=scaler,
         use_amp=use_amp,
+        classifier=classifier,
+        class_loss_weight=CLASS_LOSS_WEIGHT,
     )
 
     # Plot training curves
@@ -581,10 +604,11 @@ if __name__ == "__main__":
         print(f"⚠️ Plotting failed: {e}")
 
     # Evaluate on test set
-    test_loss, test_recon, test_kl = validate_epoch(
-        trained_model, test_loader, device, eval_transform, BETA, FREE_BITS
+    test_loss, test_recon, test_kl, test_cls = validate_epoch(
+        trained_model, test_loader, device, eval_transform, BETA, FREE_BITS,
+        classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT
     )
-    print(f"\n🎯 Test Set: Total={test_loss:.6f} | MSE={test_recon:.6f} | KL={test_kl:.6f}")
+    print(f"\n🎯 Test Set: Total={test_loss:.6f} | MSE={test_recon:.6f} | KL={test_kl:.6f} | Cls={test_cls:.4f}")
     print(f"   Model saved to: {BEST_MODEL_PATH}")
 
     # Generate demo sounds!

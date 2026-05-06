@@ -166,26 +166,20 @@ class SimpleAudioVAE(nn.Module):
         self.fc_mu = nn.Linear(self.flat_dim, latent_dim)
         self.fc_log_var = nn.Linear(self.flat_dim, latent_dim)
 
-        # ── Class Conditioning — ENTIRELY NEW ──
+        # ── Class Conditioning ──
         #
         # nn.Embedding(num_classes, embed_dim) creates a lookup table:
         #   class 0 (Dog)     → [0.3, -0.1, 0.8, ...]   (64-dim vector)
         #   class 1 (Cat)     → [-0.2, 0.5, 0.1, ...]   (different vector)
-        #   class 2 (Rooster) → [0.7, 0.3, -0.4, ...]   (different again)
         #
-        # These vectors are LEARNED during training — the model figures out
-        # what makes each class unique.
-        #
-        # class_project projects embed_dim → latent_dim so we can ADD it to z.
-        # Addition is simpler than concatenation and works well when latent_dim
-        # is already large (1024).
+        # CONCATENATION (not addition): the class embedding is concatenated
+        # to z, giving the decoder a separate "channel" for class identity.
+        # This is stronger than addition because z and class don't interfere.
         self.class_embed = nn.Embedding(num_classes, embed_dim)
-        self.class_project = nn.Linear(embed_dim, latent_dim)
 
         # ── Decoder — EXACTLY the same as SimpleAudioAutoencoder ──
-        # Why same? The decoder's job hasn't changed: latent vector → spectrogram
-        # It just receives a slightly different z (conditioned on class)
-        self.fc_decode = nn.Linear(latent_dim, self.flat_dim)
+        # Input dim = latent_dim + embed_dim (concatenated z + class_emb)
+        self.fc_decode = nn.Linear(latent_dim + embed_dim, self.flat_dim)
         self.decode = nn.Sequential(
             SimpleDecoderBlock(256, 128),
             SimpleDecoderBlock(128, 64),
@@ -303,20 +297,15 @@ class SimpleAudioVAE(nn.Module):
         #    VAE:         z is sampled from N(μ, σ²) — introduces randomness!
         z = self.reparameterize(mu, log_var)
 
-        # 3. Add class conditioning
-        #    Autoencoder: z goes straight to decoder
-        #    VAE:         z is adjusted by class embedding first
-        #
+        # 3. Add class conditioning via CONCATENATION
         #    class_embed(labels) → [B, embed_dim]   look up class vector
-        #    class_project(...) → [B, latent_dim]   resize to match z
-        #    z + project(...)   → [B, latent_dim]   inject class info
+        #    cat([z, class_emb]) → [B, latent_dim + embed_dim]
         #
-        #    After this: z contains BOTH the audio content (from encoder)
-        #    AND the class identity (from embedding).
-        #    The decoder learns: "given this z, generate a spectrogram
-        #    that sounds like this class."
-        class_emb = self.class_project(self.class_embed(labels))  # [B, latent_dim]
-        z = z + class_emb
+        #    Concatenation gives the class a dedicated channel in z.
+        #    The decoder learns: "dimensions 1024-1087 tell me the class,
+        #    dimensions 0-1023 tell me the audio content."
+        class_emb = self.class_embed(labels)  # [B, embed_dim]
+        z = torch.cat([z, class_emb], dim=1)  # [B, latent_dim + embed_dim]
 
         # 4. Decode — same as autoencoder from here
         reconstructed = self.decode_from_z(z, target_size)
@@ -365,9 +354,9 @@ class SimpleAudioVAE(nn.Module):
         #    This works because KL loss trained the latent space to be ~N(0,1)
         z = torch.randn(num_samples, self.fc_mu.out_features, device=device)
 
-        # 2. Add class conditioning (same as in forward())
-        class_emb = self.class_project(self.class_embed(labels))
-        z = z + class_emb
+        # 2. Add class conditioning via CONCATENATION
+        class_emb = self.class_embed(labels)
+        z = torch.cat([z, class_emb], dim=1)
 
         # 3. Decode — use a default target size (64 mel bins, 552 time frames)
         #    This matches 5 seconds of audio at 22050 Hz
@@ -408,11 +397,11 @@ class SimpleAudioVAE(nn.Module):
         mu1, _ = self.encode_to_params(x1)
         mu2, _ = self.encode_to_params(x2)
 
-        # Add class embeddings to each
+        # Add class embeddings via concatenation
         label1_t = torch.tensor([label1], device=device)
         label2_t = torch.tensor([label2], device=device)
-        z1 = mu1 + self.class_project(self.class_embed(label1_t))
-        z2 = mu2 + self.class_project(self.class_embed(label2_t))
+        z1 = torch.cat([mu1, self.class_embed(label1_t)], dim=1)
+        z2 = torch.cat([mu2, self.class_embed(label2_t)], dim=1)
 
         # Interpolate: z = (1-α)*z1 + α*z2, for α from 0 to 1
         results = []
