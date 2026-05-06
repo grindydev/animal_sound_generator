@@ -50,3 +50,5 @@ client/frontend/dist/
 
 models/
 evaluation_output/
+generated_audio/
+diagnosis/
