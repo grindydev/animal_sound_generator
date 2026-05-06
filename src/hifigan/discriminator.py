@@ -241,17 +241,14 @@ class MultiScaleDiscriminator(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class Discriminator(nn.Module):
-    """MPD + MSD combined."""
+    """MPD-only — fast, with boosted λ_adv in config to prevent collapse."""
 
     def __init__(self):
         super().__init__()
         self.mpd = MultiPeriodDiscriminator()
-        self.msd = MultiScaleDiscriminator()
 
     def forward(self, x: torch.Tensor) -> tuple:
-        mpd_scores, mpd_feats = self.mpd(x)
-        msd_scores, msd_feats = self.msd(x)
-        return mpd_scores + msd_scores, mpd_feats + msd_feats
+        return self.mpd(x)
 
 
 # ══════════════════════════════════════════════════════════════

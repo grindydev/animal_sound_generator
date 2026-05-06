@@ -51,7 +51,7 @@ class HiFiGANConfig:
     # ── Loss weights ─────────────────────────────────────
     lambda_mel: float = 20.0  # reduced from 45 — slim discriminator, less needed
     lambda_fm: float = 2.0
-    lambda_adv: float = 1.0
+    lambda_adv: float = 8.0   # boosted to prevent D collapse with MPD-only discriminator
 
     # ── Smart crop (energy VAD) ──────────────────────────
     smart_crop_threshold_db: float = -30.0

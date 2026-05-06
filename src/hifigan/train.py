@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "train",         # "test" = quick dev, "train" = full
+    "mode": "test",         # "test" = quick dev, "train" = full
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
