@@ -62,6 +62,7 @@ import warnings
 import torch
 from torch import nn
 from torch import optim
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
 from data_loader import get_dataloaders, get_transformations

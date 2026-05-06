@@ -82,20 +82,20 @@ Audio generation introduces concepts your NSFW project didn't cover:
     │   • Confusion matrix, accuracy, per-class analysis
     │   • This classifier becomes your evaluation tool later
     ▼
- Phase 3 — Autoencoder (learn to reconstruct)
+ Phase 3 — Autoencoder (learn to reconstruct) ✅
     │   • Encoder: compress spectrogram → latent vector
     │   • Decoder: latent vector → reconstruct spectrogram
     │   • The decoder is the GENERATOR you'll build on
     ▼
- Phase 4 — Conditional VAE (generate by class + diverse)
+ Phase 4 — Conditional VAE (generate by class + diverse) ✅
     │   • Add class conditioning: specify which animal to generate
     │   • VAE sampling: same class → different sounds each time
     │   • Latent space exploration, interpolation between animals
     ▼
- Phase 5 — Audio Quality & Evaluation
-    │   • Fréchet Audio Distance, classification agreement
-    │   • Latent space visualization (t-SNE)
+ Phase 5 — Audio Quality & Evaluation ✅
+    │   • Classification agreement, diversity, t-SNE
     │   • Compare real vs generated spectrograms
+    │   • DISCOVER MODE COLLAPSE → debug → fix (Phase 5.1)
     ▼
  Phase 6 — Advanced Generation (longer, mixed, refined)
     │   • Mix multiple animals in latent space
@@ -209,7 +209,7 @@ Flow:
 
 ---
 
-## Phase 3 — Autoencoder (Reconstruct) 🔲
+## Phase 3 — Autoencoder (Reconstruct) ✅
 
 **Goal:** Learn to compress and reconstruct audio. The **decoder** is the foundation of your generator.
 
@@ -277,11 +277,11 @@ OUTPUT: Audio waveform → .wav file
 
 ---
 
-## Phase 4 — Conditional VAE (Generate by Class) 🔲
+## Phase 4 — Conditional VAE (Generate by Class) ✅
 
 **Goal:** Generate animal sounds by specifying which animal, with diversity.
 
-**Build this file:** `vae.py`
+**Build these files:** `vae.py`, `train_vae.py`, `finetune_vae.py`
 
 ### What you'll practice
 
@@ -290,9 +290,9 @@ OUTPUT: Audio waveform → .wav file
 | Variational Autoencoder | `vae.py` — encoder outputs μ and σ | L3-M2 (diffusion noise concepts) |
 | Reparameterization trick | `vae.py` — `z = μ + σ * ε` where ε ~ N(0,1) | New — key to differentiable sampling |
 | KL divergence loss | `vae.py` — keeps latent space organized | New — regularization for the latent space |
-| Class conditioning | `vae.py` — `nn.Embedding(num_classes, embed_dim)` | L2-M3 `embeddings/main.py` |
-| Conditional decoder | `vae.py` — [z + class_emb] → decoder → spectrogram | L3-M2 (text conditioning in stable diffusion) |
-| Sampling at inference | `vae.py` — random z → unique generation each time | L3-M2 (noise → denoise → image) |
+| Class conditioning | `vae.py` — `nn.Embedding(num_classes, embed_dim)` → concat | L2-M3 `embeddings/main.py` |
+| Conditional decoder | `vae.py` — `cat([z, class_emb])` → decoder → spectrogram | L3-M2 (text conditioning in stable diffusion) |
+| Sampling at inference | `vae.py` — `cat([random_noise, class_emb])` → unique generation | L3-M2 (noise → denoise → image) |
 | Latent space interpolation | `vae.py` — z_dog → z_cat, decode each step | L3-M2 (stable diffusion latent arithmetic) |
 | Audio saving | `vae.py` — `torchaudio.save()` | New |
 
@@ -319,16 +319,18 @@ total_loss = reconstruction_loss + beta * kl_loss      # beta controls tradeoff
 
 ### Conditioning approaches
 
+We use **CONCATENATION** — the class embedding gets its own dedicated channels
+in z that KL divergence cannot dilute:
+
 ```python
-# Approach A: Concatenation
-class_embedding = self.embed(label)          # [batch, 64]
-z_input = torch.cat([z, class_embedding])    # [batch, 128+64]
+class_embedding = self.embed(label)              # [batch, 64]
+z_input = torch.cat([z, class_embedding], dim=1) # [batch, 1024+64=1088]
 output = self.decoder(z_input)
 
-# Approach B: Addition (projection to same size)
-class_embedding = self.embed_and_project(label)  # [batch, 128]
-z_input = z + class_embedding                    # [batch, 128]
-output = self.decoder(z_input)
+# Why NOT addition?
+# z = z + class_embedding — shares the same dimensions
+# When KL pushes μ→0, the class signal disappears too
+# Concatenation puts a "firewall" between KL and the class lane
 ```
 
 ### After conditional VAE
@@ -347,7 +349,7 @@ output = self.decoder(z_input)
 
 ---
 
-## Phase 5 — Audio Quality & Evaluation 🔲
+## Phase 5 — Audio Quality & Evaluation ✅
 
 **Goal:** Move beyond "sounds okay to me" — quantify generation quality.
 
@@ -393,6 +395,117 @@ output = self.decoder(z_input)
 │ Real vs generated t-SNE:   ???               │
 │ Best class:                ???               │
 │ Worst class:               ???               │
+└──────────────────────────────────────────────┘
+```
+
+### Initial results (before fix)
+
+```
+┌──────────────────────────────────────────────┐
+│ GENERATION EVALUATION (v1 — addition + β=0.005) │
+│ Classification agreement:  15-18% (bad!)      │
+│   - Insect: 62-94%, Dog: 0-52%               │
+│   - ALL other classes: ~0%                    │
+│ Diversity score:            93-97             │
+│ MSE:                        ~0.12-0.13        │
+│                                              │
+│ PROBLEM: MODE COLLAPSE!                      │
+│ All generated sounds clustered as Insect,    │
+│ regardless of which class was requested.     │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 5.1 — Debug & Fix Mode Collapse ✅
+
+**Goal:** Diagnose and fix the generation quality issues found in Phase 5.
+
+**Problem discovered:** Mode collapse — the VAE output the same "generic animal"
+spectrogram for every class. The classifier recognized it as `Insect` 94% of
+the time.
+
+### Root cause: Partial Posterior Collapse
+
+Three problems, working together:
+
+```
+1. KL pushing μ→0 (β=0.005 too aggressive)
+   → All class clouds squished onto the same spot at center
+   → Decoder can't tell Dog from Cat from Insect
+
+2. Addition (z = z + class_emb) shares the same dimensions for content & class
+   → When KL kills z_content, class signal gets diluted too
+   → Decoder was trained to see "content+class", not "class alone"
+
+3. No explicit class signal in the loss
+   → MSE only cares about reconstruction accuracy, not class identity
+   → "Average animal" has lower MSE than "risky, class-specific" output
+```
+
+### Three fixes applied
+
+| Level | Fix | What it does |
+|-------|-----|-------------|
+| **L1: Architecture** | Addition → Concatenation | Class embedding gets 64 dedicated channels. KL can's touch them. `cat([z_content, class_emb])` = [1024+64=1088] |
+| **L2: Loss** | + γ·CrossEntropy(classifier(recon), label) | Frozen Phase 2 classifier grades every output: "Does this look like a Dog?" γ=0.1. Gradient flows backward through classifier into VAE decoder. |
+| **L3: Config** | β 0.005→0.002, free bits→0, 15 full-β epochs | Gentler KL = clouds stay spread out. No floor on KL. More refinement time. |
+
+### Files modified
+
+```
+vae.py              — concat architecture, removed class_project
+                      fc_decode(1088 → flat) instead of (1024 → flat)
+train_vae.py        — β=0.002, γ=0.1, free_bits=0, 8+27+15 schedule
+                      classifier loading, class_loss in vae_loss()
+finetune_vae.py     — same config + class loss changes as train_vae.py
+evaluate_gen.py     — unchanged (evaluation framework stays the same)
+```
+
+### How to verify the fix worked
+
+```
+✅ Classification agreement > 50% (was 15-18%)
+✅ Each class gets significant predictions (was Insect domination)
+✅ t-SNE shows distinct clusters per class (was one blob)
+✅ MSE stays similar (~0.10-0.18), not sacrificed for class signal
+✅ Both finetune and scratch models improve similarly
+```
+
+### Key lessons
+
+```
+1. "Low KL = good training" is WRONG.
+   KL=0 means μ=0 everywhere → all classes at same point → mode collapse.
+   A healthy VAE needs moderate KL (10-50) for functioning latent space.
+
+2. Addition fails when KL kills content.
+   The class embedding was trained as a "helper" (added to content),
+   not standalone. When content dies, the helper is useless.
+   Concatenation gives class its own independent lane.
+
+3. Classifier as teacher is powerful.
+   A frozen, pretrained classifier provides a direct gradient signal
+   toward class-recognizable outputs. No guessing — strict grading.
+
+4. β is a "tax rate," not a "quality dial."
+   Lower β → lower tax on being different from zero
+   → μ can grow to non-zero values → clouds stay distinct
+   → but too low → latent space chaotic (no organization)
+```
+
+### After fix — record results
+
+```
+┌──────────────────────────────────────────────┐
+│ GENERATION EVALUATION (v2 — concat + β=0.002 + γ=0.1) │
+│ Classification agreement:  ??%               │
+│ Best class:                ???               │
+│ Worst class:               ???               │
+│ MSE (scratch):             ???               │
+│ MSE (finetune):            ???               │
+│ Diversity score:           ???               │
+│ Scratch better or finetune? ???              │
 └──────────────────────────────────────────────┘
 ```
 
@@ -712,8 +825,10 @@ animal_sound_generator/
 │   ├── model.py                   # Phase 2: Audio classifier (2D CNN)
 │   ├── train.py                   # Phase 2: Training pipeline
 │   ├── evaluate.py                # Phase 2: Classifier evaluation
-│   ├── autoencoder.py             # Phase 3: Basic autoencoder
+│   ├── train_autoencoder.py       # Phase 3: Autoencoder training loop
 │   ├── vae.py                     # Phase 4: Conditional VAE (generator)
+│   ├── train_vae.py               # Phase 4: VAE from-scratch training
+│   ├── finetune_vae.py            # Phase 4: VAE finetune from AE
 │   ├── evaluate_gen.py            # Phase 5: Generation quality metrics
 │   ├── latent_mixing.py           # Phase 6a: Latent space mixing
 │   ├── sequential_generator.py    # Phase 6b: Longer + sequential sounds
@@ -746,9 +861,10 @@ animal_sound_generator/
 |-------|------------|------|-----------------|--------|
 | 1 | Audio data loading & spectrograms | `data_loader.py` | L1-M3 (datasets) | ✅ |
 | 2 | Audio classifier baseline | `model.py`, `train.py`, `evaluate.py`, `smart_crop.py` | L1-M4 (CNN) | ✅ |
-| 3 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | 🔲 |
-| 4 | Conditional VAE (generate by class) | `vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | 🔲 |
-| 5 | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | 🔲 |
+| 3 | Autoencoder (reconstruct) | `autoencoder.py` | L3-M2 (stable_diffusion) | ✅ |
+| 4 | Conditional VAE (generate by class) | `vae.py`, `train_vae.py`, `finetune_vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | ✅ |
+| 5a | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | ✅ |
+| 5b | Debug & fix mode collapse | `vae.py`, `train_vae.py`, `finetune_vae.py` | — | ✅ |
 | 6a | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
 | 6b | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
 | 6c | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |

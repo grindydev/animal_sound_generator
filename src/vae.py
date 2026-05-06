@@ -41,7 +41,8 @@ THREE THINGS THAT MAKE A VAE DIFFERENT FROM AN AUTOENCODER:
 
   3. CLASS CONDITIONING (specify what to generate)
      nn.Embedding learns a vector for each class (dog, cat, etc.)
-     This vector gets added to z, steering generation toward that class
+     This vector is CONCATENATED to z, giving the class its own dedicated channel
+     that KL divergence cannot dilute or destroy.
 
 
 HOW THE FULL PIPELINE WORKS:
@@ -55,22 +56,20 @@ HOW THE FULL PIPELINE WORKS:
   │       ↓                                                  │
   │  Sample z = μ_dog + σ_dog * random_noise                 │
   │       ↓                                                  │
-  │  Add class info: z = z + class_embedding("Dog")          │
+  │  Concatenate: z = [z | class_embedding("Dog")]         │
   │       ↓                                                  │
   │  Decoder → reconstructed spectrogram                     │
   │       ↓                                                  │
-  │  Loss = MSE(recon, original) + β * KL_divergence         │
-  │         ↑                         ↑                      │
-  │    "make it look right"    "keep latent space organized"  │
+  │  Loss = MSE(recon, original) + β * KL + γ * class_loss  │
+  │         ↑                         ↑         ↑           │
+  │    "make it look right"    "keep latent space"  "is it Dog?" │
   │                                                          │
   └──────────────────────────────────────────────────────────┘
 
   GENERATION (create new sounds from nothing):
   ┌──────────────────────────────────────────────────────────┐
   │                                                          │
-  │  z = random_noise ~ N(0,1)        ← random sample       │
-  │       ↓                                                  │
-  │  z = z + class_embedding("Dog")   ← specify class       │
+  │  z = [random_noise ~ N(0,1) | class_embedding("Dog")] ← concat │
   │       ↓                                                  │
   │  Decoder(z) → new spectrogram     ← never-before-seen!  │
   │       ↓                                                  │
@@ -90,10 +89,10 @@ ARCHITECTURE (compared to your SimpleAudioAutoencoder):
   │  Encoder            │  same 4 blocks          │  same 4 blocks              │
   │  Bottleneck encode  │  Linear → z             │  Linear → μ + Linear → σ    │
   │  Sampling           │  (none — z is fixed)    │  z = μ + σ * ε  (random!)   │
-  │  Class conditioning │  (none)                 │  Embedding + add to z       │
+  │  Class conditioning │  (none)                 │  Embedding → concat to z       │
   │  Bottleneck decode  │  Linear(flat_dim)       │  Linear(flat_dim)           │
   │  Decoder            │  same 4 blocks          │  same 4 blocks              │
-  │  Loss               │  MSE only               │  MSE + β * KL_divergence    │
+  │  Loss               │  MSE only               │  MSE + β·KL + γ·class_loss_divergence    │
   │  forward() returns  │  reconstructed           │  reconstructed, μ, log_var │
   └─────────────────────┴────────────────────────┴─────────────────────────────┘
 

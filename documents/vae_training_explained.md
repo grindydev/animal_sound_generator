@@ -36,7 +36,8 @@ These are all the symbols you'll see in the code and math. Here's what each one 
 | **σ²** | "sigma squared" | Variance | Same as σ, just squared. Still means "spread" |
 | **log_var** | "log var" | log(σ²) | σ² stored as a logarithm — easier for the network |
 | **ε** | "epsilon" | Random noise | A random number used to sample z |
-| **β** | "beta" | KL weight | A dial WE SET (not learned by model). Controls how much to organize latent space |
+| **β** | "beta" | KL weight | A dial WE SET. Controls how much to pull clouds toward center (0). Lower β = looser clouds, higher β = tighter. 0.002 is very gentle. |
+| **γ** | "gamma" | Class loss weight | A dial WE SET. Controls how much to punish class-unrecognizable outputs. 0.1 means 10% of the loss comes from classification correctness. |
 | **B** | "B" | Batch size | How many sounds processed at once (e.g., 16) |
 | **N(0,1)** | "N zero one" | Standard normal distribution | A bell curve centered at 0, spread of 1 |
 | **KL** | "K-L" | KL Divergence | A number COMPUTED from mu, log_var (NOT a weight/bias). Measures how different YOUR distribution is from N(0,1) — NOT how different dogs are from cats! |
@@ -269,13 +270,13 @@ Clamping keeps σ in [0.007, 148] — enough range for practical use.
 
 ---
 
-#### Step 3: Add class conditioning
+#### Step 3: Concatenate class conditioning
 
 **What happens:**
 
 ```python
-class_emb = self.class_project(self.class_embed(labels))
-z = z + class_emb
+class_emb = self.class_embed(labels)      # [B, 64] — raw embedding, no projection
+z = torch.cat([z, class_emb], dim=1)      # [B, 1024+64=1088]
 ```
 
 ```
@@ -290,29 +291,46 @@ class_embed(labels)
     ...
            │
            ▼
-  [16, 64]  (batch of 16, each gets Dog's vector)
+  [B, 64]  (batch of B, each gets their class's vector)
            │
            ▼
-class_project(...)
-  Linear(64 → 1024) — resize to match z
-           │
-           ▼
-  [16, 1024]  (Dog's signature in 1024-dim space)
-           │
-           ▼
-  z = z + class_emb  (inject Dog identity into z)
+  torch.cat([z, class_emb], dim=1)
+    z        = [a, b, c, ...]        (1024 dims, CONTENT from encoder)
+    class_emb = [x, y, z, ...]       (64 dims, CLASS identity)
+    result    = [a, b, c, ... | x, y, z, ...]   (1088 dims)
+                └─── content ──┘ └── class ──┘
 ```
 
-**Why addition, not concatenation?**
+**Why concatenation, not addition?**
 
 ```
-Concatenation would require z to be 1024 → then concat with 1024 = 2048
-  → decoder would need to handle 2048 instead of 1024
+Old addition approach (REMOVED):
+  class_emb = Linear(64→1024)(class_embed(labels))
+  z = z + class_emb                     ← blends content and class together
 
-Addition keeps z at 1024 dimensions
-  → class info is "baked into" z
-  → same decoder works without changes
-  → simpler and more elegant
+Problem with addition when KL pushes μ→0:
+  z_content → [0, 0, 0, ..., 0]         ← KL killed the content
+  z = 0 + class_emb = class_emb alone   ← decoder gets only class_vec
+  But the decoder was trained seeing z_content+class_emb
+    → confused → outputs "average animal" → mode collapse!
+
+New concatenation approach:
+  class_emb = class_embed(labels)        ← raw 64-dim, no projection
+  z = [z_content | class_emb]           ← separate "lanes"
+  
+  fc_decode receives 1088 dims:
+    - Dims 0-1023: content weights (handles encoder output)
+    - Dims 1024-1087: class weights (handles class ID ONLY)
+  
+  When KL kills content (z_content→0):
+    Decoder sees: [0, 0, ..., 0 | Dog][0, 0, ..., 0 | Dog signal]
+    The class-weight column was trained independently
+    → decoder STILL generates something Dog-like!
+  
+  THE WALL ANALOGY:
+    KL fire ──→ [content] │ [class] ←── MSE + class_loss water
+                └───────┘   └─────┘
+                firewall — KL can burn content but can't touch class lane
 ```
 
 ---
@@ -512,50 +530,80 @@ After warmup: KL dropped to 12 ← model learned to organize
 ### 4.4 The β Dial
 
 ```python
-total_loss = recon_loss + beta * kl_loss
+total_loss = recon_loss + beta * kl_loss + gamma * class_loss
+             └─MSE──┘   └────KL control───┘   └──class guidance──┘
 ```
 
-**What β controls:**
+**What β controls — The Cloud-Crowding Problem:**
+
+Think of the latent space as a 2D room. Each animal class forms a "cloud" of points.
 
 ```
-β = 0      → "I don't care about organization at all"
-               → Pure autoencoder (best reconstruction, worst generation)
+β=0 (no KL, pure autoencoder):
+    ┌─────────────────────┐
+    │   🐕🐕               │
+    │  🐕🐕    🐓🐓🐓      │  ← clouds spread out naturally
+    │           🐓🐓       │    (wherever helps MSE)
+    │    🐈🐈               │
+    │   🐈🐈🐈              │
+    └─────────────────────┘
+
+β=0.005 (strong KL — OLD):
+    ┌─────────────────────┐
+    │                     │
+    │    🐕🐓🐈🐕🐓🐈       │  ← clouds CRAMMED into center!
+    │    🐈🐓🐕🐓🐕🐈       │    overlapping = unrecognizable
+    │                     │
+    └─────────────────────┘
+
+β=0.002 (gentle KL — NEW):
+    ┌─────────────────────┐
+    │ 🐕🐕                 │
+    │ 🐕🐕   🐓🐓🐓       │  ← mild pull toward center
+    │         🐓🐓         │    clouds stay distinct,
+    │    🐈🐈              │    but aren't scattered randomly
+    │    🐈🐈🐈            │
+    └─────────────────────┘
+```
+
+KL says "stay near zero." At high β, every cloud is forced onto the SAME spot (center).
+When you then say "generate a Dog," the model samples near center — but dog, cat, and
+rooster clouds are all mushed together there. The decoder can't tell them apart → class-blind outputs.
+
+**β is a "tax rate" on being different from N(0,1):**
+
+```
+β = 0      → "I don't care about organization"
+               Pure autoencoder (best reconstruction, worst generation)
 β = 0.001  → "Organize a LITTLE bit"
-               → Slightly worse reconstruction, slightly better generation
+               Slightly worse recon, slightly better generation
+β = 0.002  → "Organize gently"                       ← OUR NEW VALUE
+               Good recon, distinct class clouds
+               KL ≈ 10-50 (healthy, dimensions are alive)
 β = 0.005  → "Organize moderately"
-               → Reasonable reconstruction, decent generation
+               Clouds start crowding at center
 β = 0.1    → "Organize A LOT"
-               → Worse reconstruction, cleaner latent space
+               Worse recon, everything near 0
 β = 1.0    → "Only care about organization"
-               → Terrible reconstruction, very organized (useless)
+               Terrible recon, everything at 0 (useless)
 ```
 
-**Visualizing the β effect:**
+**Critical insight — higher KL is NOT bad:**
 
 ```
-β = 0 (no KL pressure):
-  Latent space:  · · · · · · · · · · · · · · · · ·
-                  (random dots, no organization)
+A common mistake: thinking "low KL = good training."
 
-β = 0.005 (moderate KL):
-  Latent space:  ⬭⬭⬭ dog   ⬯⬯⬯ cat   ⬮⬮⬮ rooster
-                  (organized neighborhoods!)
+Reality:
+  KL = 2   → μ≈0 everywhere → latent space is DEAD
+  KL = 20  → some μ≠0 → dimensions carry information → HEALTHY
+  KL = 200 → μ is huge → KL dominates MSE → diverging
 
-β = 1.0 (extreme KL):
-  Latent space:    ⬭
-                   (everything squished into one tiny point)
-```
+Side effect: when β is too high, μ gets pushed to 0.
+When μ=0 for all classes, every class's cloud sits on the same spot.
+That's why your VAE outputs "Insect" for every class — all clouds collapsed together.
 
-**The trade-off:**
-
-```
-Higher β = better generation quality (organized latent space)
-         = worse reconstruction quality (forced toward N(0,1))
-
-Lower β = better reconstruction quality (less constraint)
-         = worse generation quality (chaotic latent space)
-
-β = 0.005 is a compromise: good enough recon, good enough generation.
+Lower β gives μ room to GROW to non-zero values.
+Non-zero μ = class clouds stay separate = recognizable outputs.
 ```
 
 ---
@@ -860,16 +908,16 @@ AFTER collapse (β too strong, too early):
 
 ### 5.1 The Problem We're Solving
 
-If you just set β=0.005 from epoch 1:
+If you just set β=0.002 from epoch 1 (even a gentle value would be too much at start):
 
 ```
 Epoch 1:
   fc_mu is random → produces mu ≈ 50 (huge!)
   KL = 0.5 × 1024 × 50² ≈ 1,280,000
-  With β = 0.005 → KL gradient = 6,400
+  With β = 0.002 → KL gradient = 2,560
   MSE gradient ≈ 0.8
   
-  KL dominates gradient by 8000×!
+  KL dominates gradient by 3200×!
   Model says: "Forget reconstruction — just output mu=0!"
   → Posterior collapse: encoder ignores all inputs
   → Every z is [0,0,...,0] + random noise
@@ -877,45 +925,57 @@ Epoch 1:
   → CANNOT RECOVER from this
 ```
 
-### 5.2 The Solution — 3 Phases (for from-scratch)
+### 5.2 The Solution — 3 Phases + Class Supervision
 
 ```
-PHASE 1: Free (epochs 0 to beta_free_epochs-1, e.g. 0-9)
+PHASE 1: Free (epochs 0-7, 8 epochs total)
   β = 0              → KL penalty is ZERO (MSE only)
   All layers train   → encoder, decoder, bottleneck all learn together
-  Goal:              Learn basic reconstruction patterns
-                     (dogs cluster, cats cluster, no organization yet)
+  Class loss ON       → γ=0.1 guides decoder toward class-recognizable outputs
+  Goal:              Learn basic reconstruction + class-distinct patterns
+                     (dogs cluster, cats cluster, no KL organization yet)
 
-PHASE 2: Ramp (epochs 10 to 39)
-  β 0 → 0.005 via exponential curve over 30 epochs
+PHASE 2: Ramp (epochs 8-34, 27 epochs total)
+  β 0 → 0.002 via exponential curve
   All layers train   → full network adapts gradually
-  Goal:              Introduce KL pressure without collapsing
-                     (clusters pulled toward center, staying organized)
+  Class loss ON       → γ=0.1 kept constant throughout
+  Goal:              Introduce gentle KL pressure without collapsing
+                     (clouds pulled toward center, staying separated by class loss)
 
-PHASE 3: Full VAE (epochs 40 to 49)
-  β = 0.005          → target KL pressure
+PHASE 3: Full VAE (epochs 35-49, 15 epochs total)
+  β = 0.002          → target KL pressure (very gentle)
   All layers train   → normal VAE training
-  Goal:              Refine quality and organization together
+  Class loss ON       → γ=0.1 still active
+  Goal:              Refine quality and class distinctness together
+                     (15 epochs at full β, up from 10 before)
 ```
 
-### 5.3 Visual Timeline (50-epoch from-scratch)
+### 5.3 Visual Timeline (50-epoch schedule)
 
 ```
 β value (KL pressure)
   │
-0.005 ┤                                         ════════  ← full VAE (10 epochs)
-      │                                  ╱─────
-      │                            ╱─────
-      │                       ╱────
-      │                   ╱───
-      │               ╱──
-      │            ╱──
-0.000 ┤────────────                                 ← free phase (10 epochs)
-      └───────┬──────────┬──────────┬──────────→ epoch
-             10         20         30         40
-             │          │          │          │
-             │          └─── Phase 2: Exponential ramp ──│
-             └─────────────────── Phase 1: β=0 (MSE only)
+0.002 ┤                                    ═══════════════  ← full VAE (15 epochs)
+      │                              ╱─────
+      │                          ╱────
+      │                     ╱────
+      │                 ╱───
+      │             ╱──
+      │          ╱──
+0.000 ┤─────────                                    ← free phase (8 epochs)
+      └─────────┬──────────┬──────────┬──────────→ epoch
+                8         20         35         49
+                │         │          │          │
+                │         └─── Phase 2: Exponential ramp ──│
+                └─────────────────── Phase 1: β=0 (MSE + class loss)
+
+class loss γ
+  │
+0.1 ┤══════════════════════════════════════════  ← CONSTANT throughout
+  │
+0.0 ┤
+      └─────────┬──────────┬──────────┬──────────→ epoch
+                8         20         35         49
 ```
 
 ### 5.4 Exponential vs Linear Ramp
@@ -953,42 +1013,111 @@ With LR warmup (3 epochs):
   Then go full speed. Then slow down for fine-tuning.
 ```
 
-### 5.6 Free Bits — Preventing Dead Latent Dimensions
+### 5.6 Free Bits — Why We Disabled Them
 
-Sometimes a latent dimension gives up and learns nothing:
+Previously we used free_bits=0.1 to force every latent dimension to "do work."
 
 ```
-Without free bits:
-  Some dims: mu≈0, sigma≈0 → "I just output 0"
-  → These dims carry ZERO information about the input
-  → Wastes latent capacity
-  
-With free bits (0.1 per dim):
-  Every dim MUST have KL ≥ 0.1
-  → Forces even "lazy" dimensions to carry information
-  → All 1024 dims contribute something useful
+With free bits:  KL_eff = max(KL_per_dim, 0.1)
+Without:          KL_eff = KL_per_dim (natural)
 ```
 
-### 5.7 Finetune vs From-Scratch — Different Schedules!
+Why disabled now? With β lowered to 0.002, KL pressure is gentle enough that
+latent dimensions don't need a "floor" — they stay alive naturally. Free bits
+can actually override the lower β by forcing KL≥0.1 for all dims, which adds
+unnecessary pressure on already-healthy dimensions.
+
+### 5.7 Finetune vs From-Scratch — Same Schedule, Different Init
+
+Both scripts use IDENTICAL schedule now (50 epochs, fair comparison):
 
 ```
 FINETUNE (loads pretrained autoencoder):
-  Warmup:  β=0 for 10 epochs, ENCODER/DECODER FROZEN
+  Warmup:  β=0 for 8 epochs, ENCODER/DECODER FROZEN
   Why:    Pretrained convs already know features.
           Don't let KL destroy them. Let new heads adapt first.
-  Ramp:   50 epochs (unfreeze at epoch 11, then ramp)
-  Full:   remaining epochs
+  Ramp:   27 epochs exponential (everything unfrozen at epoch 9)
+  Full:   15 epochs at β=0.002
 
 FROM-SCRATCH (random init):
-  Free:   β=0 for 10 epochs, ALL LAYERS UNFROZEN
+  Free:   β=0 for 8 epochs, ALL LAYERS UNFROZEN
   Why:    No pretrained weights to protect.
           Need basic features to form before KL pressure.
-  Ramp:   30 epochs exponential (everything trains)
-  Full:   10 epochs
+  Ramp:   27 epochs exponential (everything trains)
+  Full:   15 epochs at β=0.002
   Extra:  LR warmup (0→target over 3 epochs)
-          Free bits (0.1 per dim)
           Adam (not AdamW) — no weight decay conflict with KL
+
+Both: γ=0.1 classifier supervision throughout all phases.
 ```
+
+### 5.8 Classification Supervision Loss — The Secret Weapon
+
+This is the most important addition. The VAE now has a third loss component:
+
+```python
+loss = MSE + β × KL + γ × CrossEntropy(classifier(recon), label)
+       ═══   ═══════   ═══════════════════════════════════════════
+       how     how       "Does the classifier recognize this as
+       close   much      the right animal?"
+       to      KL
+       real    pressure
+```
+
+**How it works step by step:**
+
+```
+Step 1: VAE generates a spectrogram for "Dog"
+        → spectrogram might look like: [generic blur]
+
+Step 2: Frozen pretrained classifier examines it
+        → "I'm 94% sure this is: Insect"
+
+Step 3: Cross-entropy compares:
+        Target: [Dog=1.0, Cat=0.0, Rooster=0.0, Insect=0.0, ...]
+        Got:    [Dog=0.02, Cat=0.01, Rooster=0.0, Insect=0.94, ...]
+        
+Step 4: Penalty = γ × "how wrong is this?"
+        → High penalty because Dog scored only 2%
+
+Step 5: Gradient flows backward through classifier INTO VAE's decoder:
+        "Change pixels at positions X, Y, Z so the classifier
+         thinks this looks more like Dog!"
+
+Step 6: VAE adjusts its output → next time, classifier says "Dog 87%"
+```
+
+**Why the classifier is frozen:**
+
+```
+The classifier is a TEACHER with an answer key, NOT a student.
+It doesn't learn anything — its weights never change.
+Gradients flow THROUGH it (backward pass) but don't UPDATE it (optimizer skip).
+
+This is done by:
+  classifier.eval()                  # no BatchNorm updates
+  for p in classifier.parameters():  # no weight changes
+      p.requires_grad = False
+
+Why this works: the classifier was trained on REAL spectrograms.
+It knows what real Dog/Cat/Rooster spectrograms look like.
+By forcing the VAE to produce outputs that the classifier 
+recognizes, we're indirectly forcing the VAE to make more
+REALISTIC, CLASS-DISTINCT spectrograms.
+```
+
+**Why combine with concatenation and lower β:**
+
+| Fix | What it solves |
+|-----|---------------|
+| Concatenation | Class signal doesn't get diluted when μ→0 (KL can't touch the class lane) |
+| Lower β (0.002) | More μ dimensions survive KL pressure (clouds stay spread out) |
+| Class loss (γ=0.1) | Explicit "make it recognizable" signal (direct gradient toward correct class) |
+
+Each alone helps. All three together create a feedback loop:
+  → Concat gives class its own safe lane
+  → Lower β leaves room for clouds to stay distinct
+  → Class loss directly punishes class-blindness from multiple angles
 
 ---
 
@@ -1000,9 +1129,11 @@ FROM-SCRATCH (random init):
 # What it does:
 1. Load autoencoder weights (encoder + decoder already trained)
 2. Initialize fc_mu and fc_log_var with tiny weights
-3. Phase 1 (warmup): freeze encoder/decoder, train only new heads
-4. Phase 2 (ramp): unfreeze everything, gradual KL pressure
-5. Phase 3 (full): full VAE training
+3. Phase 1 (warmup, epochs 0-7): freeze encoder/decoder, β=0, train only new heads
+4. Phase 2 (ramp, epochs 8-34): unfreeze everything, β 0→0.002
+5. Phase 3 (full, epochs 35-49): full VAE, β=0.002
+
+# Throughout: γ=0.1 classification supervision
 
 # Why freeze during warmup?
 The autoencoder encoder produces specific features.
@@ -1013,10 +1144,10 @@ We need the VAE heads to "learn the language" first.
 
 ```
 Timeline for finetune_vae.py:
-  Epoch 1-10:  Encoder FROZEN. Only heads train. β=0
-  Epoch 11:    Unfreeze encoder+decoder. β≈0
-  Epoch 11-60: Everything trains. β 0→0.005
-  Epoch 61+:   Full VAE. β=0.005
+  Epoch 0-7:   Encoder/decoder FROZEN. Only heads train. β=0. γ=0.1.
+  Epoch 8:     Unfreeze encoder+decoder. β≈0.
+  Epoch 8-34:  Everything trains. β 0→0.002. γ=0.1.
+  Epoch 35-49: Full VAE. β=0.002. γ=0.1. (15 epochs full β)
 ```
 
 ### 6.2 train_vae.py (From Scratch)
@@ -1025,9 +1156,11 @@ Timeline for finetune_vae.py:
 # What it does:
 1. Create VAE with random weights
 2. Initialize fc_mu and fc_log_var with tiny weights
-3. Phase 1 (warmup): all layers train, β=0 (learn reconstruction)
-4. Phase 2 (ramp): all layers train, β 0→0.005
-5. Phase 3 (full): all layers train, β=0.005
+3. Phase 1 (free, epochs 0-7): all layers train, β=0, learn reconstruction
+4. Phase 2 (ramp, epochs 8-34): all layers train, β 0→0.002
+5. Phase 3 (full, epochs 35-49): all layers train, β=0.002
+
+# Throughout: γ=0.1 classification supervision
 
 # Why NOT freeze during warmup?
 There's nothing to protect! All weights are random.
@@ -1037,9 +1170,9 @@ before KL pressure kicks in.
 
 ```
 Timeline for train_vae.py:
-  Epoch 1-10:  Everything trains. β=0. Learn basic recon.
-  Epoch 11-60: Everything trains. β 0→0.005
-  Epoch 61+:   Everything trains. β=0.005
+  Epoch 0-7:   Everything trains. β=0. γ=0.1.
+  Epoch 8-34:  Everything trains. β 0→0.002. γ=0.1.
+  Epoch 35-49: Everything trains. β=0.002. γ=0.1. (15 epochs full β)
 ```
 
 ### 6.3 Comparison Table
@@ -1051,12 +1184,16 @@ Timeline for train_vae.py:
 ├───────────────────────┼────────────────────┼────────────────────┤
 │ Pretrained weights    │  Yes (autoencoder) │  No                │
 │ Encoder/decoder init  │  Already good      │  Random            │
-│ fc_mu init            │  Tiny (std=0.001)  │  Tiny (std=0.001)  │
+│ Class conditioning    │  CONCAT (new!)     │  CONCAT (new!)     │
 │ Warmup freezing       │  YES               │  NO                │
 │ Warmup purpose        │  Let heads adapt   │  Learn basic recon │
-│ Epochs needed         │  100               │  200               │
-│ Expected final MSE    │  ~0.05-0.10        │  ~0.10-0.20        │
-│ Speed to good results │  Faster            │  Slower            │
+│ β target              │  0.002             │  0.002             │
+│ β schedule            │  8+27+15 epochs    │  8+27+15 epochs    │
+│ Class loss γ          │  0.1 (constant)    │  0.1 (constant)    │
+│ Free bits             │  0.0 (disabled)    │  0.0 (disabled)    │
+│ Epochs total          │  50                │  50                │
+│ Early stopping        │  No (save last)    │  No (save last)    │
+│ Expected final MSE    │  ~0.10-0.15        │  ~0.12-0.18        │
 │ Model saved to        │  best_vae_finetune │  best_vae_scratch  │
 └───────────────────────┴────────────────────┴────────────────────┘
 ```
@@ -1381,23 +1518,37 @@ Without ramp (β jumps to 0.005 at epoch 11):
 ```
 Options (try one at a time):
 
-1. Lower β (0.005 → 0.002):
-   Better reconstruction quality
-   Slightly worse latent organization
-   Trade-off: sounds are more like training data, less diverse
+1. Lower β (0.002 → 0.001):
+   Even looser clouds, better class distinctness
+   Trade-off: slightly less organized latent space
 
-2. Longer ramp (50 → 80 epochs):
-   Smoother transition
-   Decoder adapts better
-   MSE stays lower during training
+2. Increase γ (0.1 → 0.2):
+   Stronger classifier supervision
+   Trade-off: may push decoder toward "classifier-pleasing" artifacts
 
-3. More epochs (100 → 150):
-   More time to refine
-   Especially useful for from-scratch training
+3. Longer training (50 → 100 epochs):
+   More refinement time at full β
 
-4. Lower learning rate (0.001 → 0.0005):
-   Smaller, more careful updates
-   Takes longer but more stable
+4. Concatenation dimension tuning (64 → 128):
+   Bigger class lane, more capacity for class differences
+
+5. Architecture: Class-conditioned BatchNorm in decoder
+   Class info injected at every upsampling layer, not just bottleneck
+```
+
+### Q: What's mode collapse and how do I know if the fix worked?
+
+```
+Mode collapse (what we had before):
+  - Ask for any class → output looks like Insect
+  - Classifier agreement: 15-18% (barely above random 12.5%)
+  - All generated sounds cluster together in t-SNE
+
+After the fix (target outcome):
+  - Ask for Dog → classifier says Dog with high confidence
+  - Classifier agreement: >50% (ideally 70-80%)
+  - Each class forms distinct t-SNE cluster
+  - MSE stays similar but class distinctness goes way up
 ```
 
 ---
@@ -1415,7 +1566,7 @@ If MSE never improves:
   ✓ Check β schedule: is β ramping too fast?
   ✓ Check if pretrained weights loaded correctly
   ✓ Check data loading: are spectrograms normalized?
-  ✓ Increase warmup/ramp epochs
+  ✓ Increase free/ramp epochs
 
 If generated sounds are garbage:
   ✓ β too low → latent space not organized
@@ -1423,10 +1574,21 @@ If generated sounds are garbage:
   ✓ KL loss too low → model didn't learn distributions
   ✓ Check sample() uses the correct target_size
 
-If early stopping triggers too early:
-  ✓ Increase patience (20 → 50)
-  ✓ Check if reset happens after warmup (for finetune)
-  ✓ Make sure you're tracking MSE, not total loss
+If ALL generations look the same (mode collapse):
+  ✓ β too high → clouds squished to center → all classes overlap
+    → Try: lower β (0.005→0.002→0.001)
+  ✓ Class conditioning not working → addition gets killed by KL
+    → Try: concat instead of addition (already applied)
+  ✓ Classifier agrees <25% on its own generations
+    → Class loss γ too low → increase to 0.2
+  ✓ Check: is classifier loaded correctly? classifier_path valid?
+  ✓ Check: does classifier have requires_grad=False?
+
+If class loss dominates:
+  ✓ γ too high → MSE rising, KL flat, class_loss dropping
+    → Reduce γ to 0.05 or 0.02
+  ✓ Classifier might have wrong number of classes
+    → Verify num_classes matches
 ```
 
 ---
@@ -1436,23 +1598,36 @@ If early stopping triggers too early:
 ```python
 # Training config
 lr = 0.001              # Learning rate
-weight_decay = 0.001    # L2 regularization (prevents overfitting)
+lr_warmup_epochs = 3    # LR ramps 0→target (scratch only)
 batch_size = 16         # Sounds per batch
-num_epochs = 100        # Maximum training rounds (200 for scratch)
-patience = 50           # Stop after this many epochs without improvement
+num_epochs = 50         # Fair comparison (both scripts)
+no early stopping       # Save last model (best generative VAE)
 
 # Model config
-latent_dim = 1024       # Size of the compressed representation (z)
-embed_dim = 64          # Size of each class embedding vector
+latent_dim = 1024       # Size of content representation (z)
+embed_dim = 64          # Size of class embedding (concat → 1088 total)
 num_classes = 8         # Dog, Cat, Rooster, Frog, Crow, Insect, Hen, Noise
+class_conditioning = concat  # NOT addition (concatenation avoids KL interference)
 
 # KL schedule
-warmup_epochs = 10      # Epochs with β=0 (free learning)
-ramp_epochs = 50        # Epochs to ramp β from 0 to target
-beta = 0.005            # Final KL weight
+free_epochs = 8         # Epochs with β=0 (both scripts)
+ramp_epochs = 27        # Epochs to ramp β from 0 to target
+beta_target = 0.002     # Final KL weight (gentle, lets clouds stay distinct)
+beta_k = 3              # Exponential ramp speed
+free_bits = 0.0         # Disabled (lower β makes them unnecessary)
+
+# Class supervision
+class_loss_weight = 0.1 # γ — weight of classifier cross-entropy in total loss
+classifier_path = models/best_audio_cnn_train.pth
+
+# Optimizer
+optimizer = Adam        # Not AdamW (weight decay conflicts with KL)
+scheduler = CosineAnnealingLR
 
 # What these numbers mean in practice:
-# 1024 latent dims = enough room to represent 8 animal classes
-# 64 embed dims = small enough to not dominate z, large enough to matter
-# β=0.005 = moderate KL pressure (tunable)
+# 1024 content dims + 64 class dims = 1088 total z
+# concat = class has dedicated lane, KL can't dilute it
+# β=0.002 = gentle pull toward center, clouds stay recognizably apart
+# γ=0.1 = moderate push toward class-recognizable outputs
+# 15 epochs full β = enough for refinement without over-squeezing
 ```
