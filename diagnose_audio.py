@@ -15,9 +15,9 @@ from audio_utils import spectrogram_to_waveform
 
 device = torch.device("mps")
 CLASS_NAMES = ["Dog", "Cat", "Rooster", "Frog", "Crow", "Insect", "Hen", "Noise"]
-SAMPLE_RATE = 44100
-N_FFT = 400       # Must match MelSpectrogram default
-HOP_LENGTH = 200  # Must match MelSpectrogram default
+SAMPLE_RATE = 22050
+N_FFT = 1024       # Must match MelSpectrogram n_fft
+HOP_LENGTH = 200  # Must match MelSpectrogram hop_length
 N_MELS = 64
 
 # ── Load models ──────────────────────────────────────────────

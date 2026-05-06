@@ -21,7 +21,7 @@ import torchaudio.transforms as T
 
 def spectrogram_to_waveform(
     spec: torch.Tensor,
-    sample_rate: int = 44100,
+    sample_rate: int = 22050,
     n_fft: int = 1024,
     hop_length: int = 200,
     n_mels: int = 64,
@@ -116,7 +116,7 @@ def spectrogram_to_waveform(
 def save_audio(
     waveform: torch.Tensor,
     path: str,
-    sample_rate: int = 44100,
+    sample_rate: int = 22050,
 ) -> None:
     """Save a waveform tensor as a .wav file."""
     import torchaudio

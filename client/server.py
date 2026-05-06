@@ -49,9 +49,9 @@ CLASS_NAMES = ["Dog", "Cat", "Rooster", "Frog", "Crow", "Insect", "Hen", "Noise"
 NUM_CLASSES = len(CLASS_NAMES)
 
 # Spectrogram params (must match training)
-SAMPLE_RATE = 44100
-N_FFT = 400       # Must match MelSpectrogram default
-HOP_LENGTH = 200  # Must match MelSpectrogram default
+SAMPLE_RATE = 22050
+N_FFT = 1024       # Must match MelSpectrogram n_fft
+HOP_LENGTH = 200  # Must match MelSpectrogram hop_length
 N_MELS = 64
 LATENT_DIM = 1024
 EMBED_DIM = 64
