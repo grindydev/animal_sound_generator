@@ -84,7 +84,7 @@ CONFIG = {
     "embed_dim": 64,                     # class embedding size
     "beta": 0.002,                       # Target KL weight (after ramp, lower = more class distinct)
     "beta_free_epochs": 8,               # Epochs with β=0 (MSE-only head start)
-    "beta_ramp_epochs": 27,              # β ramps over N epochs AFTER free epochs
+    "beta_ramp_epochs": 17,              # β ramps over N epochs AFTER free epochs
     "beta_schedule": "exponential",      # "exponential" or "linear"
     "beta_k": 3,                         # Curve steepness for exponential
     "free_bits": 0.0,                    # Disabled — let KL flow freely with lower β
@@ -100,7 +100,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 50,                # from-scratch: tight schedule
+        "num_epochs": 30,                # from-scratch: tight schedule
         "batch_size": 16,
         "num_workers": 4,
     }

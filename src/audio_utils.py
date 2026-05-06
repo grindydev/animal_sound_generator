@@ -87,15 +87,15 @@ def spectrogram_to_waveform(
     spec_valid = spec_cpu[valid_mels]  # [n_valid_mels, T]
     
     # Solve fb_valid @ X = spec_valid  →  X = linear [n_stft, T]
+    # X contains POWER values (MelSpectrogram uses power=2 internally).
+    # GriffinLim expects MAGNITUDE, so take sqrt. Clamp small negatives first.
     result = torch.linalg.lstsq(fb_valid, spec_valid, driver='gelsd')
-    linear_spec = result.solution.to(spec_device).contiguous()  # [n_stft, T]
-    
-    # Clamp extreme values that crash GriffinLim
-    linear_spec = torch.clamp(linear_spec, min=-10.0, max=10.0)
-    linear_spec = torch.nan_to_num(linear_spec, nan=0.0)
+    linear_power = result.solution.to(spec_device).contiguous()  # [n_stft, T]
+    linear_power = torch.clamp(linear_power, min=0.0)  # no negative power
+    linear_spec = torch.sqrt(linear_power)  # power → magnitude
 
-    # Step 3: Griffin-Lim — linear spec → waveform
-    #    power=1 because our linear_spec contains magnitudes, not power
+    # Step 3: Griffin-Lim — linear spec (magnitude) → waveform
+    #    power=1: we pass MAGNITUDES (already sqrt'd above)
     griffin_lim = T.GriffinLim(
         n_fft=n_fft,
         hop_length=hop_length,

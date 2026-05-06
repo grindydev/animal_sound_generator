@@ -55,7 +55,7 @@ CONFIG = {
     "beta": 0.002,                       # Target KL weight after warmup (lower = more class distinct)
     "free_bits": 0.0,                    # Disabled — let KL flow freely with lower β
     "warmup_epochs": 8,                  # Frozen encoder/decoder, β=0
-    "ramp_epochs": 27,                  # β exponential ramp (8+27=35, then 15 epochs full β)
+    "ramp_epochs": 17,                  # β exponential ramp (8+17=25, then 5 epochs full β)
     "beta_k": 3,                         # Curve steepness for exponential ramp
     "class_loss_weight": 0.1,            # γ — weight for classification supervision loss
     "classifier_path": "models/best_audio_cnn_train.pth",
@@ -69,7 +69,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 50,
+        "num_epochs": 30,
         "batch_size": 16,
         "num_workers": 4,
     }

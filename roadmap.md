@@ -102,11 +102,12 @@ Audio generation introduces concepts your NSFW project didn't cover:
     │   • Temperature control, model comparison
     │   • MLflow model registry
     ▼
- Phase 7 — Advanced Generation (longer, mixed, refined) 🔲
-    │   • Longer & sequential sounds (autoregressive + overlap-add)
-    │   • Latent space mixing (dog+cat hybrids)
-    │   • Diffusion refinement for higher quality
-    │   • Update UI with new controls
+  Phase 7 — Audio Quality & Scale 🔲
+    │   • 7a: HiFi-GAN vocoder — replace Griffin-Lim with neural converter
+    │   • 7b: Diffusion refinement — sharpen blurry VAE outputs
+    │   • 7c: Sequential generation — longer sounds, chained animals
+    │   • 7d: Latent space mixing — blend animals, interpolate
+    │   • 7e: UI v2 with all new controls
     ▼
  Phase 8 — Re-practice All Techniques on the Generator 🔲
     │   • Transfer learning, Optuna, skip connections (U-Net)
@@ -558,13 +559,87 @@ Test your VAE immediately — way more motivating than staring at metrics.
 
 ---
 
-## Phase 7 — Advanced Generation 🔲
+## Phase 7 — Audio Quality & Scale 🔲
 
-**Goal:** Push beyond basic 2-second single-animal generation.
+**Goal:** Two quality fixes first (diffusion + neural vocoder), then scale up (longer sounds, mixing). You learn BOTH diffusion AND GANs in one project.
 
-**Build these files:** `sequential_generator.py`, `latent_mixing.py`, `diffusion_refine.py`
+**Build these files:** `src/hifigan/`, `diffusion_refine.py`, `sequential_generator.py`, `latent_mixing.py`
 
-### 7a — Longer & Sequential Sounds
+---
+
+### 7a — HiFi-GAN Vocoder (replace Griffin-Lim)
+
+> **Full plan:** [`documents/phase-7a-hifigan.md`](documents/phase-7a-hifigan.md)
+
+**Problem it solves:** Griffin-Lim guesses phase from magnitude — it's a mathematical approximation that adds static/noise. HiFi-GAN is a trained neural network that converts mel spectrograms → waveforms with realistic phase and timbre.
+
+**What you'll learn: a GAN (Generative Adversarial Network)**
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| GAN Generator | ConvTranspose upsampling — mel bands → raw waveform | New (GAN from scratch) |
+| GAN Discriminator | "Is this a real audio clip or a fake one?" | New |
+| Multi-scale discriminator | Check realism at different time resolutions | New |
+| Adversarial loss | Generator tries to fool discriminator | L3-M2 (GAN basics) |
+| Feature matching loss | Match intermediate discriminator features | New |
+| Mel-spectrogram loss | Generated audio's mel spec must match input mel spec | New |
+
+```
+mel spectrogram → ConvTranspose × 4 → waveform [1, T]
+                        ↓
+              Discriminator: real or fake?
+
+Generator and discriminator play cat-and-mouse → generator learns
+what REAL audio waveforms look like, not just mathematical approximations.
+```
+
+**Why this matters:** HiFi-GAN doesn't fix the spectrogram — it fixes the CONVERSION. Even a perfect VAE spectrogram sounds mediocre through Griffin-Lim. HiFi-GAN turns a good spectrogram into crisp, natural audio.
+
+**VAE vs Diffusion vs HiFi-GAN (what each fixes):**
+```
+  Real waveform
+       ↓
+  [Mel spectrogram]        ← VAE generates this (blurred)
+       ↓                        ↓
+  Griffin-Lim (lossy)      Diffusion refiner (sharpens VAE output)
+       ↓                        ↓
+  Grainy audio              Sharp spectrogram
+                                 ↓
+                            HiFi-GAN (neural conversion)
+                                 ↓
+                            ✨ Crisp audio ✨
+```
+
+---
+
+### 7b — Diffusion Refinement (sharpen the spectrogram)
+
+**Problem it solves:** VAE outputs are blurry — the decoder averages possibilities together. Diffusion removes this blur by iterative denoising.
+
+**What you'll learn: a DIFFUSION model**
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| Forward diffusion (add noise) | Gradually corrupt spectrogram | L3-M2 `stable_diffusion` (forward process) |
+| Reverse diffusion (denoise) | U-Net learns to remove noise step-by-step | L3-M2 (reverse process) |
+| Noise schedule (β schedule) | How fast noise is added — controls quality vs speed | L3-M2 |
+| Conditional diffusion | Guide denoising toward target animal class | L3-M2 (text conditioning) |
+| DDPM sampling loop | 50–1000 denoising steps → sharp output | L3-M2 (DDPM pipeline) |
+| U-Net architecture | Encoder-decoder with skip connections | L3-M1 (resnet), Phase 8c |
+
+```
+VAE output (blurry) → add small noise → U-Net denoise → sharper spectrogram → audio
+
+Same principle as Stable Diffusion, but on spectrograms instead of images.
+```
+
+**Why this is fascinating:** The model learns to predict "remove 1% of noise," which is a much easier, more precise task than "generate the whole thing at once." That's why diffusion beats raw VAE quality.
+
+---
+
+### 7c — Sequential Generation (longer sounds, chained animals)
+
+**Problem it solves:** VAE generates fixed 5-second clips. Real animal sounds happen in sequences: "bark → pause → bark → pause → growl."
 
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
@@ -574,7 +649,11 @@ Test your VAE immediately — way more motivating than staring at metrics.
 | Temperature control | Higher = more random, lower = more consistent | L3-M3 (generation temperature) |
 | Causal masking | Can only attend to past chunks (not future) | L3-M3 `decoder_block` (causal mask) |
 
-### 7b — Latent Space Mixing (Multiple Animals)
+---
+
+### 7d — Latent Space Mixing (blending animals)
+
+**Problem it solves:** Generate hybrids — what does 70% dog + 30% cat sound like?
 
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
@@ -592,45 +671,19 @@ for alpha in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
 z_mix = 0.5 * z_dog + 0.3 * z_cat + 0.2 * z_bird
 ```
 
-### 7c — Diffusion Refinement
+---
 
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Forward diffusion (add noise) | Gradually corrupt spectrogram | L3-M2 `stable_diffusion` (forward process) |
-| Reverse diffusion (denoise) | U-Net learns to remove noise | L3-M2 (reverse process) |
-| Conditional diffusion | Guide denoising toward target animal class | L3-M2 (text conditioning) |
-| DDPM on spectrograms | Same pipeline as DDPM bedroom model | L3-M2 (DDPM pipeline) |
+### 7e — Update UI v2 (all new controls)
 
-```
-VAE output (rough) → add noise → U-Net denoise → clean spectrogram → audio
-
-Exactly what Stable Diffusion does, but on spectrograms instead of images!
-```
-
-### After advanced generation — record results
-
-```
-┌──────────────────────────────────────────────┐
-│ ADVANCED GENERATION                          │
-│ Longest sequence generated:     ??? seconds   │
-│ Dog→Cat interpolation smooth?   Yes/No       │
-│ 3-way mix sounds natural?       Yes/No       │
-│ Diffusion quality improvement:  +???%        │
-│ Best approach overall:          ???           │
-└──────────────────────────────────────────────┘
-```
-
-### 7d — Update UI v2 (Advanced Gen Controls)
-
-**Goal:** Add controls for new Phase 7 features to the web app.
+**Goal:** Add controls for all Phase 7 features to the web app.
 
 | Control | What it does |
 |---------|-------------|
+| Diffusion toggle + steps | ON = VAE + diffusion polish. 10-50 timesteps |
+| Vocoder selector | Griffin-Lim vs HiFi-GAN — hear the difference! |
 | Duration slider (2-30s) | How many seconds of audio to generate |
 | Sequence editor | Drag-and-drop: "Dog 3s → pause 1s → Cat 2s → Rooster 1s" |
 | Mix mode (2 classes) | Slider: 70% Dog + 30% Cat → hybrid sound |
-| Diffusion toggle | ON = VAE + diffusion polish, OFF = VAE only |
-| Diffusion steps | 10-50 timesteps (more = higher quality, slower) |
 | Waveform view | Longer waveform scroll, play/pause with seek |
 
 ```
@@ -648,6 +701,7 @@ Exactly what Stable Diffusion does, but on spectrograms instead of images!
 │  🔀 Mix: 🐶 70% + 🐱 30%  [Generate]  │
 │                                         │
 │  ⚙️ Diffusion: [ON]  Steps: ████░ 30  │
+│  🎤 Vocoder: [HiFi-GAN ▼]             │
 │                                         │
 │  ┌─────────────────────────────────┐    │
 │  │  ▁▂▃▄▅▆▇  [Waveform 12s]      │    │
@@ -658,6 +712,21 @@ Exactly what Stable Diffusion does, but on spectrograms instead of images!
 │  📜 History:                            │
 │  🐶 3s  🐶🐱 Mix 5s  🐱🐔🐶 Seq 12s  │
 └─────────────────────────────────────────┘
+```
+
+### After Phase 7 — record results
+
+```
+┌──────────────────────────────────────────────┐
+│ AUDIO QUALITY & SCALE                        │
+│ Diffusion quality improvement:     +???%      │
+│ HiFi-GAN vs Griffin-Lim:          ??? vs ???  │
+│ Best pipeline: VAE+Diff+HiFiGAN     ???/10    │
+│ Longest sequence generated:        ??? sec    │
+│ Dog→Cat interpolation smooth?      Yes/No     │
+│ 3-way mix sounds natural?          Yes/No     │
+│ Best approach overall:             ???         │
+└──────────────────────────────────────────────┘
 ```
 
 ---
@@ -905,9 +974,17 @@ animal_sound_generator/
 │   ├── train_vae.py               # Phase 4: VAE from-scratch training
 │   ├── finetune_vae.py            # Phase 4: VAE finetune from AE
 │   ├── evaluate_gen.py            # Phase 5: Generation quality metrics
-│   ├── sequential_generator.py    # Phase 7a: Longer + sequential sounds
-│   ├── latent_mixing.py           # Phase 7b: Latent space mixing
-│   ├── diffusion_refine.py        # Phase 7c: Diffusion refinement
+│   ├── diffusion_refine.py        # Phase 7b: Diffusion refinement
+│   ├── hifigan/                     # Phase 7a: HiFi-GAN neural vocoder
+│   │   ├── config.py
+│   │   ├── generator.py
+│   │   ├── discriminator.py
+│   │   ├── losses.py
+│   │   ├── train.py
+│   │   ├── inference.py
+│   │   └── utils.py
+│   ├── sequential_generator.py    # Phase 7c: Longer + sequential sounds
+│   ├── latent_mixing.py           # Phase 7d: Latent space mixing
 │   ├── transfer_generator.py      # Phase 8a: Transfer learning on generator
 │   ├── tuning.py                  # Phase 8b: Optuna for generator
 │   ├── unet_vae.py                # Phase 8c: U-Net skip connections
@@ -941,10 +1018,11 @@ animal_sound_generator/
 | 5a | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | ✅ |
 | 5b | Debug & fix mode collapse | `vae.py`, `train_vae.py`, `finetune_vae.py` | — | ✅ |
 | 6 | Deployment (web app) | `client/`, `export_onnx.py` | L3-M4 (ONNX, MLflow, deployment) | 🔜 |
-| 7a | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
-| 7b | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
-| 7c | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
-| 7d | Update UI v2 (advanced gen controls) | `client/frontend/` | — | 🔲 |
+| 7a | HiFi-GAN vocoder | `src/hifigan/` | New (GAN from scratch) | 🔲 |
+| 7b | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
+| 7c | Sequential generation | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
+| 7d | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
+| 7e | Update UI v2 (new controls) | `client/frontend/` | — | 🔲 |
 | 8a | Transfer learning (PANNs encoder) | `transfer_generator.py` | L2-M2 (transfer_learning) | 🔲 |
 | 8b | Optuna tuning (generator architecture) | `tuning.py` | L2-M1 (optuna) | 🔲 |
 | 8c | U-Net skip connections | `unet_vae.py` | L3-M1 (resnet) | 🔲 |
@@ -1021,7 +1099,7 @@ Phase 4:  Conditional VAE (can we generate BY CLASS? diverse?)
 Phase 5:  Evaluation (how GOOD are they?)
 Phase 5.1: Debug & fix (mode collapse → concat + β + class loss)
 Phase 6:  Deploy (can anyone use it? click → hear!) 🔜
-Phase 7:  Advanced (longer, mixing, diffusion)
+Phase 7:  Vocoder first (HiFi-GAN), then quality refinement (diffusion), then scale (longer, mixing) 🔲
 Phase 8:  Re-practice ALL techniques on the generator
 ```
 
