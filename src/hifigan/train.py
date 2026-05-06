@@ -15,19 +15,20 @@ FRAMEWORK (matches train_vae.py / finetune_vae.py):
 
 MODES:
   "test"  — 5 epochs, batch=4  → quick dev smoke test
-  "train" — 50 epochs, batch=8 → full training
+  "train" — 30 epochs, batch=12 → full training
 
 Run:
     python src/hifigan/train.py
 """
 import os
 import sys
+import time
 import torch
 import torch.nn.functional as F
 import torchaudio
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
-import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -38,7 +39,6 @@ from src.hifigan.generator import HiFiGANGenerator
 from src.hifigan.discriminator import Discriminator
 from src.hifigan.losses import MelL1Loss, generator_loss, discriminator_loss
 from src.hifigan.utils import save_checkpoint, load_checkpoint
-import helper_utils
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -56,13 +56,13 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 1,
+        "batch_size": 4,
         "num_workers": 1,
     },
 
     "train": {
-        "num_epochs": 50,
-        "batch_size": 4,       # safe for 4GB — 2.1→~3.2GB
+        "num_epochs": 30,
+        "batch_size": 12,       # 774MB/4096MB used — plenty of headroom
         "num_workers": 4,
     },
 }
@@ -198,22 +198,24 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════
 
 def train_epoch(generator, discriminator, train_loader,
-                opt_g, opt_d, mel_loss_fn, pbar=None):
+                opt_g, opt_d, mel_loss_fn):
     """Train one epoch. Returns (avg_g, avg_d, avg_mel)."""
+    from tqdm import tqdm
+
     generator.train()
     discriminator.train()
 
     total_g, total_d, total_mel = 0.0, 0.0, 0.0
-    nb = len(train_loader)
+    pbar = tqdm(train_loader, desc="  Train", leave=False)
 
-    for bi, audio in enumerate(train_loader):
+    for audio in pbar:
         audio = audio.to(device)
 
         real_mel = compute_mel(audio)
         n_frames = real_mel.shape[-1]
         target_len = n_frames * cfg.hop_length
 
-        # Pad real audio to match exact mel frame count (avoids off-by-1 mismatch)
+        # Pad real audio to match exact mel frame count
         if audio.shape[-1] < target_len:
             real_trim = F.pad(audio, (0, target_len - audio.shape[-1]))
         else:
@@ -269,35 +271,32 @@ def train_epoch(generator, discriminator, train_loader,
         total_d += d_dict["d_total"]
         total_mel += g_dict["g_mel"]
 
-        if pbar:
-            pbar.update_batch(bi + 1, postfix_dict={
-                "G": f"{g_loss.item():.2f}",
-                "D": f"{d_loss.item():.2f}",
-                "mel": f"{g_dict['g_mel']:.1f}",
-            })
+        pbar.set_postfix({
+            "G": f"{g_loss.item():.2f}",
+            "D": f"{d_loss.item():.2f}",
+            "mel": f"{g_dict['g_mel']:.1f}",
+        })
 
-    return total_g / nb, total_d / nb, total_mel / nb
+    n = len(train_loader)
+    return total_g / n, total_d / n, total_mel / n
 
 
-def validate(generator, val_loader, mel_loss_fn, pbar=None):
+def validate(generator, val_loader, mel_loss_fn):
     """Validate — returns average mel loss."""
     generator.eval()
     total_mel = 0.0
 
     with torch.no_grad():
-        for bi, va in enumerate(val_loader):
+        for va in val_loader:
             va = va.to(device)
             vm = compute_mel(va)
             vt = vm.shape[-1] * cfg.hop_length
             vf = generator(vm, target_length=vt)
-            # Pad val audio to match generated length (same fix as train_epoch)
             if va.shape[-1] < vt:
                 va_trim = F.pad(va, (0, vt - va.shape[-1]))
             else:
                 va_trim = va[..., :vt]
             total_mel += mel_loss_fn(vf, va_trim).item()
-            if pbar:
-                pbar.update_batch(bi + 1)
 
     return total_mel / max(len(val_loader), 1)
 
@@ -369,42 +368,33 @@ def training_loop():
     BEST_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}_best.pth")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
-        train_pbar = helper_utils.NestedProgressBar(
-            total_epochs=NUM_EPOCHS,
-            total_batches=len(train_loader),
-            mode="train",
-        )
-        train_pbar.update_epoch(epoch + 1)
+        t0 = time.time()
 
         avg_g, avg_d, avg_mel = train_epoch(
             generator, discriminator, train_loader,
-            opt_g, opt_d, mel_loss_fn, pbar=train_pbar,
+            opt_g, opt_d, mel_loss_fn,
         )
-        train_pbar.batch_bar.close()
 
         sched_g.step()
         sched_d.step()
-
         lr = sched_g.get_last_lr()[0]
 
-        # Validate + save checkpoint
-        if epoch % CONFIG["save_interval"] == 0 or epoch == NUM_EPOCHS - 1:
-            val_pbar = helper_utils.NestedProgressBar(
-                total_epochs=1,
-                total_batches=len(val_loader),
-                mode="eval",
-            )
-            val_mel = validate(generator, val_loader, mel_loss_fn, pbar=val_pbar)
-            val_pbar.close()
+        val_mel = validate(generator, val_loader, mel_loss_fn)
 
+        dt = time.time() - t0
+        print(
+            f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+            f"({dt:.0f}s) ── "
+            f"G={avg_g:.4f} D={avg_d:.4f} "
+            f"mel={avg_mel:.4f} val={val_mel:.4f} lr={lr:.2e}"
+        )
+
+        if epoch % CONFIG["save_interval"] == 0 or epoch == NUM_EPOCHS - 1:
             save_checkpoint(
                 generator, discriminator, opt_g, opt_d,
                 epoch + 1, CHECKPOINT_DIR,
             )
-        else:
-            val_mel = validate(generator, val_loader, mel_loss_fn)
 
-        # Track best model
         if val_mel < best_val_mel:
             best_val_mel = val_mel
             torch.save(
@@ -412,15 +402,6 @@ def training_loop():
                 BEST_PATH,
             )
 
-        train_pbar.update_epoch(epoch + 1, postfix_dict={
-            "G": f"{avg_g:.2f}",
-            "D": f"{avg_d:.2f}",
-            "mel": f"{avg_mel:.1f}",
-            "val": f"{val_mel:.1f}",
-            "lr": f"{lr:.1e}",
-        })
-
-    # ── Save final ──────────────────────────────────────
     torch.save(
         {"generator": generator.state_dict(), "config": cfg.__dict__},
         BEST_MODEL_PATH,
@@ -430,10 +411,6 @@ def training_loop():
 
     return generator
 
-
-# ═══════════════════════════════════════════════════════════════
-#  RUN
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     trained_generator = training_loop()
