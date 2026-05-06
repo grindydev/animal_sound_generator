@@ -180,7 +180,10 @@ def compute_tsne(vae, loader, classifier, device, eval_transform, n_samples=200)
             labels = labels.to(device)
             specs = eval_transform(waveforms)
             mu, _ = vae.encode_to_params(specs)
-            all_encodings.append(mu.cpu().numpy())
+            # Concatenate class embedding to match 1088-dim latent
+            class_emb = vae.class_embed(labels)
+            mu_full = torch.cat([mu, class_emb], dim=1)
+            all_encodings.append(mu_full.cpu().numpy())
             all_types.extend([0] * len(mu))
             all_classes.extend(labels.cpu().numpy())
             if len(all_types) >= n_samples // 2:
@@ -197,10 +200,11 @@ def compute_tsne(vae, loader, classifier, device, eval_transform, n_samples=200)
     gen_classes = []
     for class_idx in range(len(CLASS_NAMES)):
         z = torch.randn(gen_per_class, vae.fc_mu.out_features, device=device)
-        class_emb = vae.class_project(vae.class_embed(
+        class_emb = vae.class_embed(
             torch.full((gen_per_class,), class_idx, dtype=torch.long, device=device)
-        ))
-        z_cond = z + class_emb
+        )
+        # Concatenation: z (1024) + class_emb (64) = 1088-dim latent
+        z_cond = torch.cat([z, class_emb], dim=1)
         gen_encodings.append(z_cond.detach().cpu().numpy())
         gen_classes.extend([class_idx] * gen_per_class)
 

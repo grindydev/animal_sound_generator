@@ -62,11 +62,11 @@ path_dataset = Path(__file__).resolve().parent.parent / 'data' / 'animal_audio'
 TARGET_SR = 22050
 MAX_SECONDS = 5
 MAX_SAMPLES = TARGET_SR * MAX_SECONDS  # 110250
-#     Mean: -30.8645
-#     Std:  21.1952
+#     Mean (n_fft=1024): -18.4903
+#     Std  (n_fft=1024): 19.8031
 
 class SimpleNormalize(nn.Module):
-    def __init__(self, mean = -30.8645, std = 21.1952):
+    def __init__(self, mean = -18.4903, std = 19.8031):
         super().__init__()
         self.mean = mean
         self.std = std
@@ -255,14 +255,14 @@ def get_transformations():
             • (SpecAugment = FrequencyMasking + TimeMasking)
     """
     train_transform = nn.Sequential(
-        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),   # waveform → mel spectrogram
+        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64, n_fft=1024, hop_length=200),   # waveform → mel spectrogram
         T.AmplitudeToDB(stype='power', top_db=80),            # linear → log scale (dB)
         SimpleNormalize(),
         # TODO: add SpecAugment here later
     )
 
     eval_transform = nn.Sequential(
-        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64),
+        T.MelSpectrogram(sample_rate=TARGET_SR, n_mels=64, n_fft=1024, hop_length=200),
         T.AmplitudeToDB(stype='power', top_db=80),
         SimpleNormalize(),
     )

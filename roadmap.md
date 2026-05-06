@@ -97,20 +97,22 @@ Audio generation introduces concepts your NSFW project didn't cover:
     │   • Compare real vs generated spectrograms
     │   • DISCOVER MODE COLLAPSE → debug → fix (Phase 5.1)
     ▼
- Phase 6 — Advanced Generation (longer, mixed, refined)
-    │   • Mix multiple animals in latent space
-    │   • Generate longer sequences (autoregressive / overlap-add)
-    │   • Diffusion refinement for higher quality
+ Phase 6 — Deployment (Web App) 🔜
+    │   • FastAPI + React: click button → hear sound
+    │   • Temperature control, model comparison
+    │   • MLflow model registry
     ▼
- Phase 7 — Re-practice All Techniques on the Generator
+ Phase 7 — Advanced Generation (longer, mixed, refined) 🔲
+    │   • Longer & sequential sounds (autoregressive + overlap-add)
+    │   • Latent space mixing (dog+cat hybrids)
+    │   • Diffusion refinement for higher quality
+    │   • Update UI with new controls
+    ▼
+ Phase 8 — Re-practice All Techniques on the Generator 🔲
     │   • Transfer learning, Optuna, skip connections (U-Net)
     │   • Grad-CAM on spectrograms, pruning, quantization
     │   • All applied to YOUR generative model
-    ▼
- Phase 8 — Deployment (Web App)
-        • Export generator, FastAPI + React web app
-        • Click animal button → generate unique sound
-        • Mix mode, temperature control, history
+    │   • Update UI again with new features
 ```
 
 ---
@@ -511,13 +513,68 @@ evaluate_gen.py     — unchanged (evaluation framework stays the same)
 
 ---
 
-## Phase 6 — Advanced Generation 🔲
+## Phase 6 — Deployment (Web App) 🔜
+
+**Goal:** Deploy a web app where users click an animal button and hear generated sounds.
+Test your VAE immediately — way more motivating than staring at metrics.
+
+**Build these files:** `client/server.py`, `client/frontend/`
+
+### What you'll practice
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| FastAPI audio endpoint | `client/server.py` — POST /generate → .wav | L3-M4 (deployment) |
+| React audio player | `client/frontend/` — play generated sounds | New |
+| Random seed control | `client/server.py` — different sound each click | New |
+| Sampling temperature slider | `client/frontend/` — control consistent↔wild | L3-M3 (temperature) |
+| Model comparison | Side-by-side: finetune vs scratch model | New |
+| MLflow model registry | Track best checkpoint, load in production | L3-M4 `MLflow/main.py` |
+
+### UI concept (v1 — basic generation)
+
+```
+┌─────────────────────────────────────┐
+│   🐾 Animal Sound Generator        │
+│   Model: VAE-Concat  β=0.002       │
+│                                     │
+│  🐶 Dog    🐱 Cat    🐔 Rooster    │
+│  🐸 Frog   🐦 Crow  🦗 Insect     │
+│  🐔 Hen    🔊 Noise                 │
+│                                     │
+│  Model: [Finetune ▼] [Scratch ▼]   │
+│  Temperature: ████░░ 0.7           │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │  ▁▂▃▄▅▆▇ [Waveform 2s]      │  │
+│  │  ▶ 0:00 / 2:00               │  │
+│  │  [▶ Play] [⬇ Download .wav]  │  │
+│  └───────────────────────────────┘  │
+│                                     │
+│  📜 History:                        │
+│  🐶 #1  🐱 #1  🐶 #2  🐔 #1       │
+└─────────────────────────────────────┘
+```
+
+---
+
+## Phase 7 — Advanced Generation 🔲
 
 **Goal:** Push beyond basic 2-second single-animal generation.
 
-**Build these files:** `latent_mixing.py`, `sequential_generator.py`, `diffusion_refine.py`
+**Build these files:** `sequential_generator.py`, `latent_mixing.py`, `diffusion_refine.py`
 
-### 6a — Latent Space Mixing (Multiple Animals)
+### 7a — Longer & Sequential Sounds
+
+| Concept | Where | Course reference |
+|---------|-------|-----------------|
+| Autoregressive generation | Predict next audio chunk from previous | L3-M3 `decoder_block` (Shakespeare generator) |
+| Overlap-add stitching | Crossfade between generated chunks | New |
+| Sequence planning | "dog bark → pause → cat meow" as a sequence | L3-M3 `translation` (seq2seq) |
+| Temperature control | Higher = more random, lower = more consistent | L3-M3 (generation temperature) |
+| Causal masking | Can only attend to past chunks (not future) | L3-M3 `decoder_block` (causal mask) |
+
+### 7b — Latent Space Mixing (Multiple Animals)
 
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
@@ -535,17 +592,7 @@ for alpha in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
 z_mix = 0.5 * z_dog + 0.3 * z_cat + 0.2 * z_bird
 ```
 
-### 6b — Longer & Sequential Sounds
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| Autoregressive generation | Predict next audio chunk from previous | L3-M3 `decoder_block` (Shakespeare generator) |
-| Overlap-add stitching | Crossfade between generated chunks | New |
-| Sequence planning | "dog bark → pause → cat meow" as a sequence | L3-M3 `translation` (seq2seq) |
-| Temperature control | Higher = more random, lower = more consistent | L3-M3 (generation temperature) |
-| Causal masking | Can only attend to past chunks (not future) | L3-M3 `decoder_block` (causal mask) |
-
-### 6c — Diffusion Refinement
+### 7c — Diffusion Refinement
 
 | Concept | Where | Course reference |
 |---------|-------|-----------------|
@@ -565,23 +612,63 @@ Exactly what Stable Diffusion does, but on spectrograms instead of images!
 ```
 ┌──────────────────────────────────────────────┐
 │ ADVANCED GENERATION                          │
+│ Longest sequence generated:     ??? seconds   │
 │ Dog→Cat interpolation smooth?   Yes/No       │
 │ 3-way mix sounds natural?       Yes/No       │
-│ Longest sequence generated:     ??? seconds   │
 │ Diffusion quality improvement:  +???%        │
 │ Best approach overall:          ???           │
 └──────────────────────────────────────────────┘
 ```
 
+### 7d — Update UI v2 (Advanced Gen Controls)
+
+**Goal:** Add controls for new Phase 7 features to the web app.
+
+| Control | What it does |
+|---------|-------------|
+| Duration slider (2-30s) | How many seconds of audio to generate |
+| Sequence editor | Drag-and-drop: "Dog 3s → pause 1s → Cat 2s → Rooster 1s" |
+| Mix mode (2 classes) | Slider: 70% Dog + 30% Cat → hybrid sound |
+| Diffusion toggle | ON = VAE + diffusion polish, OFF = VAE only |
+| Diffusion steps | 10-50 timesteps (more = higher quality, slower) |
+| Waveform view | Longer waveform scroll, play/pause with seek |
+
+```
+┌─────────────────────────────────────────┐
+│   🐾 Animal Sound Generator v2         │
+│   Model: VAE + Diffusion  Size: ??? MB │
+│                                         │
+│  Duration: ████████░░░ 12 sec          │
+│                                         │
+│  Sequence:                              │
+│  ┌──────┐  ┌──────┐  ┌──────┐         │
+│  │ 🐶 3s│→│ ⏸ 1s│→│ 🐱 2s│  [+Add]  │
+│  └──────┘  └──────┘  └──────┘         │
+│                                         │
+│  🔀 Mix: 🐶 70% + 🐱 30%  [Generate]  │
+│                                         │
+│  ⚙️ Diffusion: [ON]  Steps: ████░ 30  │
+│                                         │
+│  ┌─────────────────────────────────┐    │
+│  │  ▁▂▃▄▅▆▇  [Waveform 12s]      │    │
+│  │  ▶ 0:03 / 12:00                │    │
+│  │  [▶ Play] [⏸ Pause] [⬇ WAV]   │    │
+│  └─────────────────────────────────┘    │
+│                                         │
+│  📜 History:                            │
+│  🐶 3s  🐶🐱 Mix 5s  🐱🐔🐶 Seq 12s  │
+└─────────────────────────────────────────┘
+```
+
 ---
 
-## Phase 7 — Re-practice All Techniques on the Generator 🔲
+## Phase 8 — Re-practice All Techniques on the Generator 🔲
 
 **Goal:** Apply every technique from your NSFW project (and PyTorch course) to the generative model. Same concepts, different domain — this solidifies your understanding.
 
 Each sub-phase takes your working VAE generator and improves it with a technique you've already learned:
 
-### 7a — Transfer Learning for the Generator
+### 8a — Transfer Learning for the Generator
 
 **You learned:** ResNet18 freeze/fine-tune/full retrain on images (NSFW Phase 4, L2-M2)  
 **Now apply:** Use a pretrained audio encoder (PANNs) as the encoder part of your autoencoder
@@ -610,7 +697,7 @@ model = ConditionalVAE(encoder=pretrained_encoder, decoder=your_decoder)
 
 ---
 
-### 7b — Optuna Tuning for the Generator
+### 8b — Optuna Tuning for the Generator
 
 **You learned:** Search CNN architecture, lr, dropout for classifier (NSFW Phase 3, L2-M1)  
 **Now apply:** Search VAE hyperparameters for best generation quality
@@ -640,7 +727,7 @@ def objective(trial):
 
 ---
 
-### 7c — Skip Connections (U-Net Architecture)
+### 8c — Skip Connections (U-Net Architecture)
 
 **You learned:** ResidualTunedCNN skip connections `F(x) + x` (NSFW Phase 5, L3-M1)  
 **Now apply:** U-Net skip connections from encoder → decoder (different from ResNet!)
@@ -659,7 +746,7 @@ def objective(trial):
 
 📄 **Detailed implementation guide:** [`documents/autoencoder_improvement_plan.md`](documents/autoencoder_improvement_plan.md)
 
-This document covers 5 improvement steps for the autoencoder (applied here in Phase 7c but also relevant to Phase 3 understanding):
+This document covers 5 improvement steps for the autoencoder (applied here in Phase 8c but also relevant to Phase 3 understanding):
 
 | Step | Change | Why | Expected Impact |
 |------|--------|-----|----------------|
@@ -673,7 +760,7 @@ This document covers 5 improvement steps for the autoencoder (applied here in Ph
 
 ---
 
-### 7d — Grad-CAM on Spectrograms
+### 8d — Grad-CAM on Spectrograms
 
 **You learned:** Grad-CAM on images, what pixels matter for classification (NSFW Phase 6, L3-M2)  
 **Now apply:** Grad-CAM on spectrograms — what frequencies and time regions matter
@@ -702,9 +789,9 @@ If dog generation has weak low frequencies → decoder didn't learn dog's spectr
 
 ---
 
-### 7e — Pruning + Quantization on the Generator
+### 8e — Pruning + Quantization on the Generator
 
-**You learned:** Pruning removes small weights, quantization shrinks to INT8 (NSFW Phase 7b/7c, L3-M4)  
+**You learned:** Pruning removes small weights, quantization shrinks to INT8 (NSFW Phase 8b/8c, L3-M4)  
 **Now apply:** Shrink your generator for real-time sound generation
 
 ```python
@@ -738,7 +825,7 @@ quantized = torch.quantization.quantize_dynamic(
 
 ---
 
-### Phase 7 Summary
+### Phase 8 Summary
 
 After completing all sub-phases, compare everything:
 
@@ -747,11 +834,11 @@ After completing all sub-phases, compare everything:
 │ GENERATOR COMPARISON (Audio Quality / 10)                │
 │                                                          │
 │ Phase 4:  Basic VAE (from scratch)               ???/10  │
-│ Phase 7a: VAE + PANNs transfer encoder          ???/10  │
-│ Phase 7b: VAE + Optuna-tuned architecture        ???/10  │
-│ Phase 7c: U-Net VAE + skip connections           ???/10  │
-│ Phase 7d: (diagnostic — not a model change)         —    │
-│ Phase 7e: Pruned + Quantized                     ???/10  │
+│ Phase 8a: VAE + PANNs transfer encoder          ???/10  │
+│ Phase 8b: VAE + Optuna-tuned architecture        ???/10  │
+│ Phase 8c: U-Net VAE + skip connections           ???/10  │
+│ Phase 8d: (diagnostic — not a model change)         —    │
+│ Phase 8e: Pruned + Quantized                     ???/10  │
 │                                                          │
 │ Best model:  ???                                         │
 │ Best approach: ???                                       │
@@ -763,52 +850,40 @@ After completing all sub-phases, compare everything:
 └──────────────────────────────────────────────────────────┘
 ```
 
----
+### 8f — Update UI v3 (Re-practice Features)
 
-## Phase 8 — Deployment (Web App) 🔲
+**Goal:** After applying all Phase 8 techniques, update the web app with:
 
-**Goal:** Deploy a web app where users click an animal button and hear generated sounds.
-
-**Build these files:** `export_onnx.py`, `client/server.py`, `client/frontend/`
-
-### What you'll practice
-
-| Concept | Where | Course reference |
-|---------|-------|-----------------|
-| ONNX export (generator only) | `export_onnx.py` | L3-M4 `ONNX/main.py` |
-| FastAPI audio endpoint | `client/server.py` — generate + return .wav | L3-M4 (deployment) |
-| React audio player | `client/frontend/` — play generated sounds | New |
-| Random seed control | `client/server.py` — different sound each click | New |
-| Sampling temperature slider | `client/frontend/` — control diversity | L3-M3 (temperature) |
-| Model info on UI | `client/frontend/` — show model type, size | Same as NSFW |
-| MLflow model registry | Track best model, load in production | L3-M4 `MLflow/main.py` |
-
-### UI concept
+| Feature | From Phase | What it enables |
+|---------|-----------|----------------|
+| ONNX export + inference | 8e | Faster generation, smaller deployment |
+| U-Net model toggle | 8c | Compare basic VAE vs U-Net VAE quality |
+| Transfer model selector | 8a | Compare from-scratch vs PANNs-pretrained |
+| Optuna best params display | 8b | Show which hyperparameters won the search |
+| Grad-CAM overlay on spectrogram | 8d | "Why did it generate this frequency?" |
+| INT8 speed benchmark | 8e | Show ms-per-generation before/after quantization |
 
 ```
-┌─────────────────────────────────────┐
-│   🐾 Animal Sound Generator        │
-│   Model: VAE-UNet  Size: ??? MB    │
-│                                     │
-│  🐶 Dog    🐱 Cat    🐔 Rooster    │
-│  🐷 Pig    🐄 Cow    🐸 Frog       │
-│  🦗 Cricket 🐑 Sheep 🐦 Crow      │
-│                                     │
-│  Temperature: ████░░ 0.7           │
-│                                     │
-│  ┌───────────────────────────────┐  │
-│  │  ▶ [Generated waveform]      │  │
-│  │  Duration: 2.0s              │  │
-│  │                               │  │
-│  │  [▶ Play] [⬇ Download]       │  │
-│  └───────────────────────────────┘  │
-│                                     │
-│  🔀 Mix Mode:                      │
-│  🐶 70% + 🐱 30%  → [Generate]    │
-│                                     │
-│  History:                           │
-│  🐶 Dog #1  🐱 Cat #1  🐶 Dog #2  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│   🐾 Animal Sound Generator v3          │
+│                                          │
+│  ⚙️ Settings:                           │
+│  Architecture: [VAE-Concat ▼] [U-Net ▼] │
+│  Weights: [Scratch ▼] [PANNs ▼] [Best▼] │
+│  Precision: [FP32 ▼] [INT8 ▼]           │
+│                                          │
+│  📊 Optuna Best Config:                 │
+│  latent=128, β=0.0018, lr=0.0008        │
+│  [Load Config]                          │
+│                                          │
+│  🔍 Grad-CAM: [Show Overlay]           │
+│  ┌──────────────────────────────────┐   │
+│  │  Spectrogram + heatmap overlay   │   │
+│  │  ████▓▓▓▓░░░░  Red = important  │   │
+│  └──────────────────────────────────┘   │
+│                                          │
+│  ⚡ Bench: FP32=45ms  INT8=12ms (3.75×) │
+└──────────────────────────────────────────┘
 ```
 
 ---
@@ -830,21 +905,21 @@ animal_sound_generator/
 │   ├── train_vae.py               # Phase 4: VAE from-scratch training
 │   ├── finetune_vae.py            # Phase 4: VAE finetune from AE
 │   ├── evaluate_gen.py            # Phase 5: Generation quality metrics
-│   ├── latent_mixing.py           # Phase 6a: Latent space mixing
-│   ├── sequential_generator.py    # Phase 6b: Longer + sequential sounds
-│   ├── diffusion_refine.py        # Phase 6c: Diffusion refinement
-│   ├── transfer_generator.py      # Phase 7a: Transfer learning on generator
-│   ├── tuning.py                  # Phase 7b: Optuna for generator
-│   ├── unet_vae.py                # Phase 7c: U-Net skip connections
-│   ├── grad_cam_audio.py          # Phase 7d: Grad-CAM on spectrograms
-│   ├── optimize.py                # Phase 7e: Pruning + Quantization
-│   ├── export_onnx.py             # Phase 8: Export to ONNX
+│   ├── sequential_generator.py    # Phase 7a: Longer + sequential sounds
+│   ├── latent_mixing.py           # Phase 7b: Latent space mixing
+│   ├── diffusion_refine.py        # Phase 7c: Diffusion refinement
+│   ├── transfer_generator.py      # Phase 8a: Transfer learning on generator
+│   ├── tuning.py                  # Phase 8b: Optuna for generator
+│   ├── unet_vae.py                # Phase 8c: U-Net skip connections
+│   ├── grad_cam_audio.py          # Phase 8d: Grad-CAM on spectrograms
+│   ├── optimize.py                # Phase 8e: Pruning + Quantization
+│   ├── export_onnx.py             # Phase 6: Export to ONNX
 │   └── helper_utils.py            # Shared utilities
 │
 ├── client/
-│   ├── server.py                  # Phase 8: FastAPI backend
-│   ├── start.py                   # Phase 8: One-command launcher
-│   └── frontend/                  # Phase 8: React frontend
+│   ├── server.py                  # Phase 6: FastAPI backend
+│   ├── start.py                   # Phase 6: One-command launcher
+│   └── frontend/                  # Phase 6: React frontend
 │
 ├── documents/                     # Learning notes per phase
 ├── models/                        # Saved checkpoints
@@ -865,15 +940,17 @@ animal_sound_generator/
 | 4 | Conditional VAE (generate by class) | `vae.py`, `train_vae.py`, `finetune_vae.py` | L2-M3 (embeddings), L3-M2 (conditioning) | ✅ |
 | 5a | Audio quality evaluation | `evaluate_gen.py` | L2-M1 (metrics), L3-M2 (interpreting) | ✅ |
 | 5b | Debug & fix mode collapse | `vae.py`, `train_vae.py`, `finetune_vae.py` | — | ✅ |
-| 6a | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
-| 6b | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
-| 6c | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
-| 7a | Transfer learning (PANNs encoder) | `transfer_generator.py` | L2-M2 (transfer_learning) | 🔲 |
-| 7b | Optuna tuning (generator architecture) | `tuning.py` | L2-M1 (optuna) | 🔲 |
-| 7c | U-Net skip connections | `unet_vae.py` | L3-M1 (resnet) | 🔲 |
-| 7d | Grad-CAM on spectrograms | `grad_cam_audio.py` | L3-M2 (saliency_and_class_activation_map) | 🔲 |
-| 7e | Pruning + Quantization | `optimize.py` | L3-M4 (pruning, quantization) | 🔲 |
-| 8 | Deployment (web app) | `client/` | L3-M4 (ONNX, MLflow, deployment) | 🔲 |
+| 6 | Deployment (web app) | `client/`, `export_onnx.py` | L3-M4 (ONNX, MLflow, deployment) | 🔜 |
+| 7a | Longer & sequential sounds | `sequential_generator.py` | L3-M3 (decoder_block, translation) | 🔲 |
+| 7b | Latent space mixing | `latent_mixing.py` | L3-M2 (stable diffusion latent space) | 🔲 |
+| 7c | Diffusion refinement | `diffusion_refine.py` | L3-M2 (DDPM pipeline) | 🔲 |
+| 7d | Update UI v2 (advanced gen controls) | `client/frontend/` | — | 🔲 |
+| 8a | Transfer learning (PANNs encoder) | `transfer_generator.py` | L2-M2 (transfer_learning) | 🔲 |
+| 8b | Optuna tuning (generator architecture) | `tuning.py` | L2-M1 (optuna) | 🔲 |
+| 8c | U-Net skip connections | `unet_vae.py` | L3-M1 (resnet) | 🔲 |
+| 8d | Grad-CAM on spectrograms | `grad_cam_audio.py` | L3-M2 (saliency_and_class_activation_map) | 🔲 |
+| 8e | Pruning + Quantization | `optimize.py` | L3-M4 (pruning, quantization) | 🔲 |
+| 8f | Update UI v3 (new features) | `client/frontend/` | — | 🔲 |
 
 ---
 
@@ -892,7 +969,7 @@ pandas>=2.0          # data handling
 scikit-learn>=1.3    # Metrics, t-SNE
 
 # Training
-optuna>=3.4          # Phase 7b: Hyperparameter tuning
+optuna>=3.4          # Phase 8b: Hyperparameter tuning
 mlflow>=2.8          # All phases: Experiment tracking
 
 # Audio
@@ -900,7 +977,7 @@ librosa>=0.10        # Advanced audio processing
 soundfile>=0.12      # Save .wav files
 
 # Transfer learning
-panns-inference>=0.1 # Phase 7a: PANNs pretrained models
+panns-inference>=0.1 # Phase 8a: PANNs pretrained models
 
 # Deployment
 fastapi>=0.104
@@ -922,11 +999,11 @@ python-multipart>=0.0.6
 | No decoder needed | Decoder is the core component |
 | 2D convolutions on images | 2D conv on spectrograms OR 1D conv on waveforms |
 | Last layer: Linear(256, 5) | Last layer: ConvTranspose2d (expand to full spectrogram) |
-| ResNet18 transfer learning | PANNs transfer learning (Phase 7a) |
-| ResidualTunedCNN skip connections | U-Net skip connections (Phase 7c) |
-| Grad-CAM on images | Grad-CAM on spectrograms (Phase 7d) |
-| Optuna for classifier | Optuna for generator (Phase 7b) |
-| Pruning/Quantization on classifier | Pruning/Quantization on generator (Phase 7e) |
+| ResNet18 transfer learning | PANNs transfer learning (Phase 8a) |
+| ResidualTunedCNN skip connections | U-Net skip connections (Phase 8c) |
+| Grad-CAM on images | Grad-CAM on spectrograms (Phase 8d) |
+| Optuna for classifier | Optuna for generator (Phase 8b) |
+| Pruning/Quantization on classifier | Pruning/Quantization on generator (Phase 8e) |
 
 ---
 
@@ -942,9 +1019,10 @@ Phase 2:  Baseline classifier (what features matter? reusable evaluator)
 Phase 3:  Autoencoder (can we compress and reconstruct?)
 Phase 4:  Conditional VAE (can we generate BY CLASS? diverse?)
 Phase 5:  Evaluation (how GOOD are they?)
-Phase 6:  Advanced (mixing, longer, diffusion)
-Phase 7:  Re-practice ALL techniques on the generator
-Phase 8:  Deploy (can anyone use it?)
+Phase 5.1: Debug & fix (mode collapse → concat + β + class loss)
+Phase 6:  Deploy (can anyone use it? click → hear!) 🔜
+Phase 7:  Advanced (longer, mixing, diffusion)
+Phase 8:  Re-practice ALL techniques on the generator
 ```
 
 Every phase builds on the previous one. The classifier from Phase 2 becomes the evaluator in Phase 5. The autoencoder from Phase 3 becomes the generator in Phase 4. Phase 7 applies every technique from your NSFW project to the new domain — same concepts, deeper understanding.

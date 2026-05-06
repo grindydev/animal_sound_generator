@@ -312,7 +312,7 @@ class SimpleAudioVAE(nn.Module):
         return reconstructed, mu, log_var
 
     @torch.no_grad()
-    def sample(self, label, num_samples=1, device='cpu'):
+    def sample(self, label, num_samples=1, device='cpu', temperature=1.0):
         """
         GENERATE new animal sounds! No encoder needed — just random noise + class.
 
@@ -325,7 +325,7 @@ class SimpleAudioVAE(nn.Module):
           1. Sample random noise from N(0,1) — because KL loss organized
              the latent space to BE approximately N(0,1), random points
              will produce meaningful outputs
-          2. Add the class embedding — steers the random point toward
+          2. Concatenate the class embedding — steers generation toward
              the "dog neighborhood" or "cat neighborhood"
           3. Decode — the decoder turns this into a spectrogram
 
@@ -336,6 +336,7 @@ class SimpleAudioVAE(nn.Module):
             label:       int (0-7) or list of ints, which animal to generate
             num_samples: how many different sounds to generate
             device:      'cpu', 'cuda', or 'mps'
+            temperature: sampling temperature (0.5=consistent, 1.0=normal, 1.5=wild)
 
         Returns:
             generated spectrogram [num_samples, 1, 64, 552]
@@ -349,9 +350,10 @@ class SimpleAudioVAE(nn.Module):
             labels = torch.tensor(label, dtype=torch.long, device=device)
             num_samples = len(labels)
 
-        # 1. Sample random z from standard normal
-        #    This works because KL loss trained the latent space to be ~N(0,1)
-        z = torch.randn(num_samples, self.fc_mu.out_features, device=device)
+        # 1. Sample random z from standard normal, scaled by temperature
+        #    temperature=0.7 → tighter, more consistent
+        #    temperature=1.5 → wider, more diverse/wild
+        z = torch.randn(num_samples, self.fc_mu.out_features, device=device) * temperature
 
         # 2. Add class conditioning via CONCATENATION
         class_emb = self.class_embed(labels)

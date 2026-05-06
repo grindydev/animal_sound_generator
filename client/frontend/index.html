@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🐾 Animal Sound Generator</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .container {
+    max-width: 700px;
+    width: 100%;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 30px;
+  }
+
+  header h1 { font-size: 2rem; margin-bottom: 4px; }
+  header p { color: #888; font-size: 0.9rem; }
+
+  .status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 0.85rem;
+    color: #666;
+  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; }
+  .status-dot.loading { background: #facc15; animation: pulse 0.6s infinite; }
+  .status-dot.error { background: #f87171; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* ── Card ──────────── */
+  .card {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+    backdrop-filter: blur(10px);
+  }
+  .card h2 { font-size: 1.1rem; margin-bottom: 16px; color: #ccc; }
+
+  /* ── Animal Grid ────── */
+  .animal-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+  }
+  .animal-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 16px 8px;
+    border: 2px solid rgba(255,255,255,0.12);
+    border-radius: 14px;
+    background: rgba(255,255,255,0.04);
+    color: #ccc;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-size: 0.9rem;
+    gap: 6px;
+    user-select: none;
+  }
+  .animal-btn:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.25); }
+  .animal-btn.active { background: rgba(99, 179, 237, 0.2); border-color: #63b3ed; color: #63b3ed; }
+  .animal-btn .emoji { font-size: 1.8rem; }
+  .animal-btn .name { font-weight: 500; }
+
+  /* ── Controls ──────── */
+  .controls-row {
+    display: flex;
+    gap: 20px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .control-group { flex: 1; min-width: 180px; }
+  .control-group label {
+    display: block;
+    font-size: 0.8rem;
+    color: #888;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .control-group select, .control-group input[type=range] {
+    width: 100%;
+  }
+  input[type=range] {
+    -webkit-appearance: none;
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.15);
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: #63b3ed;
+    cursor: pointer;
+  }
+  select {
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.08);
+    color: #ccc;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  .temp-value { text-align: center; font-size: 0.85rem; color: #63b3ed; font-weight: 600; margin-top: 4px; }
+
+  /* ── Generate Button ──── */
+  .btn-generate {
+    width: 100%;
+    padding: 14px;
+    border: none;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: white;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-top: 16px;
+  }
+  .btn-generate:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(102,126,234,0.4); }
+  .btn-generate:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .btn-generate.generating { background: linear-gradient(135deg, #48bb78, #38a169); }
+
+  /* ── Audio Player ─────── */
+  .audio-section { margin-top: 16px; }
+  .audio-player {
+    width: 100%;
+    margin-top: 8px;
+  }
+  .audio-player::-webkit-media-controls-panel {
+    background: rgba(255,255,255,0.08);
+  }
+  .audio-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: #666;
+    margin-top: 6px;
+  }
+  .audio-meta span { color: #63b3ed; font-weight: 500; }
+
+  /* ── History ──────── */
+  .history-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .history-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .history-item:hover { background: rgba(255,255,255,0.12); }
+  .history-item .play-icon { font-size: 0.7rem; }
+
+  /* ── Toast ────────────── */
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 24px;
+    border-radius: 10px;
+    background: #333;
+    color: white;
+    font-size: 0.9rem;
+    z-index: 1000;
+    animation: fadeIn 0.2s;
+  }
+  .toast.error { background: #dc2626; }
+  .toast.success { background: #16a34a; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+    to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>🐾 Animal Sound Generator</h1>
+    <p>Click an animal → hear a unique AI-generated sound</p>
+    <div class="status-bar">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">Connecting...</span>
+    </div>
+  </header>
+
+  <!-- Animal selection -->
+  <div class="card">
+    <h2>Choose an animal</h2>
+    <div class="animal-grid" id="animal-grid"></div>
+  </div>
+
+  <!-- Controls -->
+  <div class="card">
+    <h2>Settings</h2>
+    <div class="controls-row">
+      <div class="control-group">
+        <label>Model</label>
+        <select id="model-select">
+          <option value="finetune">Finetuned VAE</option>
+          <option value="scratch">From-Scratch VAE</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Temperature</label>
+        <input type="range" id="temp-slider" min="0.3" max="1.8" value="0.7" step="0.05">
+        <div class="temp-value" id="temp-value">0.70 — Consistent</div>
+      </div>
+    </div>
+
+    <button class="btn-generate" id="btn-generate" onclick="generate()">
+      🎵 Generate Sound
+    </button>
+
+    <!-- Audio player area -->
+    <div class="audio-section" id="audio-section" style="display:none">
+      <audio class="audio-player" id="audio-player" controls></audio>
+      <div class="audio-meta">
+        <span id="audio-class"></span>
+        <span id="audio-model"></span>
+        <span id="audio-temp"></span>
+        <span id="audio-time"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card" id="history-card" style="display:none">
+    <h2>Recent Generations</h2>
+    <div class="history-list" id="history-list"></div>
+  </div>
+</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────
+const CLASS_NAMES = ["Dog", "Cat", "Rooster", "Frog", "Crow", "Insect", "Hen", "Noise"];
+const CLASS_EMOJIS = ["🐶", "🐱", "🐔", "🐸", "🐦", "🦗", "🐔", "🔊"];
+const API = "/api";
+
+let selectedClass = "Dog";
+let history = [];
+let currentAudioUrl = null;
+
+// ─── Init ─────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  buildAnimalGrid();
+  setupControls();
+  checkHealth();
+});
+
+function buildAnimalGrid() {
+  const grid = document.getElementById("animal-grid");
+  CLASS_NAMES.forEach((name, i) => {
+    const btn = document.createElement("button");
+    btn.className = "animal-btn" + (name === selectedClass ? " active" : "");
+    btn.innerHTML = `<span class="emoji">${CLASS_EMOJIS[i]}</span><span class="name">${name}</span>`;
+    btn.onclick = () => selectAnimal(name);
+    grid.appendChild(btn);
+  });
+}
+
+function selectAnimal(name) {
+  selectedClass = name;
+  document.querySelectorAll(".animal-btn").forEach(b => {
+    b.classList.toggle("active", b.querySelector(".name").textContent === name);
+  });
+}
+
+function setupControls() {
+  const slider = document.getElementById("temp-slider");
+  slider.oninput = () => {
+    const v = parseFloat(slider.value);
+    let label = "Consistent";
+    if (v > 0.8) label = "Balanced";
+    if (v > 1.2) label = "Creative";
+    if (v > 1.5) label = "Wild";
+    document.getElementById("temp-value").textContent = v.toFixed(2) + " — " + label;
+  };
+}
+
+// ─── API ──────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API}/health`);
+    const data = await r.json();
+    document.getElementById("status-text").textContent =
+      `Ready · ${data.device} · ${Object.keys(data.available_models).join(", ")}`;
+    document.getElementById("status-dot").className = "status-dot";
+
+    // Update model selector based on available models
+    const select = document.getElementById("model-select");
+    if (!data.available_models.finetune) select.options[0].disabled = true;
+    if (!data.available_models.scratch) select.options[1].disabled = true;
+  } catch (e) {
+    document.getElementById("status-text").textContent = "Server offline";
+    document.getElementById("status-dot").className = "status-dot error";
+  }
+}
+
+async function generate() {
+  const btn = document.getElementById("btn-generate");
+  const temperature = parseFloat(document.getElementById("temp-slider").value);
+  const model = document.getElementById("model-select").value;
+
+  btn.disabled = true;
+  btn.textContent = "⏳ Generating...";
+  btn.classList.add("generating");
+
+  try {
+    const t0 = performance.now();
+    const r = await fetch(`${API}/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        class_name: selectedClass,
+        temperature,
+        model,
+        num_samples: 1,
+      }),
+    });
+
+    if (!r.ok) {
+      const err = await r.json();
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+
+    const genTime = (performance.now() - t0).toFixed(0);
+    const blob = await r.blob();
+
+    // Revoke old URL to free memory
+    if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = URL.createObjectURL(blob);
+
+    // Show and play
+    const audio = document.getElementById("audio-player");
+    audio.src = currentAudioUrl;
+    document.getElementById("audio-section").style.display = "block";
+
+    const duration = parseFloat(r.headers.get("X-Duration-Seconds") || "?");
+    document.getElementById("audio-class").textContent = selectedClass;
+    document.getElementById("audio-model").textContent = model;
+    document.getElementById("audio-temp").textContent = `T=${temperature.toFixed(2)}`;
+    document.getElementById("audio-time").textContent = `${duration.toFixed(1)}s · ${genTime}ms`;
+
+    audio.play().catch(() => {});
+
+    // Add to history
+    addToHistory(selectedClass, model, temperature, currentAudioUrl);
+
+    showToast(`✅ ${selectedClass} · ${duration.toFixed(1)}s`, "success");
+  } catch (e) {
+    showToast(`❌ ${e.message}`, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🎵 Generate Sound";
+    btn.classList.remove("generating");
+  }
+}
+
+// ─── History ──────────────────────────────────────────────────────────
+function addToHistory(className, model, temp, url) {
+  history.unshift({ className, model, temp, url, time: new Date() });
+  if (history.length > 10) history.pop();
+  renderHistory();
+}
+
+function renderHistory() {
+  const card = document.getElementById("history-card");
+  const list = document.getElementById("history-list");
+  card.style.display = history.length ? "block" : "none";
+  list.innerHTML = history.map((h, i) => `
+    <div class="history-item" onclick="replayHistory(${i})">
+      <span>${CLASS_EMOJIS[CLASS_NAMES.indexOf(h.className)]}</span>
+      <span>${h.className}</span>
+      <span style="color:#666;font-size:0.75rem">${h.model}</span>
+      <span class="play-icon">▶</span>
+    </div>
+  `).join("");
+}
+
+function replayHistory(i) {
+  const h = history[i];
+  const audio = document.getElementById("audio-player");
+  audio.src = h.url;
+  document.getElementById("audio-section").style.display = "block";
+  document.getElementById("audio-class").textContent = h.className;
+  document.getElementById("audio-model").textContent = h.model;
+  document.getElementById("audio-temp").textContent = `T=${h.temp.toFixed(2)}`;
+  audio.play().catch(() => {});
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────
+function showToast(msg, type) {
+  const toast = document.createElement("div");
+  toast.className = "toast " + type;
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+// ─── Keyboard shortcuts ───────────────────────────────────────────────
+document.addEventListener("keydown", (e) => {
+  // Space = generate
+  if (e.code === "Space" && e.target === document.body) {
+    e.preventDefault();
+    generate();
+  }
+  // 1-8 = select class
+  const num = parseInt(e.key);
+  if (num >= 1 && num <= 8) {
+    selectAnimal(CLASS_NAMES[num - 1]);
+  }
+});
+</script>
+</body>
+</html>
