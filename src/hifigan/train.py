@@ -122,6 +122,40 @@ use_amp = is_cuda
 scaler = GradScaler() if use_amp else None
 
 # ═══════════════════════════════════════════════════════════════
+#  AUDIO LOADER (torchaudio → soundfile fallback)
+# ═══════════════════════════════════════════════════════════════
+
+def _load_audio(path: str):
+    """Load audio file. Tries torchaudio first, falls back to soundfile.
+
+    torchaudio 2.11+ requires libtorchcodec which needs FFmpeg shared libs.
+    On systems without FFmpeg, soundfile works directly (reads WAV natively).
+    """
+    import numpy as np
+    # ── Try torchaudio first (fast, native) ──
+    try:
+        return torchaudio.load(path)
+    except Exception:
+        pass
+
+    # ── Fallback: soundfile (no FFmpeg needed for WAV) ──
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype='float32')
+        # soundfile returns [samples] or [samples, channels]
+        wav = torch.from_numpy(data)
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)  # [1, samples]
+        else:
+            wav = wav.transpose(0, 1)  # [channels, samples]
+        return wav, sr
+    except Exception as e:
+        import warnings
+        warnings.warn(f"⚠️  Audio load FAILED (all backends): {path} → {e}")
+        return None, None
+
+
+# ═══════════════════════════════════════════════════════════════
 #  DATASET
 # ═══════════════════════════════════════════════════════════════
 
@@ -152,11 +186,8 @@ class HiFiGANDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.files[idx]
-        try:
-            wav, sr = torchaudio.load(path)
-        except Exception as e:
-            import warnings
-            warnings.warn(f"⚠️  Audio load FAILED: {path} → {e}")
+        wav, sr = _load_audio(path)
+        if wav is None:
             return torch.zeros(1, self.segment_size)
 
         if sr != cfg.sample_rate:
