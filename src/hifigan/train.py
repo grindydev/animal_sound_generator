@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "test",         # "test" = quick dev, "train" = full
+    "mode": "train",         # "test" = quick dev, "train" = full
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
@@ -62,7 +62,7 @@ CONFIG = {
 
     "train": {
         "num_epochs": 30,
-        "batch_size": 10,
+        "batch_size": 8,
         "num_workers": 4,
     },
 }
