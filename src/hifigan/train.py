@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "diag",          # "test" / "train" / "diag" (mel-only speed test)
+    "mode": "meltrain",      # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
@@ -78,7 +78,10 @@ CONFIG = {
 # ═══════════════════════════════════════════════════════════════
 
 MODE = CONFIG["mode"]
-SETTINGS = CONFIG[MODE]
+if MODE not in CONFIG:
+    SETTINGS = CONFIG["train"]  # meltrain reuses train settings
+else:
+    SETTINGS = CONFIG[MODE]
 
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
@@ -386,12 +389,58 @@ def training_loop():
             prev_val = val_mel
 
         print(f"\n✅ Diagnostic complete.")
-        Verdict = "DROPS" if final_val < val_mel * 0.95 else "FLAT"
+        Verdict = "DROPS" if val_mel < 0.5 else "FLAT"
         print(f"   Verdict: Mel {Verdict} → {'GAN setup broken' if Verdict == 'DROPS' else 'generator too weak'}")
         return None
 
     # ═════════════════════════════════════════════════════════
-    #  NORMAL TRAINING (test / train modes)
+    #  MEL-ONLY TRAINING: no discriminator, pure mel→audio
+    # ═════════════════════════════════════════════════════════
+    if MODE == "meltrain":
+        print(f"\n🎵 MEL-ONLY TRAINING — No GAN, pure reconstruction")
+        print(f"   Segment: {SEGMENT_SIZE} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE}\n")
+
+        train_ds = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="train")
+        val_ds   = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="val")
+        train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
+                                  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+        val_loader   = DataLoader(val_ds, BATCH_SIZE, shuffle=False,
+                                  num_workers=NUM_WORKERS, pin_memory=True)
+
+        generator = HiFiGANGenerator(cfg).to(device)
+        print(f"   Generator: {sum(p.numel() for p in generator.parameters()):,} params")
+
+        opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
+        sched_g = torch.optim.lr_scheduler.ExponentialLR(opt_g, gamma=cfg.lr_decay)
+        mel_loss_fn = MelL1Loss(cfg.sample_rate, cfg.n_fft, cfg.hop_length, cfg.n_mels,
+                                cfg.f_min, cfg.f_max).to(device)
+
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs(cfg.model_dir, exist_ok=True)
+        best_val = float("inf")
+        BEST_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}_best.pth")
+
+        for epoch in range(NUM_EPOCHS):
+            t0 = time.time()
+            avg_mel = train_epoch_mel_only(generator, train_loader, opt_g, mel_loss_fn)
+            sched_g.step()
+            val_mel = validate(generator, val_loader, mel_loss_fn)
+            dt = time.time() - t0
+
+            trend = "📉" if val_mel < best_val else "➡️"
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} ({dt:.0f}s) ── mel={avg_mel:.4f} val={val_mel:.4f} {trend} lr={sched_g.get_last_lr()[0]:.2e}")
+
+            if val_mel < best_val:
+                best_val = val_mel
+                torch.save({"generator": generator.state_dict(), "config": cfg.__dict__}, BEST_PATH)
+
+        torch.save({"generator": generator.state_dict(), "config": cfg.__dict__}, BEST_MODEL_PATH)
+        print(f"\n💾 Saved: {BEST_MODEL_PATH}")
+        print(f"   Best val mel: {best_val:.4f}")
+        return None
+
+    # ═════════════════════════════════════════════════════════
+    #  GAN TRAINING (test / train modes)
     # ═════════════════════════════════════════════════════════
 
     # ── Models ──────────────────────────────────────────
