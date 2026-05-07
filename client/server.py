@@ -188,15 +188,22 @@ async def generate(req: GenerateRequest):
             temperature=req.temperature,
         )  # [num_samples, 1, n_mels, time_frames]
 
-    # Convert to waveform
+    # Convert to waveform — try HiFi-GAN first, fall back to Griffin-Lim
     spec = spectrograms[0]  # Take first sample
-    waveform = spectrogram_to_waveform(
-        spec,
-        sample_rate=SAMPLE_RATE,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        n_mels=N_MELS,
-    )
+
+    try:
+        from src.hifigan.inference import mel_to_waveform
+        waveform = mel_to_waveform(spec, device=device, use_griffin_lim=True)
+        print(f"   ✓ HiFi-GAN + Griffin-Lim")
+    except Exception as e:
+        print(f"   ⚠️ HiFi-GAN unavailable ({e}), falling back to Griffin-Lim")
+        waveform = spectrogram_to_waveform(
+            spec,
+            sample_rate=SAMPLE_RATE,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS,
+        )
 
     gen_time = (time.time() - t0) * 1000
     duration = waveform.shape[-1] / SAMPLE_RATE

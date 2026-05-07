@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "train",          # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
+    "mode": "meltrain",      # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
