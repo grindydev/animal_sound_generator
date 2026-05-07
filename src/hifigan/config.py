@@ -49,9 +49,9 @@ class HiFiGANConfig:
     num_workers: int = 4
 
     # ── Loss weights ─────────────────────────────────────
-    lambda_mel: float = 1.0   # gentle mel guide — let adv+FM do the heavy lifting
-    lambda_fm: float = 2.0
-    lambda_adv: float = 10.0  # generator must fight D hard
+    lambda_mel: float = 1.0   # gentle guide
+    lambda_fm: float = 10.0   # FEATURE MATCHING is the real teacher — never saturates
+    lambda_adv: float = 2.0   # adversarial gives slight push
 
     # ── Smart crop (energy VAD) ──────────────────────────
     smart_crop_threshold_db: float = -30.0
