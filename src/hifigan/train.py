@@ -71,6 +71,12 @@ CONFIG = {
         "batch_size": 16,       # must be ≥16 for mel-only (batch=8 collapses to mean!)
         "num_workers": 4,
     },
+
+    "meltrain": {
+        "num_epochs": 30,
+        "batch_size": 16,
+        "num_workers": 0,       # 0 = no multiprocessing → avoids silent data loading bugs on CUDA
+    },
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -116,19 +122,6 @@ use_amp = is_cuda
 scaler = GradScaler() if use_amp else None
 
 # ═══════════════════════════════════════════════════════════════
-#  BANNER
-# ═══════════════════════════════════════════════════════════════
-
-print(f"\n🔧 HiFi-GAN → {MODE.upper()} MODE")
-if is_cuda:
-    print(f"   GPU:    {torch.cuda.get_device_name(0)}")
-print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS}")
-print(f"   Segment: {SEGMENT_SIZE} samples (~{SEGMENT_SIZE/cfg.sample_rate:.1f}s)")
-print(f"   Mixed precision: {'yes' if use_amp else 'no'}")
-print(f"   Best model → {BEST_MODEL_PATH}")
-
-
-# ═══════════════════════════════════════════════════════════════
 #  DATASET
 # ═══════════════════════════════════════════════════════════════
 
@@ -146,7 +139,8 @@ class HiFiGANDataset(Dataset):
                 continue
             for fname in sorted(os.listdir(cls_dir)):
                 if fname.endswith('.wav'):
-                    self.files.append(os.path.join(cls_dir, fname))
+                    # ABSOLUTE PATHS — relative paths break in multiprocessing workers
+                    self.files.append(os.path.abspath(os.path.join(cls_dir, fname)))
 
         np.random.seed(42)
         np.random.shuffle(self.files)
@@ -160,7 +154,9 @@ class HiFiGANDataset(Dataset):
         path = self.files[idx]
         try:
             wav, sr = torchaudio.load(path)
-        except Exception:
+        except Exception as e:
+            import warnings
+            warnings.warn(f"⚠️  Audio load FAILED: {path} → {e}")
             return torch.zeros(1, self.segment_size)
 
         if sr != cfg.sample_rate:
@@ -363,6 +359,17 @@ def training_loop():
     """Full HiFi-GAN training with test/train mode, AMP, checkpoint resume."""
 
     # ═════════════════════════════════════════════════════════
+    #  BANNER (inside training_loop to avoid multiprocessing duplication)
+    # ═════════════════════════════════════════════════════════
+    print(f"\n🔧 HiFi-GAN → {MODE.upper()} MODE")
+    if is_cuda:
+        print(f"   GPU:    {torch.cuda.get_device_name(0)}")
+    print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS}")
+    print(f"   Segment: {SEGMENT_SIZE} samples (~{SEGMENT_SIZE/cfg.sample_rate:.1f}s)")
+    print(f"   Mixed precision: {'yes' if use_amp else 'no'}")
+    print(f"   Best model → {BEST_MODEL_PATH}")
+
+    # ═════════════════════════════════════════════════════════
     #  DIAGNOSTIC: mel-only, no discriminator, small segment
     # ═════════════════════════════════════════════════════════
     if MODE == "diag":
@@ -375,9 +382,9 @@ def training_loop():
         val_ds = HiFiGANDataset(CONFIG["data_dir"], diag_segment, split="val")
 
         train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
-                                  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+                                  num_workers=NUM_WORKERS, pin_memory=False, drop_last=True)
         val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False,
-                                num_workers=NUM_WORKERS, pin_memory=True)
+                                num_workers=NUM_WORKERS, pin_memory=False)
 
         generator = HiFiGANGenerator(cfg).to(device)
         opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
@@ -386,6 +393,16 @@ def training_loop():
             hop_length=cfg.hop_length, n_mels=cfg.n_mels,
             f_min=cfg.f_min, f_max=cfg.f_max,
         ).to(device)
+
+        # ── DATA VALIDATION ─────────────────────────────────
+        _check = next(iter(train_loader))
+        _check_max = _check.abs().max().item()
+        print(f"   📊 First batch: shape={tuple(_check.shape)}, "
+              f"min={_check.min():.4f}, max={_check.max():.4f}, "
+              f"mean_abs={_check.abs().mean():.4f}")
+        if _check_max < 1e-6:
+            print("   🚨 ALL ZEROS — audio files not loading correctly.")
+            return None
 
         prev_val = float("inf")
         for epoch in range(NUM_EPOCHS):
@@ -407,14 +424,30 @@ def training_loop():
     # ═════════════════════════════════════════════════════════
     if MODE == "meltrain":
         print(f"\n🎵 MEL-ONLY TRAINING — No GAN, pure reconstruction")
-        print(f"   Segment: {SEGMENT_SIZE} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE}\n")
+        print(f"   Segment: {SEGMENT_SIZE} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS}\n")
 
         train_ds = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="train")
         val_ds   = HiFiGANDataset(CONFIG["data_dir"], SEGMENT_SIZE, split="val")
+        print(f"   Data: {len(train_ds)} train / {len(val_ds)} val files")
+
+        # pin_memory only useful with workers > 0
+        pin_mem = NUM_WORKERS > 0 and is_cuda
         train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
-                                  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+                                  num_workers=NUM_WORKERS, pin_memory=pin_mem, drop_last=True)
         val_loader   = DataLoader(val_ds, BATCH_SIZE, shuffle=False,
-                                  num_workers=NUM_WORKERS, pin_memory=True)
+                                  num_workers=NUM_WORKERS, pin_memory=pin_mem)
+
+        # ── DATA VALIDATION ─────────────────────────────────
+        # Catch silent zero-data bugs BEFORE wasting epochs
+        _check = next(iter(train_loader))
+        _check_max = _check.abs().max().item()
+        print(f"   📊 First batch: shape={tuple(_check.shape)}, "
+              f"min={_check.min():.4f}, max={_check.max():.4f}, "
+              f"mean_abs={_check.abs().mean():.4f}")
+        if _check_max < 1e-6:
+            print("   🚨 ALL ZEROS — audio files not loading correctly. Check data_dir and file format.")
+            print("   🚨 Training stopped to save time.")
+            return None
 
         generator = HiFiGANGenerator(cfg).to(device)
         print(f"   Generator: {sum(p.numel() for p in generator.parameters()):,} params")
@@ -482,14 +515,27 @@ def training_loop():
 
     print(f"\n✅ Data loaded: {len(train_ds)} train / {len(val_ds)} val")
 
+    # pin_memory only useful with workers > 0
+    pin_mem = NUM_WORKERS > 0 and is_cuda
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True, drop_last=True,
+        num_workers=NUM_WORKERS, pin_memory=pin_mem, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True, drop_last=False,
+        num_workers=NUM_WORKERS, pin_memory=pin_mem, drop_last=False,
     )
+
+    # ── DATA VALIDATION ─────────────────────────────────
+    _check = next(iter(train_loader))
+    _check_max = _check.abs().max().item()
+    print(f"   📊 First batch: shape={tuple(_check.shape)}, "
+          f"min={_check.min():.4f}, max={_check.max():.4f}, "
+          f"mean_abs={_check.abs().mean():.4f}")
+    if _check_max < 1e-6:
+        print("   🚨 ALL ZEROS — audio files not loading correctly. Check data_dir and file format.")
+        print("   🚨 Training stopped to save time.")
+        return None
 
     # ── Resume ──────────────────────────────────────────
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
