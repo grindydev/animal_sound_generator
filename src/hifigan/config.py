@@ -40,7 +40,7 @@ class HiFiGANConfig:
     )
 
     # ── Training ──────────────────────────────────────────
-    segment_size: int = 32768                  # 1.49s — harder for D, more context for G
+    segment_size: int = 8192                   # 0.37s — only size where generator learns (mel=0.17)
     batch_size: int = 8
     learning_rate: float = 2e-4
     lr_decay: float = 0.999                    # per-epoch decay
