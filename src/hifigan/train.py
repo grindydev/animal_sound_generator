@@ -46,13 +46,19 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "train",         # "test" = quick dev, "train" = full
+    "mode": "diag",          # "test" / "train" / "diag" (mel-only speed test)
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
     "data_dir": cfg.data_dir,
     "segment_size": cfg.segment_size,
     "save_interval": cfg.save_interval,
+
+    "diag": {
+        "num_epochs": 5,
+        "batch_size": 16,
+        "num_workers": 2,
+    },
 
     "test": {
         "num_epochs": 5,
@@ -197,6 +203,38 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
 #  TRAIN / VALIDATE
 # ═══════════════════════════════════════════════════════════════
 
+def train_epoch_mel_only(generator, train_loader, opt_g, mel_loss_fn):
+    """Train one epoch — MEL ONLY, no discriminator. Returns avg_mel."""
+    from tqdm import tqdm
+
+    generator.train()
+    total_mel = 0.0
+    pbar = tqdm(train_loader, desc="  Train", leave=False)
+
+    for audio in pbar:
+        audio = audio.to(device)
+        real_mel = compute_mel(audio)
+        n_frames = real_mel.shape[-1]
+        target_len = n_frames * cfg.hop_length
+
+        if audio.shape[-1] < target_len:
+            real_trim = F.pad(audio, (0, target_len - audio.shape[-1]))
+        else:
+            real_trim = audio[..., :target_len]
+
+        fake = generator(real_mel, target_length=target_len)
+        mel_loss = mel_loss_fn(fake, real_trim)
+
+        opt_g.zero_grad()
+        mel_loss.backward()
+        opt_g.step()
+
+        total_mel += mel_loss.item()
+        pbar.set_postfix({"mel": f"{mel_loss.item():.1f}"})
+
+    return total_mel / len(train_loader)
+
+
 def train_epoch(generator, discriminator, train_loader,
                 opt_g, opt_d, mel_loss_fn):
     """Train one epoch. Returns (avg_g, avg_d, avg_mel)."""
@@ -311,6 +349,50 @@ def validate(generator, val_loader, mel_loss_fn):
 
 def training_loop():
     """Full HiFi-GAN training with test/train mode, AMP, checkpoint resume."""
+
+    # ═════════════════════════════════════════════════════════
+    #  DIAGNOSTIC: mel-only, no discriminator, small segment
+    # ═════════════════════════════════════════════════════════
+    if MODE == "diag":
+        diag_segment = 8192  # 0.37s, ~4× faster
+        print(f"\n🔬 DIAGNOSTIC: Mel-only training, segment={diag_segment}")
+        print(f"   No discriminator. If mel drops → GAN setup is broken.")
+        print(f"   If mel flatlines → generator is too weak.\n")
+
+        train_ds = HiFiGANDataset(CONFIG["data_dir"], diag_segment, split="train")
+        val_ds = HiFiGANDataset(CONFIG["data_dir"], diag_segment, split="val")
+
+        train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
+                                  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False,
+                                num_workers=NUM_WORKERS, pin_memory=True)
+
+        generator = HiFiGANGenerator(cfg).to(device)
+        opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
+        mel_loss_fn = MelL1Loss(
+            sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
+            hop_length=cfg.hop_length, n_mels=cfg.n_mels,
+            f_min=cfg.f_min, f_max=cfg.f_max,
+        ).to(device)
+
+        prev_val = float("inf")
+        for epoch in range(NUM_EPOCHS):
+            t0 = time.time()
+            avg_mel = train_epoch_mel_only(generator, train_loader, opt_g, mel_loss_fn)
+            val_mel = validate(generator, val_loader, mel_loss_fn)
+            dt = time.time() - t0
+            trend = "📉" if val_mel < prev_val else "➡️"
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} ({dt:.0f}s) ── mel={avg_mel:.4f} val={val_mel:.4f} {trend}")
+            prev_val = val_mel
+
+        print(f"\n✅ Diagnostic complete.")
+        Verdict = "DROPS" if final_val < val_mel * 0.95 else "FLAT"
+        print(f"   Verdict: Mel {Verdict} → {'GAN setup broken' if Verdict == 'DROPS' else 'generator too weak'}")
+        return None
+
+    # ═════════════════════════════════════════════════════════
+    #  NORMAL TRAINING (test / train modes)
+    # ═════════════════════════════════════════════════════════
 
     # ── Models ──────────────────────────────────────────
     generator = HiFiGANGenerator(cfg).to(device)
