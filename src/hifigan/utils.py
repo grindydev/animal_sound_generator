@@ -15,13 +15,9 @@ import torch.nn as nn
 
 
 def init_weights(module: nn.Module, mean: float = 0.0, std: float = 0.01):
-    """Initialize Conv1d weights with Xavier normal, biases to 0."""
-    if isinstance(module, nn.Conv1d):
-        nn.init.xavier_normal_(module.weight)
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0.0)
-    elif isinstance(module, nn.ConvTranspose1d):
-        nn.init.xavier_normal_(module.weight)
+    """Kaiming init for Conv1d/ConvTranspose1d — proper for LeakyReLU nets."""
+    if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+        nn.init.kaiming_normal_(module.weight, a=0.1, mode='fan_in', nonlinearity='leaky_relu')
         if module.bias is not None:
             nn.init.constant_(module.bias, 0.0)
 

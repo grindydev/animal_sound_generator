@@ -68,7 +68,7 @@ CONFIG = {
 
     "train": {
         "num_epochs": 30,
-        "batch_size": 8,
+        "batch_size": 16,       # must be ≥16 for mel-only (batch=8 collapses to mean!)
         "num_workers": 4,
     },
 }
@@ -230,6 +230,7 @@ def train_epoch_mel_only(generator, train_loader, opt_g, mel_loss_fn):
 
         opt_g.zero_grad()
         mel_loss.backward()
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
         opt_g.step()
 
         total_mel += mel_loss.item()
