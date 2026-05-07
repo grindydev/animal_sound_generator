@@ -62,7 +62,7 @@ CONFIG = {
 
     "train": {
         "num_epochs": 30,
-        "batch_size": 12,       # 774MB/4096MB used — plenty of headroom
+        "batch_size": 10,
         "num_workers": 4,
     },
 }
