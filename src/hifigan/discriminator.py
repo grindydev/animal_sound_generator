@@ -27,7 +27,7 @@ for Conditional Waveform Synthesis" (MelGAN discriminator)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .utils import get_padding, init_weights
+from .utils import get_padding
 from .config import config
 
 
@@ -57,18 +57,18 @@ class PeriodDiscriminator(nn.Module):
         for i in range(len(channels) - 1):
             self.convs.append(
                 nn.Sequential(
-                    nn.Conv2d(
+                    nn.utils.spectral_norm(nn.Conv2d(
                         channels[i], channels[i + 1],
                         kernel_size=(5, kernel_size),
                         stride=(3, stride),
                         padding=(2, get_padding(kernel_size)),
-                    ),
+                    )),
                     nn.LeakyReLU(0.1),
                 )
             )
 
         # Final: 128 → 1 score per position
-        self.post_conv = nn.Conv2d(128, 1, kernel_size=(3, 1), padding=(1, 0))
+        self.post_conv = nn.utils.spectral_norm(nn.Conv2d(128, 1, kernel_size=(3, 1), padding=(1, 0)))
 
     def forward(self, x: torch.Tensor) -> tuple:
         """

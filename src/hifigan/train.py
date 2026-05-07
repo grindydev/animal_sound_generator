@@ -226,17 +226,21 @@ def train_epoch(generator, discriminator, train_loader,
         # ── Discriminator ───────────────────────────────
         opt_d.zero_grad()
 
+        # Add noise to D input → harder to memorize
+        d_real = real_trim + torch.randn_like(real_trim) * 0.01
+        d_fake = fake.detach() + torch.randn_like(fake) * 0.01
+
         if use_amp:
             with autocast(device_type="cuda"):
-                r_score, r_feat = discriminator(real_trim)
-                f_score_d, _ = discriminator(fake.detach())
+                r_score, r_feat = discriminator(d_real)
+                f_score_d, _ = discriminator(d_fake)
                 d_loss, d_dict = discriminator_loss(r_score, f_score_d)
             scaler.scale(d_loss).backward()
             scaler.step(opt_d)
             scaler.update()
         else:
-            r_score, r_feat = discriminator(real_trim)
-            f_score_d, _ = discriminator(fake.detach())
+            r_score, r_feat = discriminator(d_real)
+            f_score_d, _ = discriminator(d_fake)
             d_loss, d_dict = discriminator_loss(r_score, f_score_d)
             d_loss.backward()
             opt_d.step()
@@ -320,7 +324,7 @@ def training_loop():
 
     # ── Optimizers ──────────────────────────────────────
     opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
-    opt_d = torch.optim.Adam(discriminator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
+    opt_d = torch.optim.Adam(discriminator.parameters(), lr=cfg.learning_rate * 0.25, betas=cfg.adam_betas)  # 4× slower D
 
     sched_g = torch.optim.lr_scheduler.ExponentialLR(opt_g, gamma=cfg.lr_decay)
     sched_d = torch.optim.lr_scheduler.ExponentialLR(opt_d, gamma=cfg.lr_decay)
