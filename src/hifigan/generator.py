@@ -166,6 +166,9 @@ class HiFiGANGenerator(nn.Module):
         self.post_conv = nn.Conv1d(in_channels, 1, kernel_size=7, padding=3)
 
         self.apply(init_weights)
+        # Override post_conv to zero — generator starts silent, learns amplitude gradually
+        nn.init.constant_(self.post_conv.weight, 0.0)
+        nn.init.constant_(self.post_conv.bias, 0.0)
 
     def forward(self, mel: torch.Tensor, target_length: int = None) -> torch.Tensor:
         """
@@ -184,7 +187,7 @@ class HiFiGANGenerator(nn.Module):
         for mrf in self.mrf_blocks:
             x = mrf(x)
         x = self.post_conv(x)
-        x = torch.tanh(x)
+        # No tanh — time-domain loss keeps output bounded
 
         if target_length is not None and x.shape[-1] != target_length:
             if x.shape[-1] > target_length:

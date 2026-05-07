@@ -227,9 +227,11 @@ def train_epoch_mel_only(generator, train_loader, opt_g, mel_loss_fn):
 
         fake = generator(real_mel, target_length=target_len)
         mel_loss = mel_loss_fn(fake, real_trim)
+        time_loss = F.l1_loss(fake, real_trim)  # time-domain: prevents tanh saturation
+        loss = mel_loss + 1.0 * time_loss
 
         opt_g.zero_grad()
-        mel_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
         opt_g.step()
 
