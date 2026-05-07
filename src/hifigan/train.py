@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "meltrain",      # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
+    "mode": "train",          # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
@@ -278,6 +278,8 @@ def train_epoch(generator, discriminator, train_loader,
                 f_score_d, _ = discriminator(d_fake)
                 d_loss, d_dict = discriminator_loss(r_score, f_score_d)
             scaler.scale(d_loss).backward()
+            scaler.unscale_(opt_d)
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
             scaler.step(opt_d)
             scaler.update()
         else:
@@ -285,6 +287,7 @@ def train_epoch(generator, discriminator, train_loader,
             f_score_d, _ = discriminator(d_fake)
             d_loss, d_dict = discriminator_loss(r_score, f_score_d)
             d_loss.backward()
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
             opt_d.step()
 
         # ── Generator ───────────────────────────────────
@@ -300,6 +303,8 @@ def train_epoch(generator, discriminator, train_loader,
                     lambda_adv=cfg.lambda_adv,
                 )
             scaler.scale(g_loss).backward()
+            scaler.unscale_(opt_g)
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             scaler.step(opt_g)
             scaler.update()
         else:
@@ -311,6 +316,7 @@ def train_epoch(generator, discriminator, train_loader,
                 lambda_adv=cfg.lambda_adv,
             )
             g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             opt_g.step()
 
         total_g += g_dict["g_total"]
