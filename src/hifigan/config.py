@@ -40,7 +40,7 @@ class HiFiGANConfig:
     )
 
     # ── Training ──────────────────────────────────────────
-    segment_size: int = 16384                  # 0.74s — sweet spot (8192=too short for GAN, 32768=too long for G)
+    segment_size: int = 8192                   # 0.37s — fast, MPD can detect phase at this length
     batch_size: int = 8
     learning_rate: float = 2e-4
     lr_decay: float = 0.999                    # per-epoch decay
