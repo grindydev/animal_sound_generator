@@ -49,9 +49,9 @@ class HiFiGANConfig:
     num_workers: int = 4
 
     # ── Loss weights ─────────────────────────────────────
-    lambda_mel: float = 20.0  # reduced from 45 — slim discriminator, less needed
+    lambda_mel: float = 1.0   # gentle mel guide — let adv+FM do the heavy lifting
     lambda_fm: float = 2.0
-    lambda_adv: float = 8.0   # boosted to prevent D collapse with MPD-only discriminator
+    lambda_adv: float = 10.0  # generator must fight D hard
 
     # ── Smart crop (energy VAD) ──────────────────────────
     smart_crop_threshold_db: float = -30.0

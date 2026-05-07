@@ -324,7 +324,7 @@ def training_loop():
 
     # ── Optimizers ──────────────────────────────────────
     opt_g = torch.optim.Adam(generator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
-    opt_d = torch.optim.Adam(discriminator.parameters(), lr=cfg.learning_rate * 0.25, betas=cfg.adam_betas)  # 4× slower D
+    opt_d = torch.optim.Adam(discriminator.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
 
     sched_g = torch.optim.lr_scheduler.ExponentialLR(opt_g, gamma=cfg.lr_decay)
     sched_d = torch.optim.lr_scheduler.ExponentialLR(opt_d, gamma=cfg.lr_decay)
