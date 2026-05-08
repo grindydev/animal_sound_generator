@@ -131,7 +131,6 @@ def _load_audio(path: str):
     torchaudio 2.11+ requires libtorchcodec which needs FFmpeg shared libs.
     On systems without FFmpeg, soundfile works directly (reads WAV natively).
     """
-    import numpy as np
     # ── Try torchaudio first (fast, native) ──
     try:
         return torchaudio.load(path)
