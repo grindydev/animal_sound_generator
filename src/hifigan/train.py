@@ -46,7 +46,7 @@ from src.hifigan.utils import save_checkpoint, load_checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "mode": "meltrain",      # "meltrain" = mel-only (no GAN) | "train" = full GAN | "diag" = quick test
+    "mode": "train",         # "train" = full GAN | "meltrain" = mel-only (debug) | "diag" = quick test
     "device": "auto",        # "auto", "cuda", "mps", or "cpu"
 
     # ── Shared ──────────────────────────────────────────
@@ -68,8 +68,8 @@ CONFIG = {
 
     "train": {
         "num_epochs": 30,
-        "batch_size": 16,       # must be ≥16 for mel-only (batch=8 collapses to mean!)
-        "num_workers": 4,
+        "batch_size": 8,       # GAN needs less — discriminators use more memory
+        "num_workers": 0,       # 0 = no multiprocessing → avoid silent data bugs
     },
 
     "meltrain": {

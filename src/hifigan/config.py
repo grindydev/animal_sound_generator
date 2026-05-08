@@ -40,7 +40,7 @@ class HiFiGANConfig:
     )
 
     # ── Training ──────────────────────────────────────────
-    segment_size: int = 8192                   # 0.37s — fast, MPD can detect phase at this length
+    segment_size: int = 16384                  # 0.74s — need enough context for full bark/meow
     batch_size: int = 8
     learning_rate: float = 2e-4
     lr_decay: float = 0.999                    # per-epoch decay
@@ -49,9 +49,9 @@ class HiFiGANConfig:
     num_workers: int = 4
 
     # ── Loss weights ─────────────────────────────────────
-    lambda_mel: float = 1.0   # gentle guide
-    lambda_fm: float = 10.0   # FEATURE MATCHING is the real teacher — never saturates
-    lambda_adv: float = 2.0   # adversarial gives slight push
+    lambda_mel: float = 45.0   # STRONG — forces generator to match input mel (prevents content drift)
+    lambda_fm: float = 2.0     # feature matching — guides waveform realism
+    lambda_adv: float = 1.0    # adversarial — small push for naturalness (must NOT overpower mel)
 
     # ── Smart crop (energy VAD) ──────────────────────────
     smart_crop_threshold_db: float = -30.0

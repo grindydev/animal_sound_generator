@@ -1,282 +1,465 @@
-# Phase 7a: HiFi-GAN Neural Vocoder (mel → audio)
+# Phase 7a — HiFi-GAN Neural Vocoder
 
-> **Why 7a before Diffusion**: Without a vocoder, even perfect spectrograms sound like garbage through GriffinLim. Diffusion upgrades the generator quality — but we can't hear the result until we fix the converter. Vocoder first.
-
----
-
-## 1. The Problem
-
-```
-Current pipe:      VAE → mel_spec → GriffinLim (math) → garbage audio ❌
-```
-
-GriffinLim at 64 mel bands throws away 96% of original energy and all phase/harmonic/transient information. The VAE produces mel spectrograms that a CNN classifies at 100% accuracy — the spectrograms are correct. The failure is 100% in the conversion from mel back to audio.
-
-We have been trying to fix this for **multiple sessions** (normalization fixes, sqrt fixes, clamp fixes, n_fft changes) and each time the audio comes out unrecognizable. This is fundamental — you cannot mathematically reconstruct 513 frequency bins from 64 mel values while preserving phase. You need a neural network that has SEEN real audio before.
+> **Learn this after VAE (Phase 4)** — HiFi-GAN fixes what VAEs can't: converting spectrograms into crisp, natural audio.
 
 ---
 
-## 2. Solution
+## The Problem: Why Griffin-Lim Isn't Enough
 
 ```
-New pipe:           VAE → mel_spec → HiFi-GAN (neural net) → real audio 🎵
+Your VAE generates:    [mel spectrogram]  (blurred, but semantically correct)
+Then you convert to:   [waveform]
 ```
 
-HiFi-GAN is trained on `(real_audio → compute_mel) → (mel → predict_audio)` pairs. It learns: "when I see this mel pattern, the real waveform underneath looks like this." Once trained, it converts ANY mel spectrogram — including fake ones from the VAE — into natural-sounding audio.
+Two ways to convert mel → waveform:
 
-**Both components are separate, trained independently, no retraining needed:**
+| Method | How it works | Problem |
+|--------|-------------|---------|
+| **Griffin-Lim** | Math: iteratively guess phase from magnitude | Adds static/noise. Sounds like "robot voice underwater." |
+| **HiFi-GAN** | Neural network trained to generate phase | Learns what REAL audio sounds like. Crisp and natural. |
 
-| Stage | Model | Trained on | Purpose |
-|-------|-------|-----------|---------|
-| A | VAE | Real mel specs | Create new animal mel spectrograms |
-| B | Classifier | Real mel specs | Evaluate generation quality |
-| C | **HiFi-GAN** | Real mel+audio pairs | Convert mel → listenable audio |
+```
+VAE mel ── Griffin-Lim ──▶ Grainy, metallic audio
+       │
+       └─ HiFi-GAN ────▶ Crisp, realistic audio ✨
+```
+
+**HiFi-GAN doesn't fix the spectrogram.** It fixes the **conversion**. Even a perfect VAE mel sounds mediocre through Griffin-Lim.
 
 ---
 
-## 3. Is This Industry Standard?
+## What You'll Learn
 
-Yes. Every production TTS system splits generation from vocoding:
-
-| System | Generator | Vocoder |
-|--------|-----------|---------|
-| Google Tacotron 2 | Tacotron | WaveNet |
-| NVIDIA FastPitch | Transformer | **HiFi-GAN** |
-| Meta Voicebox | Flow Matching | HiFi-GAN |
-| ElevenLabs | Custom LLM | Custom vocoder |
-| **Our project** | **VAE** | **HiFi-GAN** |
-
-Two separate jobs. Two separate models. Chained like Lego.
+| Concept | New or familiar? | Analogy |
+|---------|----------------|---------|
+| **GAN (Generative Adversarial Network)** | New | Like a forger vs. detective playing cat-and-mouse |
+| **Discriminator** | New | "Is this audio real or fake?" — a classifier |
+| **Adversarial loss** | New | Generator gets rewarded for fooling the discriminator |
+| **Feature matching loss** | New | Match the discriminator's internal features, not just its output |
+| **Mel spectrogram loss** | Familiar (like VAE reconstruction) | But now on WAVEFORMS, not spectrograms |
+| **Multi-scale + Multi-period discriminators** | New | Check realism at different time resolutions |
 
 ---
 
-## 4. Architecture Overview
-
-### 4.1 Generator (mel → waveform)
+## GAN Intuition: The Forger vs. The Detective
 
 ```
-mel [B, 64, T]
-      ↓
-Conv1D pre-net  (in=64, hidden, kernel=7)
-      ↓
-┌─────────────────────────────────────────┐
-│  ┌─ Upsample 5× → ResBlock(3,7,11) ─┐  │
-│  ┌─ Upsample 5× → ResBlock(3,7,11) ─┤  │  ← repeated
-│  ┌─ Upsample 4× → ResBlock(3,7,11) ─┤  │    5×5×4×2 = 200 = hop_length
-│  └─ Upsample 2× → ResBlock(3,7,11) ─┘  │
-│          MRF (Multi-Receptive Field)    │
-└─────────────────────────────────────────┘
-      ↓
-Conv1D post-net  (kernel=7, tanh output)
-      ↓
-waveform [B, 1, T × 200]
+┌──────────────┐         fake audio         ┌──────────────┐
+│  GENERATOR   │ ──────────────────────────▶ │DISCRIMINATOR │
+│  (forger)    │                             │(detective)   │
+│              │                             │              │
+│  mel → audio │     ┌───────────────┐       │  real or     │
+│              │     │               │       │  fake?       │
+└──────────────┘     │   Feedback    │       │              │
+      ▲              │   "this sounds│       └──────┬───────┘
+      │              │   fake because│              │
+      └── GRADIENT ──│   it lacks... │◀─────────────┘
+                     │               │
+                     └───────────────┘
+
+They train together:
+  Generator: "I'll make audio that looks real to you"
+  Discriminator: "I'll learn to tell real from fake"
+
+Over time → Generator produces audio indistinguishable from real.
 ```
-
-**Why MRF?** Each ResBlock uses 3 kernel sizes (3,7,11) in parallel, summed. This lets the model see both fast transients (small kernel) and sustained tones (large kernel) simultaneously.
-
-**Why those upsample rates?** `5×5×4×2 = 200 = hop_length`. Each mel time step becomes 200 audio samples.
-
-### 4.2 Discriminator (judge real vs fake audio)
-
-HiFi-GAN uses TWO discriminator families to catch different types of artifacts:
-
-**MPD (Multi-Period Discriminator):** 5 discriminators, each checks a specific period (pitch interval):
-```
-Period 2:  check every 2nd sample   — catches high-frequency artifacts
-Period 3:  check every 3rd sample   — catches mid-frequency artifacts  
-Period 5:  check every 5th sample
-Period 7:  check every 7th sample
-Period 11: check every 11th sample  — catches low-frequency wobble
-```
-Each MPD reshapes audio `[1, L] → [B, period, L/period]` and applies 2D Conv layers. This efficiently checks periodic structure at each pitch level.
-
-**MSD (Multi-Scale Discriminator):** 3 discriminators at different audio resolutions:
-```
-Scale 1: raw audio            [1, 22050]     — fine details
-Scale 2: avg-pooled ×2        [1, 11025]     — medium structure
-Scale 3: avg-pooled ×4        [1, 5512]      — overall envelope
-```
-Each MSD applies 1D Conv layers. Catches wrong overall shape across timescales.
-
-### 4.3 Losses
-
-| Loss | Weight | What it does |
-|------|--------|-------------|
-| **L_mel** | λ=45 | `|real_mel - mel(fake_audio)|` — forces generated audio to have the right frequency content. Heavy weight because this is the primary goal. |
-| **L_adv** | λ=1 | Hinge GAN loss — realism through adversarial training |
-| **L_fm** | λ=2 | Feature matching: `Σ|D_k(real) - D_k(fake)|` across ALL discriminator layers. Forces generator to match internal representations, not just fool the final output. |
 
 ---
 
-## 5. Training Strategy
+## Architecture: Multi-Receptive Field Fusion (MRF)
 
-### 5.1 Data Format
+HiFi-GAN's generator is a **1D neural vocoder** — it upsamples from mel frames to audio samples:
+
 ```
-Training pairs from existing dataset (9000 samples, 8 classes):
-  Input:  mel spectrogram  [1, 64, T]     ← computed from real audio
-  Target: audio waveform   [1, 1, L]       ← original raw audio
+Input:  mel spectrogram [B, 64, T]    ← 64 frequency bins × time frames
+
+              ↓  pre-net Conv1d (7)
+         [B, 256, T]                   ← expand to 256 channels
+
+              ↓  ┌─ MRF Block 1 ─┐
+              ↓  │ upsample × 5  │ ← 200 samples per mel frame
+              ↓  │ ResBlock(3)   │ ← fine details (transients, attack)
+              ↓  │ ResBlock(7)   │ ← medium patterns (timbre)
+              ↓  │ ResBlock(11)  │ ← slow modulation (pitch contour)
+              ↓  │ SUM outputs   │ ← fuse all receptive fields
+              ↓  └───────────────┘
+
+              ↓  ┌─ MRF Block 2 ─┐
+              ↓  │ upsample × 5  │
+              ↓  │ ResBlock(3,7,11)│
+              ↓  └───────────────┘
+
+              ↓  ┌─ MRF Block 3 ─┐
+              ↓  │ upsample × 4  │
+              ↓  │ ResBlock(3,7,11)│
+              ↓  └───────────────┘
+
+              ↓  ┌─ MRF Block 4 ─┐
+              ↓  │ upsample × 2  │
+              ↓  │ ResBlock(3,7,11)│
+              ↓  └───────────────┘
+
+              ↓  post-net Conv1d (7)
+              ↓  (no tanh — bounded by training loss)
+
+Output: waveform [B, 1, T × 200]  ← 22050 Hz audio
 ```
 
-No synthetic data needed. Trained entirely on real `(mel, audio)` pairs.
+### Why 3 parallel ResBlocks per upsampling stage?
 
-### 5.2 Segment Training
-Audio vary in length (1-30 seconds). Training on full audio is wasteful and memory-heavy. Instead:
+```
+Kernel=3:  catches FAST transients (bark attack, click)
+           ┌───┐
+           │   │  ← narrow window, sees sharp edges
 
-- Use `smart_crop()` from `src/smart_crop.py` (energy-based VAD, already built)
-- Find loudest activity region → center a segment window on it
-- **Segment size: 32768 samples** (1.49 seconds) — long enough for a bark/meow, short enough for efficient GAN training
-- Compute mel from the cropped waveform (same `MelSpectrogram` + `SimpleNormalize` from `data_loader.py`)
-- Training pair: `(normalized_mel_segment, raw_audio_segment)`
+Kernel=7:  catches MEDIUM patterns (vocal timbre, formants)
+           ┌───────┐
+           │       │  ← wider window, sees tone
+
+Kernel=11: catches SLOW modulation (pitch contour, vibrato)
+           ┌───────────┐
+           │           │  ← widest window, sees melody
+
+Their outputs are SUMMED → generator sees ALL time scales simultaneously.
+```
+
+### Upsampling math
+
+```
+Total upsampling factor: 5 × 5 × 4 × 2 = 200
+This matches hop_length (200)
+
+Each mel frame → 200 audio samples
+44100 Hz audio → 220.5 mel frames per second
+```
+
+---
+
+## The Discriminators: Multi-Scale + Multi-Period
+
+HiFi-GAN uses **TWO types** of discriminators working together:
+
+### 1. Multi-Scale Discriminator (MSD) — checks overall structure
+
+```
+Scale 0: raw audio [B, 1, T]           ← full resolution
+Scale 1: avg-pool ×2 → [B, 1, T/2]     ← downsampled
+Scale 2: avg-pool ×4 → [B, 1, T/4]     ← more downsampled
+
+Each scale runs through its own CNN:
+  Conv1d(1,16) → Conv1d(16,64) → Conv1d(64,128) → ... → score
+
+Why? Audio has structure at multiple time scales.
+  Scale 0: catches fine details (transients, noise)
+  Scale 1: catches medium patterns (syllables)
+  Scale 2: catches long patterns (pitch, rhythm)
+```
+
+### 2. Multi-Period Discriminator (MPD) — catches periodicity
+
+```
+Period=2: reshape audio as [B, 2, T/2]  ← checks 2-sample periodicity
+Period=3: reshape audio as [B, 3, T/3]  ← checks 3-sample periodicity
+Period=5: reshape audio as [B, 5, T/5]  ← catches vocal pitch
+Period=7: reshape audio as [B, 7, T/7]  ← catches harmonics
+Period=11: reshape as [B, 11, T/11]     ← catches longer patterns
+
+Then: 2D Conv → captures cross-channel (period) patterns
+
+Why? Speech and animal sounds are PERIODIC (pitch = repeating waveform).
+MPD catches if the waveform period looks natural.
+```
+
+### Combined: 8 discriminators total
+
+```
+3 MSD scales + 5 MPD periods = 8 discriminators
+Each gives: score (real/fake) + intermediate features
+
+Generator loss = average over ALL discriminators
+```
+
+---
+
+## The Three Losses (This is where GANs get tricky)
 
 ```python
-# Reusing existing code:
-from smart_crop import smart_crop
-from data_loader import get_transformations
-
-# In HiFi-GAN train loader:
-wav = torchaudio.load(path)[0]          # [1, full_samples]
-crops = smart_crop(wav, crop_samples=32768, num_crops=1)
-segment = crops[0]                        # [1, 32768]
-mel = train_tfm(segment.unsqueeze(0))     # [1, 1, 64, ~160]
-# Training pair: (mel, segment)
+total_generator_loss = λ_mel × L_mel + λ_fm × L_fm + λ_adv × L_adv
 ```
 
-**Why not random cropping:** Animal audio has lots of silence between calls. Random cropping lands on silence ~70% of the time → discriminator learns "silent = real" → generator produces silence. `smart_crop` ensures segments contain actual animal sounds.
+### 1. Mel Spectrogram Loss (λ_mel = 45) — THE ANCHOR
 
-### 5.3 Training Loop
-```
-For each epoch:
-  For each batch:
-    1. Load real_audio [B, 1, 32768] from dataloader (smart_crop already applied)
-    2. Compute real_mel [B, 64, ~160] from real_audio (MelSpectrogram + normalize)
-    2. Generator: real_mel → fake_audio
-    3. Compute fake_mel from fake_audio
-    4. Adversarial step:
-       a. Discriminators judge real_audio → real scores
-       b. Discriminators judge fake_audio → fake scores  
-       c. D_loss = hinge_real + hinge_fake
-       d. D backward
-    5. Generator step:
-       a. D judge fake_audio again (after D updated)
-       b. G_loss = λ_mel × L_mel + λ_fm × L_fm + λ_adv × L_adv(G)
-       c. G backward
-    6. Log metrics
+```python
+# "Does the generated audio have the right frequency content?"
+fake_mel = MelSpectrogram(generator(mel_input))
+real_mel = MelSpectrogram(real_audio)
+L_mel = L1(fake_mel, real_mel)
 ```
 
-### 5.4 Config & Hyperparams
+**Purpose:** Forces generator to match the INPUT mel spectrogram.
+**Weight: HEAVY (45×)** — this is the PRIMARY objective.
+**Without it:** generator invents any "realistic" audio (could be speech, music, noise).
+
+> 🚨 **Critical lesson learned:** With `lambda_mel=1.0`, the generator produced
+> human speech instead of dog barks. The adversarial loss dominated, so "sounds
+> like real audio" mattered more than "sounds like the INPUT mel."
+
+### 2. Feature Matching Loss (λ_fm = 2) — THE GUIDE
+
+```python
+# "Do the generator's features look like real audio features?"
+real_feats = discriminator_features(real_audio)    # list of tensors
+fake_feats = discriminator_features(fake_audio)    # same structure
+L_fm = sum(L1(f, r.detach()) for f, r in zip(fake_feats, real_feats))
 ```
-# Audio
-sample_rate:   22050
-hop_length:    200
-n_mels:        64
-n_fft:         1024
 
-# Generator
-hidden_dim:            128
-resblock_kernels:      [3, 7, 11]
-resblock_dilations:    [[1,3,5], [1,3,5], [1,3,5]]
-upsample_rates:        [5, 5, 4, 2]
-upsample_kernels:      [10, 10, 8, 4]
+**Purpose:** Matches the discriminator's INTERNAL features, not just its output.
+**Why it helps:** The discriminator's intermediate layers capture "what makes
+audio sound real" at multiple abstraction levels. Matching these guides the
+generator toward realistic waveforms.
 
-# Discriminators
-mpd_periods:           [2, 3, 5, 7, 11]
-msd_scales:            3
+### 3. Adversarial Loss (λ_adv = 1) — THE POLISH
 
-# Training
-batch_size:            8             # smaller batch for 32768-sample segments
-segment_size:          32768         # 1.49s @ 22050Hz — long enough for a vocalization
-learning_rate:         2e-4
-lr_decay:              0.999 per epoch
-num_epochs:            50            # GANs need more steps than VAE (~8400 total)
-adam_betas:            [0.8, 0.99]
+```python
+# "Can the discriminator tell this is fake?"
+fake_scores = discriminator(fake_audio)
+L_adv = -mean(fake_scores)   # generator wants scores to be HIGH (real)
+```
 
-# Loss weights
-lambda_mel:            45
-lambda_fm:             2
-lambda_adv:            1
+**Purpose:** Pushes generator toward producing audio that fools the discriminator.
+**Weight: SMALL (1×)** — adversarial loss is powerful and can destabilize training
+if too strong. It's the polish, not the main objective.
+
+---
+
+## Training Loop: Generator vs. Discriminator Dance
+
+```
+Each batch:
+  1. Generate fake audio from mel
+  2. Train discriminator:
+     - real audio → should score HIGH
+     - fake audio → should score LOW
+     - Update D weights
+  3. Train generator:
+     - fake audio → should score HIGH (fool D)
+     - mel loss → should match input mel
+     - feature matching → should match D's internal features
+     - Update G weights
+  4. Repeat
+```
+
+```python
+# Discriminator step
+opt_d.zero_grad()
+r_score = discriminator(real_audio)
+f_score = discriminator(fake.detach())  # detach — don't train G here
+d_loss = hinge_loss(r_score, f_score)
+d_loss.backward()
+opt_d.step()
+
+# Generator step
+opt_g.zero_grad()
+f_score = discriminator(fake)           # NOW train G through D
+g_loss = mel_loss + fm_loss + adv_loss
+g_loss.backward()
+opt_g.step()
+```
+
+**Key insight:** The generator and discriminator are updated **alternately** on
+the same batch. They're literally playing a game — each one's update makes the
+other one's job harder.
+
+---
+
+## Critical Hyperparameters (Learned the Hard Way)
+
+| Parameter | Value | Why | What happens if wrong |
+|-----------|-------|-----|----------------------|
+| `segment_size` | **16384** (0.74s) | Long enough for full bark/meow | 8192 (0.37s) → generator sees too little context, misses full patterns |
+| `lambda_mel` | **45** | Anchors generator to input mel | 1.0 → generator drifts to speech/wrong content |
+| `lambda_fm` | **2** | Guides waveform realism | 10 → overwhelms mel loss, similar drift problem |
+| `lambda_adv` | **1** | Small adversarial polish | 2+ → discriminator dominates, generator ignores mel |
+| `learning_rate` | **2e-4** | Standard for HiFi-GAN | Higher → unstable GAN; lower → painfully slow |
+| `batch_size` | **8+** | Enough diversity per batch | < 4 → discriminator memorizes, mode collapse |
+| `beta1` (Adam) | **0.8** | Less momentum for GANs | 0.9 (default) → discriminator overshoots |
+
+### The Mel Loss Lesson
+
+```
+WRONG: lambda_mel=1.0, lambda_adv=2.0
+→ Generator: "I'll make realistic audio" (ignores input mel)
+→ Result: Human speech instead of dog barks
+
+CORRECT: lambda_mel=45.0, lambda_adv=1.0
+→ Generator: "I must match THIS mel spectrogram"
+→ Discriminator: "But make it sound natural"
+→ Result: Correct content + natural waveform
+```
+
+**Rule of thumb:** Mel loss should be the HEAVIEST weight. The discriminator
+polishes what the mel loss constrains.
+
+---
+
+## Training Strategy: Meltrain → Full GAN
+
+### Step 1: Mel-Only Pretraining (`mode="meltrain"`)
+
+```
+Train generator WITHOUT discriminator.
+Loss = L_mel + L_time (reconstruction only)
+
+Why?
+  - Generator learns "mel → audio" mapping from scratch
+  - No adversarial instability in early training
+  - Converges to a reasonable baseline in ~15-30 epochs
+  - If mel=0.0000 → data loading bug (not a model issue)
+```
+
+### Step 2: Full GAN Training (`mode="train"`)
+
+```
+Load meltrain checkpoint (optional).
+Train generator + discriminator together.
+Loss = 45×L_mel + 2×L_fm + 1×L_adv
+
+Why?
+  - Generator already knows mel → audio
+  - Discriminator refines waveform quality
+  - Feature matching adds naturalness
+  - ~20-30 epochs for convergence
+```
+
+### What to watch during training
+
+```
+Healthy:
+  G mel loss: drops steadily (6→3→2→1.5→1.0...)
+  D loss: hovers around 1-2 (hinge loss equilibrium)
+  Val mel: similar to train mel (no overfitting)
+
+Unhealthy:
+  D loss → 0: Discriminator is too strong → generator can't learn
+  D loss → very high: Discriminator collapsed → adversarial loss meaningless
+  G mel loss stops dropping: Generator plateaued → need more epochs or LR warmup
+  D loss oscillates wildly: Learning rate too high
 ```
 
 ---
 
-## 6. Files to Create
+## HiFi-GAN vs. Your VAE: Different Problems, Same Goal
 
 ```
-src/hifigan/
-├── __init__.py
-├── config.py            # All hyperparameters, one place
-├── generator.py         # MRF generator
-├── discriminator.py     # MPD + MSD discriminators
-├── losses.py            # Mel L1, feature matching, hinge GAN
-├── train.py             # Training loop with checkpointing
-├── inference.py         # Load → mel_to_waveform() single API call
-└── utils.py             # init_weights, get_padding, scan_checkpoints
+Your VAE:
+  Input: class label (e.g. "dog")
+  Output: mel spectrogram (blurred, needs conversion)
+  Trained with: MSE reconstruction + KL + classifier loss
+  Problem it solves: "What should a dog sound look like?"
+
+HiFi-GAN:
+  Input: mel spectrogram (from VAE or real)
+  Output: audio waveform (crisp, natural)
+  Trained with: mel loss + feature matching + adversarial loss
+  Problem it solves: "How do I convert this mel into audio?"
+
+Together:
+  "dog" → VAE → mel → HiFi-GAN → waveform ✨
 ```
 
-### Existing Files Modified (one-line swaps)
-
-| File | Change | 
-|------|--------|
-| `client/server.py` | `spectrogram_to_waveform()` → `hifigan.inference.mel_to_waveform()` |
-| `scripts/diagnose_audio.py` | Same swap |
+**VAE and HiFi-GAN are complementary.** VAE generates the spectrogram (the
+"what"). HiFi-GAN converts it to audio (the "how").
 
 ---
 
-## 7. Acceptance Criteria
+## Why This is Industry Standard
 
-| Check | How to verify |
-|-------|--------------|
-| Mel reconstruction | `mel(fake_audio)` matches input mel closely |
-| Audio naturalness | Listen — sounds like a real animal, no hiss/static/wobble |
-| VAE integration | Generate VAE mel spec → HiFi-GAN → recognizable animal sound |
-| Web app | `python client/start.py` → generate button → hear actual dog bark |
-| Speed | <100ms per 5-second sample (GriffinLim takes ~500ms) |
+HiFi-GAN was published by Kong, Kim, and Bae (2020) at NeurIPS. It's used in:
 
----
+- **TTS systems:** VITS, YourTTS, Coqui — all use HiFi-GAN as the vocoder
+- **Voice cloning:** Matcha-TTS, Bark — mel → waveform via HiFi-GAN
+- **Music generation:** AudioCraft (Meta) — similar GAN vocoder approach
+- **Speech enhancement:** SEGAN variants — GAN-based audio restoration
 
-## 8. Risk / Mitigation
-
-| Risk | Mitigation |
-|------|-----------|
-| GAN training instability | Hinge loss (stable), low lr=2e-4, feature matching for gradient |
-| Mode collapse (all sounds same) | MPD checks period structure, MRF gives multi-scale generation |
-| Long training (100 epochs) | Segment training (32768 samples, smart_crop for active regions), MPS acceleration |
-| Overfitting to training animals | Your data has 8 diverse animal classes — good coverage |
+The MRF architecture and multi-discriminator design became the **standard**
+because it produces high-quality audio with efficient inference.
 
 ---
 
-## 9. Implementation Order (7 sub-steps)
+## Key Lessons from Our Implementation
 
-| Step | File | What |
-|------|------|------|
-| 7a.1 | `config.py` | Constants, hyperparams dict |
-| 7a.2 | `utils.py` | `init_weights()`, `get_padding()`, `AttrDict` |
-| 7a.3 | `generator.py` | ResBlock, MRF block, HiFiGANGenerator |
-| 7a.4 | `discriminator.py` | PeriodDiscriminator, ScaleDiscriminator, MPD, MSD |
-| 7a.5 | `losses.py` | MelLoss, FeatureMatchLoss, GeneratorLoss, DiscriminatorLoss |
-| 7a.6 | `train.py` | DataLoader, train loop, checkpoint save |
-| 7a.7 | `inference.py` | `mel_to_waveform()` function |
-| 7a.8 | Swap calls | Update `server.py` and `diagnose_audio.py` |
-| 7a.9 | `documents/hifigan_guide.md` | Concept doc with analogies |
+### 1. Data loading bugs are the #1 cause of "loss=0"
 
----
+If training shows `mel=0.0000` from epoch 1, the audio files aren't loading.
+Our fix: absolute paths, soundfile fallback, data validation before training.
 
-## 10. Expected Timeline
-
-| Item | Time |
-|------|------|
-| Implementation (9 files) | ~30 min |
-| Training (50 epochs) | ~1.5 hours (MPS, segment-based) |
-| Integration + testing | ~15 min |
-
----
-
-## 11. What Happens After This Works
-
-```
-✅ Phase 7a: HiFi-GAN    → mel specs can be heard as real audio
-⬜ Phase 7b: Diffusion    → upgrade VAE with diffusion for sharper spectrograms  
-⬜ Phase 7c: Sequential   → generate evolving soundscapes
-⬜ Phase 7d: Mixing       → blend two animals together
-⬜ Phase 7e: UI v2        → polished web interface
+```python
+# Before training, always verify:
+_check = next(iter(train_loader))
+assert _check.abs().max() > 1e-6, "🚨 ALL ZEROS — check data loading"
 ```
 
+### 2. torchaudio 2.11+ requires FFmpeg shared libraries
+
+On systems without FFmpeg (like some Linux servers), `torchaudio.load()` fails.
+**Fix:** Fall back to `soundfile` which reads WAV natively without FFmpeg.
+
+```python
+def load_audio(path):
+    try: return torchaudio.load(path)
+    except: return soundfile.read(path)  # no FFmpeg needed
+```
+
+### 3. Multiprocessing workers can silently fail on CUDA
+
+With `num_workers>0`, relative paths may break in spawned processes.
+**Fix for meltrain:** Use `num_workers=0` (data loading is fast enough).
+**Fix for GAN:** Use absolute paths + soundfile fallback.
+
+### 4. The discriminator is a powerful teacher but easily overpowers
+
+With strong adversarial loss, the generator produces "realistic" but
+**wrong** content. The mel loss must anchor the generator to the input.
+
+**Loss weight ordering matters:**
+```
+lambda_mel (45) > lambda_fm (2) > lambda_adv (1)
+     ↑                  ↑               ↑
+   PRIMARY            GUIDE          POLISH
+```
+
+### 5. Segment size must match the signal structure
+
+```
+8192  samples (0.37s) → too short for full bark
+16384 samples (0.74s) → captures most bark patterns
+44100 samples (2.00s) → ideal for long sounds, slower training
+```
+
+---
+
+## Next Steps After HiFi-GAN
+
+Once HiFi-GAN training is stable and audio sounds good:
+
+| Phase | What | Builds on |
+|-------|------|-----------|
+| **7b: Diffusion** | Sharpen the VAE's blurry mel output | HiFi-GAN (vocoder still needed) |
+| **7c: Sequential** | Generate long sounds, chain animals | HiFi-GAN (handles any length) |
+| **7d: Latent mixing** | Blend animals in z-space | HiFi-GAN (converts any mel) |
+| **7e: UI v2** | Add vocoder selector to web app | All of Phase 7 |
+
+The full pipeline:
+```
+"dog" → VAE → [blurry mel] → Diffusion → [sharp mel] → HiFi-GAN → [crisp audio]
+```
+
+---
+
+## References
+
+- **Kong, Kim, Bae (2020):** "HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis" — [Paper](https://arxiv.org/abs/2010.05646)
+- **Original repo:** [jik876/hifi-gan](https://github.com/jik876/hifi-gan)
+- **Kazuki's explanation:** [Understanding HiFi-GAN](https://kazemnejad.com/blog/2024-03-19-hifi-gan/)
+- **GAN basics:** [Ian Goodfellow's original paper (2014)](https://arxiv.org/abs/1406.2661)
+- **Feature matching:** [Salimans et al. (2016) Improved Techniques for Training GANs](https://arxiv.org/abs/1606.03498)
