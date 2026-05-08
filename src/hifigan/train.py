@@ -67,7 +67,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 30,
+        "num_epochs": 60,
         "batch_size": 8,       # GAN needs less — discriminators use more memory
         "num_workers": 0,       # 0 = no multiprocessing → avoid silent data bugs
     },

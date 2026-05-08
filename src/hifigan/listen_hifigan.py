@@ -26,11 +26,15 @@ from src.hifigan.inference import HiFiGANInference
 
 # ── Config ─────────────────────────────────────────────────────
 TEST_FILES = [
-    "data/animal_audio/Dog/100124.wav",
+    "data/animal_audio/Dog/55154.wav",
     "data/animal_audio/Cat/100114.wav",
     "data/animal_audio/Insect/100886.wav",
+    "data/animal_audio/Frog/86123.wav",
+    "data/animal_audio/Crow/242401.wav",
+    "data/animal_audio/Rooster/245668.wav",
+    "data/animal_audio/Hen/407490.wav",
 ]
-OUT_DIR = "models/compare"
+OUT_DIR = "outputs/hifigan_audio"
 DURATION_SEC = 2.0
 
 # ── Helpers ────────────────────────────────────────────────────

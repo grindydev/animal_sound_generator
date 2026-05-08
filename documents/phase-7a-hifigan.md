@@ -920,6 +920,410 @@ The full quality pipeline:
 
 ---
 
+## Appendix: Layer-by-Layer Architecture Diagrams
+
+These diagrams trace exact tensor shapes (batch=1, T=41 frames ≈ 0.37s) through your actual code.
+
+### Generator — mel → waveform
+
+```
+[1, 64, 41]          ← mel spectrogram (64 freq bins × 41 time frames)
+     │
+     ▼
+┌─────────────────────────────────────────────────────┐
+│  PRE-CONV                                           │
+│  Conv1d(64 → 256, kernel=7, padding=3)              │
+│  No activation                                      │
+└─────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 256, 41]
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  MRF BLOCK 1  — upsample ×5, channels: 256→128                                  │
+│                                                                                  │
+│   [1, 256, 41]                                                                   │
+│        │                                                                         │
+│        ▼                                                                         │
+│   ┌──────────────────────────┐                                                   │
+│   │ ConvTranspose1d          │  stride=5, kernel=10, pad=2                       │
+│   │ 256 → 128                │  Time stretches: 41 × 5 = 205                     │
+│   └──────────────────────────┘                                                   │
+│        │                                                                         │
+│        ▼                                                                         │
+│   [1, 128, 205]                                                                  │
+│        │                                                                         │
+│        ├──┬──────────────────────────────────────────────────┬──┐                │
+│        │  │                                                  │  │                │
+│        │  ▼                                                  ▼  ▼                │
+│        │ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │  │                │
+│        │ │ ResBlock    │  │ ResBlock    │  │ ResBlock    │  │  │                │
+│        │ │ kernel=3    │  │ kernel=7    │  │ kernel=11   │  │  │                │
+│        │ │ dil=1,3,5   │  │ dil=1,3,5   │  │ dil=1,3,5   │  │  │                │
+│        │ │             │  │             │  │             │  │  │                │
+│        │ │ catch FAST  │  │ catch MID   │  │ catch SLOW  │  │  │                │
+│        │ │ transients  │  │ timbre      │  │ pitch       │  │  │                │
+│        │ │ [128,205]   │  │ [128,205]   │  │ [128,205]   │  │  │                │
+│        │ └─────────────┘  └─────────────┘  └─────────────┘  │  │                │
+│        │         │                │                │         │  │                │
+│        │         └────────────────┴────────────────┘         │  │                │
+│        │                      SUM (add together)             │  │                │
+│        │                           │                         │  │                │
+│        └───────────────────────────┘                         │  │                │
+│                                    ▼                         │  │                │
+│                             [1, 128, 205]                    │  │                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 128, 205]
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  MRF BLOCK 2  — upsample ×5, channels: 128→64                                   │
+│  ConvTranspose1d(128→64, stride=5, kernel=10)                                   │
+│  3×ResBlock(3,7,11) → SUM                                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 64, 1025]        ← 205 × 5 = 1025
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  MRF BLOCK 3  — upsample ×4, channels: 64→32                                    │
+│  ConvTranspose1d(64→32, stride=4, kernel=8)                                     │
+│  3×ResBlock(3,7,11) → SUM                                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 32, 4100]        ← 1025 × 4 = 4100
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  MRF BLOCK 4  — upsample ×2, channels: 32→16                                    │
+│  ConvTranspose1d(32→16, stride=2, kernel=4)                                     │
+│  3×ResBlock(3,7,11) → SUM                                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 16, 8200]        ← 4100 × 2 = 8200  (also 41 × 200)
+     │
+     ▼
+┌─────────────────────────────────────────────────────┐
+│  POST-CONV                                          │
+│  Conv1d(16 → 1, kernel=7, padding=3)                │
+│  No activation (learned amplitude)                  │
+└─────────────────────────────────────────────────────┘
+     │
+     ▼
+[1, 1, 8200]         ← AUDIO WAVEFORM 🎵
+```
+
+**Shape evolution table:**
+
+| Stage | Operation | Shape In | Shape Out | Time dim |
+|-------|-----------|----------|-----------|----------|
+| Pre | Conv1d | `[1, 64, 41]` | `[1, 256, 41]` | 41 |
+| MRF1 | ConvTranspose + 3×ResBlock | `[1, 256, 41]` | `[1, 128, 205]` | 41×5 |
+| MRF2 | ConvTranspose + 3×ResBlock | `[1, 128, 205]` | `[1, 64, 1025]` | 205×5 |
+| MRF3 | ConvTranspose + 3×ResBlock | `[1, 64, 1025]` | `[1, 32, 4100]` | 1025×4 |
+| MRF4 | ConvTranspose + 3×ResBlock | `[1, 32, 4100]` | `[1, 16, 8200]` | 4100×2 |
+| Post | Conv1d | `[1, 16, 8200]` | `[1, 1, 8200]` | 8200 |
+
+---
+
+### Zoom: Inside One ResBlock
+
+```
+Input x  ───────────────────────────┐
+  [128, 205]                        │
+                                    │   ← residual / skip connection
+                                    │
+     x → LeakyReLU(0.1) ────────────┤
+                │                   │
+                ▼                   │
+        Conv1d(128→128, k=3,       │
+                dilation=1,         │
+                padding=1)          │
+                │                   │
+                ▼                   │
+           LeakyReLU(0.1) ──────────┤
+                │                   │
+                ▼                   │
+        Conv1d(128→128, k=3,       │
+                dilation=3,         │
+                padding=3)          │
+                │                   │
+                ▼                   │
+           LeakyReLU(0.1) ──────────┤
+                │                   │
+                ▼                   │
+        Conv1d(128→128, k=3,       │
+                dilation=5,         │
+                padding=5)          │
+                │                   │
+                ▼                   │
+              output                │
+                │                   │
+                └──────────(+)──────┘   ← x + output (element-wise)
+                            │
+                            ▼
+                         new x
+                         [128, 205]
+```
+
+**Each ResBlock repeats this 3 times** (for dilations 1, 3, 5). The residual connection means if the convolutions output garbage, the original signal is still preserved.
+
+---
+
+### Discriminator — "Is this audio real?"
+
+Your code uses **MPD only** (5 period discriminators). Here's how ONE works:
+
+#### Period Discriminator (period = 5)
+
+```
+[1, 1, 8200]         ← waveform
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  FOLD into 2D grid at period=5                                              │
+│                                                                             │
+│  Pad to multiple of 5: 8200 already divisible                               │
+│                                                                             │
+│  Reshape: [1, 1, 8200] → [1, 1, 5, 1640]    (5 rows, 1640 columns)        │
+│  Permute: [1, 5, 1, 1640]                                                   │
+│  View:    [5, 1, 1, 1640]    ← batch now 5!                               │
+│                                                                             │
+│  Visual: samples [1,2,3,4,5,6,7,8...] folded into grid:                   │
+│     row 0:  1, 6, 11, 16...   ← every 5th, offset 0                        │
+│     row 1:  2, 7, 12, 17...   ← every 5th, offset 1                        │
+│     row 2:  3, 8, 13, 18...                                                │
+│     row 3:  4, 9, 14, 19...                                                │
+│     row 4:  5, 10, 15, 20...                                               │
+│                                                                             │
+│  A 4.4kHz tone (period ≈ 5 samples) becomes a VERTICAL stripe              │
+│  that 2D convolution detects instantly!                                     │
+└────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[5, 1, 1, 1640]      ← B=5, C=1, H=1, W=1640
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1                                                                    │
+│  Conv2d(1 → 16, kernel=(5,5), stride=(3,3), padding=(2,2))                  │
+│  LeakyReLU(0.1)                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[5, 16, 1, 547]      ← H stays 1, W ≈ 1640/3
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 2                                                                    │
+│  Conv2d(16 → 64, kernel=(5,5), stride=(3,3), padding=(2,2))                 │
+│  LeakyReLU(0.1)                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[5, 64, 1, 183]
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 3                                                                    │
+│  Conv2d(64 → 128, kernel=(5,5), stride=(3,3), padding=(2,2))                │
+│  LeakyReLU(0.1)                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[5, 128, 1, 61]
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  POST-CONV                                                                  │
+│  Conv2d(128 → 1, kernel=(3,1), padding=(1,0))                               │
+└────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+[5, 1, 1, 61]
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│  UNFOLD back: [5, 1, 1, 61] → [1, 5, 61]                                   │
+│                                                                             │
+│  Score: [1, 5, 61]  ← each value = "how real is this chunk?"               │
+│  (higher = discriminator thinks it's real)                                  │
+│                                                                             │
+│  Features saved at every layer for feature-matching loss!                   │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Full Multi-Period Discriminator (all 5 periods)
+
+```
+                         [1, 1, 8200]  waveform
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+  ┌──────────┐          ┌──────────┐          ┌──────────┐
+  │ Period=2 │          │ Period=3 │          │ Period=5 │
+  │(11kHz)   │          │(7.35kHz) │          │(4.4kHz)  │
+  │ Conv2d×3 │          │ Conv2d×3 │          │ Conv2d×3 │
+  │ score[]  │          │ score[]  │          │ score[]  │
+  │ feats[]  │          │ feats[]  │          │ feats[]  │
+  └────┬─────┘          └────┬─────┘          └────┬─────┘
+       │                     │                     │
+       ▼                     ▼                     ▼
+  ┌──────────┐          ┌──────────┐
+  │ Period=7 │          │ Period=11│
+  │(3.15kHz) │          │(2.0kHz)  │
+  │ Conv2d×3 │          │ Conv2d×3 │
+  │ score[]  │          │ score[]  │
+  │ feats[]  │          │ feats[]  │
+  └────┬─────┘          └────┬─────┘
+       │                     │
+       └─────────────────────┘
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+  all_scores (5)     all_features (5 groups)
+       │                 │
+       ▼                 ▼
+   adversarial loss    feature matching loss
+   (G wants HIGH)      (match real vs fake layers)
+```
+
+---
+
+### Training Flow — One Batch Step
+
+```
+BATCH: real_audio = [8, 1, 16384]   ← 8 clips, 0.74s each
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  STEP A: Generate fake audio                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  real_audio [8,1,16384]
+       │
+       ▼
+  compute_mel()
+       │
+       ▼
+  real_mel [8, 64, 82]    ← 16384 / 200 = ~82 frames
+       │
+       ▼
+  ┌─────────────┐
+  │  GENERATOR  │
+  │  (mel →     │
+  │   waveform) │
+  └─────────────┘
+       │
+       ▼
+  fake_audio [8, 1, 16384]
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  STEP B: Train DISCRIMINATOR (freeze generator)                             │
+│  Goal: D(real) = HIGH, D(fake) = LOW                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  real_audio ─────────┐
+                      ▼
+              ┌───────────────┐
+              │     D_MPD     │
+              │  (5 periods)  │
+              └───────┬───────┘
+                      │
+              real_scores (HIGH ✓)
+              real_features (saved)
+
+  fake_audio ─────────┐
+                      ▼
+              ┌───────────────┐
+              │     D_MPD     │
+              │  (detached —  │
+              │   no gradient │
+              │   to G)       │
+              └───────┬───────┘
+                      │
+              fake_scores (LOW ✓)
+
+  d_loss = hinge_loss(real_scores, fake_scores)
+  d_loss.backward()
+  optimizer_d.step()
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  STEP C: Train GENERATOR (discriminator now provides gradients)             │
+│  Goal: fool D + match mel + match features                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  fake_audio ─────────┐
+                      ▼
+              ┌───────────────┐
+              │     D_MPD     │
+              │  (NOT detached│
+              │   — gradient  │
+              │   flows to G) │
+              └───────┬───────┘
+                      │
+              fake_scores (G wants HIGH)
+              fake_features
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+│  COMPUTE 3 LOSSES                                                        │
+│                                                                          │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
+│  │  L_mel      │    │  L_fm       │    │  L_adv      │                  │
+│  │  (weight 45)│    │  (weight 2) │    │  (weight 1) │                  │
+│  │             │    │             │    │             │                  │
+│  │ mel(fake)   │    │ compare     │    │ -mean(fake  │                  │
+│  │ vs          │    │ D's internal│    │ _scores)    │                  │
+│  │ mel(real)   │    │ layers      │    │             │                  │
+│  │ L1 loss     │    │ L1 loss     │    │             │                  │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                  │
+│         │                  │                  │                          │
+│         └──────────────────┼──────────────────┘                          │
+│                            ▼                                             │
+│         g_loss = 45×L_mel + 2×L_fm + 1×L_adv                             │
+│                            │                                             │
+│                            ▼                                             │
+│                    g_loss.backward()                                     │
+│                    optimizer_g.step()                                    │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  What each loss does:                                               │  │
+│  │                                                                     │  │
+│  │  L_mel (45×):  "Match THIS spectrogram!" ← CONTENT (dog, not cat) │  │
+│  │  L_fm  (2×):   "Look natural inside D's brain" ← REALISM          │  │
+│  │  L_adv (1×):   "Fool D into saying real" ← POLISH                 │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### The Alternating Dance
+
+```
+Epoch 1, Batch 0:
+  G: terrible fake  ──▶  D: easily catches it  ──▶  G improves slightly
+Epoch 1, Batch 50:
+  G: okay fake      ──▶  D: still catches it    ──▶  G improves more
+Epoch 5, Batch 0:
+  G: good fake      ──▶  D: struggles           ──▶  D improves
+Epoch 10, Batch 0:
+  G: great fake     ──▶  D: barely catches it   ──▶  both improve
+...
+Epoch 30:
+  G: perfect fake   ──▶  D: coin flip (50/50)   ──▶  Nash equilibrium ✓
+```
+
+At equilibrium, the discriminator outputs scores near zero for both real and fake — it genuinely can't tell the difference. That's when your generator produces audio indistinguishable from real recordings.
+
+---
+
 ## References
 
 - **Kong, Kim, Bae (2020):** "HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis" — [Paper](https://arxiv.org/abs/2010.05646)
