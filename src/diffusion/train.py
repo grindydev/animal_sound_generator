@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.diffusion.config import config as cfg
 from src.diffusion.unet import SpectrogramUNet
 from src.diffusion.diffusion import DiffusionProcess
+from smart_crop import smart_crop
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -211,18 +212,28 @@ class DiffusionDataset(Dataset):
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
 
-        # Compute mel spectrogram
-        mel = compute_mel(wav)  # [1, 64, T]
+        # Smart crop: pick energy-rich region before mel (matches HiFi-GAN)
+        crop_samples = self.segment_frames * cfg.hop_length
+        if wav.shape[-1] <= crop_samples:
+            pad = torch.zeros(1, crop_samples - wav.shape[-1])
+            wav = torch.cat([wav, pad], dim=-1)
+        else:
+            crops = smart_crop(
+                wav, crop_samples=crop_samples, threshold_db=-30.0,
+                num_crops=1, merge_gap_samples=4410,
+            )
+            wav = crops[0]
 
-        # Crop or pad to segment_frames
+        # Compute mel on the smart-cropped segment
+        mel = compute_mel(wav)  # [1, 64, ~segment_frames]
+
+        # Trim/pad to exact segment_frames
         T = mel.shape[-1]
-        if T < self.segment_frames:
+        if T > self.segment_frames:
+            mel = mel[:, :, :self.segment_frames]
+        elif T < self.segment_frames:
             pad = torch.zeros(1, 64, self.segment_frames - T)
             mel = torch.cat([mel, pad], dim=-1)
-        elif T > self.segment_frames:
-            # Random crop
-            start = torch.randint(0, T - self.segment_frames, (1,)).item()
-            mel = mel[:, :, start:start + self.segment_frames]
 
         return mel, torch.tensor(label, dtype=torch.long)
 
