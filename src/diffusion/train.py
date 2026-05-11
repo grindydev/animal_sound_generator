@@ -72,8 +72,9 @@ CONFIG = {
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 1,
+        "batch_size": 3,           # was 1 — GTX 1650 4GB max
         "num_workers": 0,
+        "gradient_accumulation_steps": 2,  # effective batch = 3 × 2 = 6
     },
 }
 
@@ -87,9 +88,11 @@ SETTINGS = CONFIG[MODE] if MODE in CONFIG else CONFIG["train"]
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
 NUM_WORKERS = SETTINGS["num_workers"]
+GRADIENT_ACCUMULATION_STEPS = SETTINGS.get("gradient_accumulation_steps", 1)
 SEGMENT_FRAMES = CONFIG["segment_frames"]
 SAVE_INTERVAL = CONFIG["save_interval"]
 LOG_INTERVAL = CONFIG["log_interval"]
+EMA_DECAY = 0.9999  # Exponential Moving Average decay for model weights
 
 BEST_MODEL_PATH = f"models/diffusion_unet_{MODE}.pth"
 CHECKPOINT_DIR = os.path.join(cfg.checkpoint_dir, MODE)
@@ -301,11 +304,13 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 #  TRAIN / VALIDATE
 # ═══════════════════════════════════════════════════════════════
 
-def train_epoch(model, diffusion, train_loader, optimizer):
-    """Train one epoch. Returns average loss."""
+def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
+    """Train one epoch with gradient accumulation and optional EMA. Returns average loss."""
     model.train()
     total_loss = 0.0
     pbar = tqdm(train_loader, desc="  Train", leave=False)
+    optimizer.zero_grad()
+    accum_count = 0
 
     for mel, labels in pbar:
         mel = mel.to(device)         # [B, 1, 64, T]
@@ -322,23 +327,42 @@ def train_epoch(model, diffusion, train_loader, optimizer):
         # U-Net predicts noise
         pred_noise = model(x_t, t, labels)
 
-        # Loss: MSE between predicted and actual noise
-        loss = F.mse_loss(pred_noise, noise)
+        # Loss: MSE between predicted and actual noise, scaled for accumulation
+        loss = F.mse_loss(pred_noise, noise) / GRADIENT_ACCUMULATION_STEPS
 
-        optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        accum_count += 1
+        total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
 
-        total_loss += loss.item()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        # Step only after accumulation
+        if accum_count >= GRADIENT_ACCUMULATION_STEPS:
+            # Relaxed gradient clipping for diffusion models
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            accum_count = 0
+
+            # Update EMA if enabled
+            if ema_model is not None:
+                with torch.no_grad():
+                    for ema_p, model_p in zip(ema_model.parameters(), model.parameters()):
+                        ema_p.data.mul_(EMA_DECAY).add_(model_p.data, alpha=1 - EMA_DECAY)
+
+        pbar.set_postfix({"loss": f"{loss.item() * GRADIENT_ACCUMULATION_STEPS:.4f}"})
+
+    # Handle leftover accumulation at end of epoch
+    if accum_count > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     return total_loss / len(train_loader)
 
 
-def validate(model, diffusion, val_loader):
-    """Validate — returns average MSE loss."""
-    model.eval()
+def validate(model, diffusion, val_loader, ema_model=None):
+    """Validate — returns average MSE loss. If ema_model provided, validates with EMA weights."""
+    eval_model = ema_model if ema_model is not None else model
+    eval_model.eval()
     total_loss = 0.0
 
     with torch.no_grad():
@@ -350,7 +374,7 @@ def validate(model, diffusion, val_loader):
             t = torch.randint(0, diffusion.timesteps, (B,), device=device)
             noise = torch.randn_like(mel)
             x_t = diffusion.q_sample(mel, t, noise)
-            pred_noise = model(x_t, t, labels)
+            pred_noise = eval_model(x_t, t, labels)
             loss = F.mse_loss(pred_noise, noise)
             total_loss += loss.item()
 
@@ -373,10 +397,11 @@ def training_loop():
     print(f"\n🔧 Diffusion Refinement → {MODE.upper()} MODE")
     if is_cuda:
         print(f"   GPU:    {torch.cuda.get_device_name(0)}")
-    print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS}")
+    eff_batch = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+    print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Accum: {GRADIENT_ACCUMULATION_STEPS} | Effective: {eff_batch} | Workers: {NUM_WORKERS}")
     print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M)")
-    print(f"   Segment: {SEGMENT_FRAMES} mel frames")
-    print(f"   Mixed precision: {'yes' if use_amp else 'no'}")
+    print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
+    print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
     print(f"   Best model → {BEST_MODEL_PATH}")
 
     # ═════════════════════════════════════════════════════════
@@ -417,8 +442,19 @@ def training_loop():
     # ═════════════════════════════════════════════════════════
     #  OPTIMIZER
     # ═════════════════════════════════════════════════════════
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas, weight_decay=1e-4
+    )
+    # Cosine annealing with warm restarts — better for diffusion than exponential decay
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=NUM_EPOCHS // 4, T_mult=2, eta_min=1e-6
+    )
+
+    # EMA model (shadow copy of weights for smoother inference)
+    ema_model = SpectrogramUNet(cfg).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
 
     # ═════════════════════════════════════════════════════════
     #  RESUME
@@ -432,7 +468,7 @@ def training_loop():
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
     print(f"🚀 DIFFUSION TRAINING — {MODE.upper()} MODE")
-    print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE}")
+    print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
 
@@ -442,11 +478,11 @@ def training_loop():
     for epoch in range(start_epoch, NUM_EPOCHS):
         t0 = time.time()
 
-        avg_loss = train_epoch(model, diffusion, train_loader, optimizer)
+        avg_loss = train_epoch(model, diffusion, train_loader, optimizer, ema_model)
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
-        val_loss = validate(model, diffusion, val_loader)
+        val_loss = validate(model, diffusion, val_loader, ema_model)
 
         dt = time.time() - t0
         trend = "📉" if val_loss < best_val else "➡️"
@@ -458,13 +494,17 @@ def training_loop():
         if (epoch + 1) % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS - 1:
             save_checkpoint(model, optimizer, epoch + 1, CHECKPOINT_DIR)
 
-        # Save best
+        # Save best (using EMA weights — these are what you want at inference)
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({"unet": model.state_dict(), "config": cfg.__dict__}, BEST_PATH)
+            # Save timestamped best + overwrite latest best
+            best_epoch_path = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best_epoch{epoch+1:03d}.pth")
+            torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, best_epoch_path)
+            torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_PATH)
+            print(f"      💾 Best model saved → {best_epoch_path} (val={best_val:.4f})")
 
-    # Save final model
-    torch.save({"unet": model.state_dict(), "config": cfg.__dict__}, BEST_MODEL_PATH)
+    # Save final model (EMA weights)
+    torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_MODEL_PATH)
     print(f"\n💾 Final model saved to: {BEST_MODEL_PATH}")
     print(f"   Best val loss: {best_val:.4f}")
     print("✅ Training complete!")

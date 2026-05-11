@@ -39,12 +39,17 @@ class DiffusionConfig:
     learning_rate: float = 2e-4
     lr_decay: float = 0.999               # per-epoch decay
     adam_betas: tuple = (0.9, 0.999)
+    adam_weight_decay: float = 1e-4       # AdamW weight decay
     num_epochs: int = 50
     num_workers: int = 0
+    grad_clip_norm: float = 5.0           # relaxed clipping for diffusion
+    ema_decay: float = 0.9999             # EMA decay for smoothed inference weights
+    loss_type: str = "l2"                 # "l2" = MSE | "l1" = MAE | "huber" = smooth L1
 
     # ── Inference ────────────────────────────────────────
     inference_steps: int = 50             # DDIM sampling steps
     refinement_strength: float = 0.6      # default img2img strength (0.0-1.0)
+    ddim_eta: float = 0.0                # DDIM stochasticity (0.0 = deterministic, 1.0 = DDPM)
 
     # ── Paths ────────────────────────────────────────────
     data_dir: str = "data/animal_audio"
