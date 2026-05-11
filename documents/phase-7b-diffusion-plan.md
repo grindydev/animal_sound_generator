@@ -354,7 +354,121 @@ torchaudio.save("dog_bark_refined.wav", audio.squeeze(0), 22050)
 
 ---
 
-## 6. Model Size & Speed Estimates
+## 6. Training Config & Mode System
+
+Following the same pattern as `src/hifigan/train.py`, the diffusion training script uses a `CONFIG` dict with **test/train modes**, **device auto-detection**, and **progress tracking**.
+
+### 6.1 CONFIG Dict (in `src/diffusion/train.py`)
+
+```python
+CONFIG = {
+    "mode": "train",         # "test" | "train"
+    "device": "auto",        # "auto", "cuda", "mps", or "cpu"
+
+    "data_dir": "data/animal_audio",
+    "mel_dir": "data/animal_mel",
+    "model_dir": "models",
+    "save_interval": 5,      # epochs between checkpoints
+
+    "test": {
+        "num_epochs": 5,
+        "batch_size": 4,
+        "num_workers": 1,
+    },
+
+    "train": {
+        "num_epochs": 50,
+        "batch_size": 8,
+        "num_workers": 0,
+    },
+}
+```
+
+### 6.2 Mode Behavior
+
+| Mode | Epochs | Batch | Purpose |
+|------|--------|-------|---------|
+| `test` | 5 | 4 | Quick smoke test — verify loss drops, no crashes |
+| `train` | 50 | 8 | Full training run |
+
+### 6.3 Device Auto-Detection
+
+```python
+if CONFIG["device"] == "auto":
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        is_cuda = True
+        print("🚀 Using CUDA")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        is_cuda = False
+        print("🍎 Using MPS")
+    else:
+        device = torch.device("cpu")
+        is_cuda = False
+        print("⚠️  Using CPU")
+```
+
+### 6.4 Progress Tracking (per epoch)
+
+Each epoch prints a one-line summary matching the HiFi-GAN style:
+
+```
+── Epoch   3/50 (45s) ── loss=0.0234 val=0.0251 📉 lr=1.85e-04
+── Epoch   4/50 (44s) ── loss=0.0198 val=0.0223 📉 lr=1.83e-04
+── Epoch   5/50 (45s) ── loss=0.0182 val=0.0210 📉 lr=1.82e-04
+```
+
+- 📉 = validation improved (new best)
+- ➡️ = no improvement
+- `lr` = current learning rate
+- `time` = epoch wall-clock time
+
+### 6.5 Checkpoint & Resume
+
+```python
+# Save checkpoint (generator state + optimizer state + epoch)
+save_checkpoint(unet, optimizer, epoch, CHECKPOINT_DIR)
+
+# Resume from checkpoint
+start_epoch = load_checkpoint(unet, optimizer, CHECKPOINT_DIR, device)
+```
+
+- Checkpoints saved every `save_interval` epochs
+- Best model saved separately when validation loss improves
+- Final model saved at end of training
+
+### 6.6 Banner Print
+
+On startup, print a banner with key config info:
+
+```
+🔧 Diffusion Refinement → TRAIN MODE
+   GPU:    Apple M1 Pro
+   Epochs: 50 | Batch: 8 | Workers: 0
+   Timesteps: 1000 | Model: ~20M params
+   Mixed precision: no
+   Best model → models/diffusion_unet_best.pth
+```
+
+### 6.7 Data Validation
+
+Before training starts, load one batch and verify:
+
+```python
+_check = next(iter(train_loader))
+print(f"   📊 First batch: shape={tuple(_check[0].shape)}, "
+      f"mel min={_check[0].min():.4f}, max={_check[0].max():.4f}")
+if _check[0].abs().max() < 1e-6:
+    print("   🚨 ALL ZEROS — mel data not loading correctly.")
+    return None
+```
+
+This catches silent data loading bugs before wasting training time.
+
+---
+
+## 7. Model Size & Speed Estimates
 
 ### U-Net Size
 
@@ -383,7 +497,7 @@ Diffusion is slower but optional. The UI will have a toggle.
 
 ---
 
-## 7. Implementation Checklist
+## 8. Implementation Checklist
 
 ### Week 1: Architecture
 - [ ] `src/diffusion/unet.py` — U-Net with time + class conditioning
@@ -411,7 +525,7 @@ Diffusion is slower but optional. The UI will have a toggle.
 
 ---
 
-## 8. Key Design Decisions
+## 9. Key Design Decisions
 
 ### Decision 1: Train on real spectrograms, not VAE→real pairs
 
@@ -445,7 +559,7 @@ Diffusion is slower but optional. The UI will have a toggle.
 
 ---
 
-## 9. How to Evaluate Success
+## 10. How to Evaluate Success
 
 | Metric | Without Diffusion | With Diffusion | Target |
 |--------|-------------------|----------------|--------|
@@ -458,7 +572,7 @@ Diffusion is slower but optional. The UI will have a toggle.
 
 ---
 
-## 10. Files to Create (Skeleton)
+## 11. Files to Create (Skeleton)
 
 ```
 src/diffusion/
