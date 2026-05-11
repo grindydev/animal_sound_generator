@@ -1,542 +1,321 @@
 # Phase 7a — HiFi-GAN Neural Vocoder
 
-> **Learn this after VAE (Phase 4)** — HiFi-GAN fixes what VAEs can't: converting spectrograms into crisp, natural audio.
+> **One-line summary:** HiFi-GAN converts your VAE's mel spectrograms into crisp audio. It does NOT replace the VAE. It is a separate model trained on raw audio.
 
 ---
 
-## The Problem: Why Griffin-Lim Isn't Enough
+## 1. The Problem HiFi-GAN Solves
 
-Your VAE generates a **mel spectrogram** (a 2D image of frequencies over time).
-To hear it, you need to convert back to **waveform** (a 1D signal of air pressure over time).
+Your VAE generates a **mel spectrogram** — a 2D grid of frequency × time. To hear it, you must convert back to a **waveform** — a 1D list of air-pressure numbers.
 
-Two ways to convert mel → waveform:
-
-| Method | How it works | Sound quality | Training needed? |
-|--------|-------------|---------------|-----------------|
-| **Griffin-Lim** | Math formula: iteratively guess phase from magnitude | "Robot underwater" — grainy, metallic | No — just a function call |
-| **HiFi-GAN** | Neural network that learns what real audio looks like | Crisp, natural, realistic | Yes — 30-60 epochs of training |
+| Method | How it works | Sound quality |
+|--------|-------------|---------------|
+| **Griffin-Lim** | Math formula guesses missing phase info | Robotic, grainy, metallic |
+| **HiFi-GAN** | Neural network learns what real waveforms look like | Crisp, natural |
 
 ```
-Your VAE mel ── Griffin-Lim ──▶ Grainy, metallic audio (usable for evaluation)
-            │
-            └─ HiFi-GAN ────▶ Crisp, natural audio ✨ (production quality)
+"dog" label
+    ↓
+┌──────────┐
+│   VAE    │  ← YOU ALREADY BUILT THIS
+└────┬─────┘
+     ↓
+[64, 82] mel spectrogram     ← blurry "photo" of sound
+     ↓
+┌──────────┐                 ← HI-FI-GAN (this phase)
+│ HiFi-GAN │                   replaces Griffin-Lim here
+│Generator │
+└────┬─────┘
+     ↓
+[1, 16400] waveform          ← audio you can actually hear
 ```
 
-**HiFi-GAN doesn't fix the spectrogram.** It fixes the **conversion from spectrogram to audio**.
-Even a perfect VAE mel sounds mediocre through Griffin-Lim.
+**HiFi-GAN does NOT generate animal sounds.** The VAE does that. HiFi-GAN only converts mel → waveform. It is a **vocoder** (voice coder), not a generator.
 
 ---
 
-## What You'll Learn
+## 2. The Two Models
 
-| Concept | Familiar or new? | What it means |
-|---------|-----------------|---------------|
-| **GAN (Generative Adversarial Network)** | New | Two networks play against each other |
-| **Generator** | Familiar (your VAE decoder!) | Converts mel spectrogram → waveform |
-| **Discriminator** | New (like a classifier) | Judges: "Is this audio real or fake?" |
-| **Adversarial loss** | New | Generator gets rewarded for fooling the discriminator |
-| **Feature matching loss** | New | Match the discriminator's internal features, not just its output |
-| **Mel spectrogram loss** | Familiar (like VAE reconstruction) | Forces generator to match the input mel |
+HiFi-GAN has two separate neural networks. They train together but have different jobs.
+
+### Generator (`src/hifigan/generator.py`)
+
+**Input:** mel spectrogram `[batch, 64, time_frames]`  
+**Output:** audio waveform `[batch, 1, time_frames × 200]`  
+**Job:** "Turn this frequency grid into realistic audio."
+
+### Discriminator (`src/hifigan/discriminator.py`)
+
+**Input:** audio waveform `[batch, 1, samples]`  
+**Output:** scores `[batch, period, positions]` + internal features  
+**Job:** "Is this audio real or fake? Give me a number."
+
+```
+                    ┌─────────────────┐
+                    │  DISCRIMINATOR  │
+                    │     (Judge)     │
+                    │                 │
+  Real audio ──────▶│  score = +5     │───▶ "REAL!"
+                    │                 │
+  Fake audio ──────▶│  score = -5     │───▶ "FAKE!"
+                    │                 │
+                    └─────────────────┘
+                           ▲
+                           │
+    ┌──────────────────────┘
+    │
+    │   Generator wants HIGH scores (positive = real)
+    │   Generator's loss = -score
+    │   Lower loss = higher score = better fake
+    │
+    ▼
+┌─────────────────┐
+│   GENERATOR     │
+│    (Forger)     │
+│                 │
+│  mel ──────▶    │───▶ fake audio ──────▶ D judges it
+│  [64,82]        │     [1,16400]
+│                 │
+└─────────────────┘
+```
 
 ---
 
-## GAN Intuition: The Forger vs. The Detective
+## 3. Generator Architecture — Mel → Waveform
+
+**File:** `src/hifigan/generator.py`  
+**Class:** `HiFiGANGenerator` (line ~160)
+
+The Generator is a 1D upsampling network. It stretches the time axis by 200× (equal to `hop_length`).
 
 ```
-┌──────────────┐     fake audio        ┌──────────────┐
-│  GENERATOR   │ ─────────────────────▶ │DISCRIMINATOR │
-│  (the forger)│                        │(the detective)│
-│              │                        │              │
-│  "I'll make  │                        │  "This audio │
-│  audio that  │                        │   looks REAL │
-│  sounds real │                        │   to me!"    │
-│  to you!"    │                        │              │
-└──────────────┘                        └──────┬───────┘
-       ▲                                       │
-       │  "You fooled me this time..."         │
-       │  "...but next time I'll catch you!"   │
-       │  (feedback = gradient)                │
-       │                                       │
-       └───────────────────────────────────────┘
-
-They train together in a loop:
-
-  Round 1: Generator makes bad fake → Discriminator easily catches it
-  Round 2: Generator gets better → Discriminator struggles more
-  Round 3: Discriminator improves → catches new tricks
-  ...
-  Round N: Generator produces audio indistinguishable from real!
+Input:  [B, 64, 82]     ← mel spectrogram (64 freq bins × 82 time frames)
+           │
+           ▼
+    ┌─────────────────────────────┐
+    │ PRE_CONV                    │  Conv1d(64→256, kernel=7)
+    │ Code: generator.py line 175 │
+    └─────────────────────────────┘
+           │
+           ▼  [B, 256, 82]
+           │
+    ┌─────────────────────────────┐
+    │ MRF BLOCK 1                 │  ConvTranspose(stride=5)  256→128
+    │ Upsample ×5                 │  + 3 ResBlocks(ks=3,7,11) summed
+    │ Code: generator.py line 183 │  Time: 82 → 410
+    └─────────────────────────────┘
+           │
+           ▼  [B, 128, 410]
+           │
+    ┌─────────────────────────────┐
+    │ MRF BLOCK 2                 │  ConvTranspose(stride=5)  128→64
+    │ Upsample ×5                 │  + 3 ResBlocks summed
+    │                             │  Time: 410 → 2050
+    └─────────────────────────────┘
+           │
+           ▼  [B, 64, 2050]
+           │
+    ┌─────────────────────────────┐
+    │ MRF BLOCK 3                 │  ConvTranspose(stride=4)  64→32
+    │ Upsample ×4                 │  + 3 ResBlocks summed
+    │                             │  Time: 2050 → 8200
+    └─────────────────────────────┘
+           │
+           ▼  [B, 32, 8200]
+           │
+    ┌─────────────────────────────┐
+    │ MRF BLOCK 4                 │  ConvTranspose(stride=2)  32→16
+    │ Upsample ×2                 │  + 3 ResBlocks summed
+    │                             │  Time: 8200 → 16400
+    └─────────────────────────────┘
+           │
+           ▼  [B, 16, 16400]
+           │
+    ┌─────────────────────────────┐
+    │ POST_CONV                   │  Conv1d(16→1, kernel=7)
+    │ Code: generator.py line 188 │  No activation
+    └─────────────────────────────┘
+           │
+           ▼
+Output: [B, 1, 16400]    ← audio waveform
 ```
 
-**Real-world analogy:** Think of a forger painting fake art and an art expert
-learning to detect fakes. Each round, the forger gets better at faking, and the
-expert gets better at detecting. Eventually, the forger's work is so good that
-even experts can't tell the difference.
+**Total upsample:** `5 × 5 × 4 × 2 = 200 = hop_length` ✅
 
----
-
-## Architecture: Multi-Receptive Field Fusion (MRF)
-
-HiFi-GAN's generator is a **1D neural network** that upsamples from mel frames
-to audio samples. Here's the full pipeline with actual code references:
-
-### The Big Picture
-
-```
-Input:  mel spectrogram [B, 64, T]
-                     (64 frequency bins × T time frames)
-
-              ↓  Step 1: Pre-net (expand channels)
-              │    Code: generator.py → HiFiGANGenerator.__init__()
-              │    Layer: self.pre_conv = Conv1d(64 → 256, kernel=7)
-         [B, 256, T]
-
-              ↓  Step 2: MRF Block 1 (upsample × 5)
-              │    Code: generator.py → MRFBlock.__init__()
-              │    Layer: ConvTranspose1d(256 → 128, stride=5)
-              │    Then: 3 parallel ResBlocks (kernel 3, 7, 11)
-              │    Then: SUM all 3 outputs
-         [B, 128, T × 5]
-
-              ↓  Step 3: MRF Block 2 (upsample × 5)
-              │    ConvTranspose1d(128 → 64, stride=5)
-              │    3 parallel ResBlocks (kernel 3, 7, 11)
-              │    SUM outputs
-         [B, 64, T × 5 × 5]
-
-              ↓  Step 4: MRF Block 3 (upsample × 4)
-              │    ConvTranspose1d(64 → 32, stride=4)
-              │    3 parallel ResBlocks (kernel 3, 7, 11)
-              │    SUM outputs
-         [B, 32, T × 5 × 5 × 4]
-
-              ↓  Step 5: MRF Block 4 (upsample × 2)
-              │    ConvTranspose1d(32 → 16, stride=2)
-              │    3 parallel ResBlocks (kernel 3, 7, 11)
-              │    SUM outputs
-         [B, 16, T × 5 × 5 × 4 × 2]
-         [B, 16, T × 200]   ← 200 = hop_length
-
-              ↓  Step 6: Post-net (compress to 1 channel = audio)
-              │    Code: generator.py → HiFiGANGenerator.__init__()
-              │    Layer: self.post_conv = Conv1d(16 → 1, kernel=7)
-
-Output: waveform [B, 1, T × 200]   ← mono audio at 22,050 Hz
-```
-
-### Math notation guide (for people who hate math)
-
-Whenever you see tensor shapes like `[B, 64, T]`, here's what each letter means:
-
-| Symbol | What it means | Example |
-|--------|--------------|---------|
-| **B** | Batch size — how many audio clips processed at once | B=8 means 8 clips |
-| **64** | Number of mel frequency bins (n_mels) | Always 64 in this project |
-| **T** | Time frames — how many mel frames in the clip | Varies by clip length |
-| **200** | Upsampling factor — each mel frame becomes 200 audio samples | = hop_length |
-
-So `[B, 64, T] → [B, 1, T × 200]` means:
-- **Input:** B audio clips, each with 64 frequency bins and T time frames
-- **Output:** B audio clips, each with 1 channel (mono) and T×200 audio samples
-
----
-
-### Deep Dive: ResBlock (the building block)
-
-**File:** `generator.py` — class `ResBlock`
+### Inside a ResBlock (`generator.py` line ~30)
 
 ```python
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size, dilations):
         self.convs = nn.ModuleList()
-        for d in dilations:  # dilations = (1, 3, 5)
+        for d in dilations:          # d = 1, 3, 5
             self.convs.append(nn.Sequential(
                 nn.LeakyReLU(0.1),
-                nn.Conv1d(channels, channels, kernel_size, dilation=d),
+                nn.Conv1d(channels, channels, kernel_size,
+                          dilation=d, padding=get_padding(kernel_size, d)),
                 nn.LeakyReLU(0.1),
-                nn.Conv1d(channels, channels, kernel_size, dilation=1),
+                nn.Conv1d(channels, channels, kernel_size,
+                          dilation=1, padding=get_padding(kernel_size, 1)),
             ))
 ```
 
-**What it does:**
+Each ResBlock has **3 dilated conv paths** (dilation = 1, 3, 5). Dilation lets a small kernel "see" farther without more weights:
 
 ```
-Input x ────────────┐
-                    │ (this is the "residual" — skip connection)
-                    │
-   x → LeakyReLU ──▶ Conv(dilation=d) ──▶ LeakyReLU ──▶ Conv(dilation=1)
-                                                    │
-                                                    ▼
-                                            x + output (add them)
-                                                    │
-                                            new x → next ResBlock
+Dilation=1:  ●●●        ← sees 3 adjacent samples
+Dilation=3:  ●  ●  ●    ← sees samples 3 apart (wider view)
+Dilation=5:  ●    ●    ●  ← sees samples 5 apart (widest view)
 ```
 
-**What is "dilation"?**
+A residual connection (`x = x + residual`) lets the original signal skip through. If the convolutions mess up, the signal still gets through.
 
-Think of dilation as **spacing between kernel elements**:
-
-```
-kernel_size = 3
-
-Normal conv (dilation=1):     ● ● ●    ← looks at 3 adjacent samples
-                              ─────
-                                ↑
-
-Dilated conv (dilation=2):    ●   ●   ●  ← looks at samples 2 apart
-                              ────────
-                                ↑
-
-Dilated conv (dilation=3):    ●     ●     ●  ← looks at samples 3 apart
-                              ──────────
-                                ↑
-
-Why dilation? It lets a small kernel "see" a wider area without more parameters.
-```
-
-**Each ResBlock has 3 parallel conv paths with dilation = 1, 3, 5:**
-
-```
-Dilation 1:  ● ● ●          ← catches fine details (transients, clicks)
-Dilation 3:  ●   ●   ●      ← catches medium patterns (vocal timbre)
-Dilation 5:  ●     ●     ●  ← catches slower patterns (pitch contour)
-             │               │              │
-             └───── SUM these outputs together ─────┘
-```
-
-**Code reference:** `generator.py` line 62-68
-```python
-for conv in self.convs:
-    residual = x          # save the original x
-    x = conv(x)           # pass through the conv path
-    x = x + residual      # add original x back (residual connection)
-```
-
-The residual connection (`x = x + residual`) is important: it prevents the signal
-from degrading through many layers. Think of it like a "safety net" — if the
-convolution messes up, the original signal is still there.
-
----
-
-### Deep Dive: MRFBlock (one upsample stage)
-
-**File:** `generator.py` — class `MRFBlock`
+### Inside an MRFBlock (`generator.py` line ~65)
 
 ```python
 class MRFBlock(nn.Module):
     def __init__(self, in_channels, out_channels, ...):
-        # Step A: Upsample + reduce channels
-        self.upsample = nn.ConvTranspose1d(
-            in_channels, out_channels,
-            kernel_size=upsample_kernel_size,
-            stride=upsample_rate,    # this controls the upsampling factor
-            padding=(upsample_kernel_size - upsample_rate) // 2,
-        )
-
-        # Step B: 3 parallel ResBlock paths (different kernel sizes)
+        self.upsample = nn.ConvTranspose1d(in_channels, out_channels,
+                                           stride=upsample_rate)  # stretches time
         self.resblocks = nn.ModuleList()
-        for ks, ds in zip(kernel_sizes, dilations):
-            # ks = 3, 7, 11
-            # ds = (1,3,5), (1,3,5), (1,3,5)
-            self.resblocks.append(ResBlock(out_channels, ks, ds))
+        for ks in (3, 7, 11):       # 3 parallel paths
+            self.resblocks.append(ResBlock(out_channels, ks, (1,3,5)))
+
+    def forward(self, x):
+        x = self.upsample(x)
+        outputs = [rb(x) for rb in self.resblocks]
+        return sum(outputs)         # sum all 3 paths
 ```
 
-**What it does:**
+Three kernel sizes run in parallel:
+- **kernel=3:** catches fast transients (attack of a bark)
+- **kernel=7:** catches medium patterns (vocal timbre)
+- **kernel=11:** catches slow modulation (pitch contour)
 
-```
-Input [B, in_channels, T_in]
-              │
-              ▼
-    ┌─────────────────┐
-    │ ConvTranspose1d │  ← UP-SAMPLE: stretches time axis
-    │  stride=5       │     e.g., T_in=41 → T_out=205
-    │  channels halve │     e.g., 256 → 128
-    └────────┬────────┘
-             │
-             ▼
-         [B, out_channels, T_out]
-             │
-        ┌────┴────┬────┐
-        │         │    │        3 PARALLEL PATHS:
-        ▼         ▼    ▼
-    ┌──────┐ ┌──────┐ ┌──────┐
-    │ResBlk│ │ResBlk│ │ResBlk│   Each has a DIFFERENT kernel size:
-    │ksize=│ │ksize=│ │ksize=│
-    │   3  │ │   7  │ │  11  │
-    └──┬───┘ └──┬───┘ └──┬───┘
-       │        │        │
-       ▼        ▼        ▼
-       └────────┴────────┘
-                │
-                ▼       SUM all 3 outputs together
-
-Output: [B, out_channels, T_out]
-```
-
-**Why 3 different kernel sizes in parallel?**
-
-```
-Kernel=3 (small window):
-  ●●●
-  Catches FAST, sharp changes:
-  → bark attack, click, pop
-  → very fine details
-
-Kernel=7 (medium window):
-  ●●●●●●●
-  Captures MEDIUM patterns:
-  → vocal timbre (how a voice "sounds")
-  → formants (resonant frequencies)
-
-Kernel=11 (large window):
-  ●●●●●●●●●●●
-  Captures SLOW patterns:
-  → pitch contour (rising/falling tone)
-  → vibrato, modulation
-
-All 3 run on the SAME signal simultaneously.
-Then their outputs are SUMMED.
-The generator gets ALL time scales at once!
-```
-
-**Code reference:** `generator.py` line 113-118
-```python
-def forward(self, x):
-    x = self.upsample(x)          # upsample + reduce channels
-    outputs = []
-    for resblock in self.resblocks:
-        outputs.append(resblock(x))  # 3 paths, 3 outputs
-    return sum(outputs)             # merge them
-```
+Their outputs are **summed** — the Generator gets all time scales at once.
 
 ---
 
-### The Full Generator Forward Pass
+## 4. Discriminator Architecture — Waveform → Score
 
-**File:** `generator.py` — class `HiFiGANGenerator`, method `forward()`
+**File:** `src/hifigan/discriminator.py`  
+**Class:** `PeriodDiscriminator` (line ~20)
 
-```python
-def forward(self, mel, target_length=None):
-    if mel.dim() == 4:
-        mel = mel.squeeze(1)    # [B, 1, 64, T] → [B, 64, T]
+The Discriminator does NOT look at mel spectrograms. It looks at **raw audio waveforms** and checks if they look natural.
 
-    x = self.pre_conv(mel)      # Step 1: expand channels 64 → 256
-    for mrf in self.mrf_blocks: # Step 2: 4 MRF blocks (each upsamples)
-        x = mrf(x)
-    x = self.post_conv(x)       # Step 3: compress to 1 channel = audio
+### The Folding Trick (`discriminator.py` line ~81)
 
-    # Trim or pad to exact length if requested
-    if target_length is not None and x.shape[-1] != target_length:
-        if x.shape[-1] > target_length:
-            x = x[..., :target_length]  # chop the end
-        else:
-            x = F.pad(x, (0, target_length - x.shape[-1]))  # pad with zeros
-
-    return x
-```
-
-**Shape evolution (concrete example):**
-
-```
-Input mel:  [8, 64, 41]     ← 8 clips, 64 freq bins, 41 time frames (~0.37s)
-
-pre_conv:   [8, 256, 41]    ← expanded to 256 channels
-
-MRF block 1: [8, 128, 205]  ← upsample × 5, channels halve (256→128)
-MRF block 2: [8, 64, 1025]  ← upsample × 5, channels halve (128→64)
-MRF block 3: [8, 32, 4100]  ← upsample × 4, channels halve (64→32)
-MRF block 4: [8, 16, 8200]  ← upsample × 2, channels halve (32→16)
-
-post_conv:  [8, 1, 8200]    ← compressed to 1 channel = audio waveform
-
-Output: 8 audio clips, each 8200 samples = 0.37 seconds at 22,050 Hz
-```
-
-**Why does the output length = input frames × 200?**
-
-```
-Total upsampling = 5 × 5 × 4 × 2 = 200
-
-This number is NOT random — it equals hop_length from config.py:
-  hop_length = 200
-
-Why? When you compute a mel spectrogram from audio:
-  audio_samples / hop_length = mel_frames
-
-So to go back:
-  mel_frames × hop_length = audio_samples
-
-41 mel frames × 200 = 8,200 audio samples ✓
-```
-
----
-
-## The Discriminators: Multi-Scale + Multi-Period
-
-HiFi-GAN uses **TWO types** of discriminators working together.
-
-### 1. Multi-Period Discriminator (MPD) — checks waveform structure
-
-**File:** `discriminator.py` — class `MultiPeriodDiscriminator`, `PeriodDiscriminator`
-
-**What it does:** It folds the audio waveform into a 2D grid at different periods,
-then uses 2D convolutions to check if each fold looks "natural."
-
-**How folding works:**
-
-```
-Audio: [B, 1, 10]   ← 10 audio samples
-
-Period=2 (fold into 2 columns):
-  [1, 2]    [3, 4]    [5, 6]    [7, 8]    [9, 10]
-  → reshape to [B, 1, 2, 5]
-  → becomes a 2D image with 2 rows and 5 columns
-
-Period=5 (fold into 5 columns):
-  [1, 2, 3, 4, 5]    [6, 7, 8, 9, 10]
-  → reshape to [B, 1, 5, 2]
-  → becomes a 2D image with 5 rows and 2 columns
-```
-
-**Why fold?** Audio has repeating patterns (pitch = repeating waveform). When you
-fold at the right period, repeating patterns line up in columns and 2D convolutions
-can easily detect if the repetition looks natural or artificial.
-
-**5 periods used:**
-
-| Period | What it catches | Frequency range |
-|--------|----------------|-----------------|
-| 2 | Very fast oscillations | ~11 kHz |
-| 3 | Fast oscillations | ~7 kHz |
-| 5 | Mid oscillations | ~4.4 kHz |
-| 7 | Medium oscillations | ~3 kHz |
-| 11 | Slow oscillations | ~2 kHz |
-
-**Code reference:** `discriminator.py` line 44-50
 ```python
 def forward(self, x):
-    B, C, L = x.shape
+    B, C, L = x.shape           # x = [8, 1, 16400]
 
-    # Pad so length is divisible by period
+    # Pad to multiple of period
     if L % self.period != 0:
         n_pad = self.period - (L % self.period)
         x = F.pad(x, (0, n_pad), mode="reflect")
 
-    # Reshape: [B, 1, L] → [B×period, 1, 1, L/period]
+    # FOLD: [8, 1, 16400] → [8, 1, 5, 3280]
     x = x.view(B, C, self.period, L // self.period)
+    # PERMUTE: [8, 5, 1, 3280]
     x = x.permute(0, 2, 1, 3).contiguous()
+    # MERGE batch: [40, 1, 1, 3280]
     x = x.view(B * self.period, 1, L // self.period).unsqueeze(2)
 ```
 
----
-
-### 2. Multi-Scale Discriminator (MSD) — checks overall structure
-
-**File:** `discriminator.py` — class `MultiScaleDiscriminator`, `ScaleDiscriminator`
-
-**What it does:** It downsamples the audio to different resolutions, then runs
-1D convolutions on each scale.
-
-**How it works:**
+**What folding does (period=5 example):**
 
 ```
-Scale 0: raw audio [B, 1, L]           ← full resolution, catches fine details
-Scale 1: average pool × 2 → [B, 1, L/2]  ← downsampled, catches medium patterns
-Scale 2: average pool × 4 → [B, 1, L/4]  ← more downsampled, catches overall shape
+Original audio: [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, ...]
+
+Folded into 5 rows:
+  Row 0: s1,  s6,  s11, s16, ...   (every 5th, offset 0)
+  Row 1: s2,  s7,  s12, s17, ...   (every 5th, offset 1)
+  Row 2: s3,  s8,  s13, s18, ...   (every 5th, offset 2)
+  Row 3: s4,  s9,  s14, s19, ...   (every 5th, offset 3)
+  Row 4: s5,  s10, s15, s20, ...   (every 5th, offset 4)
 ```
 
-**Why multiple scales?**
+Now the waveform is a **grayscale image** `[40, 1, 1, 3280]`. A 4.4kHz tone (period ≈ 5 samples) becomes a vertical stripe that 2D convolutions detect instantly.
 
-```
-Scale 0 (full resolution):
-  ● ● ● ● ● ● ● ●
-  Catches tiny glitches: clicks, pops, noise artifacts
-
-Scale 1 (half resolution):
-  ●   ●   ●   ●
-  Catches syllable structure: consonant → vowel transitions
-
-Scale 2 (quarter resolution):
-  ●       ●
-  Catches overall envelope: loud → quiet patterns
-```
-
-**Our implementation uses MPD only:**
+### The Conv2D Scan (`discriminator.py` line ~55-62)
 
 ```python
-# discriminator.py — class Discriminator
-class Discriminator(nn.Module):
-    def __init__(self):
-        self.mpd = MultiPeriodDiscriminator()
-
-    def forward(self, x):
-        return self.mpd(x)  # 5 period discriminators, no MSD
+channels = [1, 16, 64, 128]
+self.convs = nn.ModuleList()
+for i in range(3):          # 3 Conv2D layers
+    self.convs.append(
+        nn.Sequential(
+            nn.Conv2d(channels[i], channels[i+1],
+                      kernel_size=(5, 5), stride=(3, 3),
+                      padding=(2, get_padding(5))),
+            nn.LeakyReLU(0.1),
+        )
+    )
 ```
 
-**Combined:** 5 discriminators total (one for each period). Each gives:
-- **score** → a number saying "real or fake"
-- **features** → intermediate layer outputs for feature matching loss
+```
+After folding: [40, 1, 1, 3280]
+       │
+       ▼
+┌────────────────────────────┐
+│ Conv2d(1→16, 5×5, stride=3)│  ← scans for raw glitches
+│ Output: [40, 16, 1, 1093]  │
+└────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────┐
+│ Conv2d(16→64, 5×5, stride=3)│  ← scans for timbre artifacts
+│ Output: [40, 64, 1, 364]   │
+└────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────┐
+│ Conv2d(64→128, 5×5, stride=3)│ ← scans for overall structure
+│ Output: [40, 128, 1, 121]  │
+└────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────┐
+│ Conv2d(128→1, 3×1)         │  ← 1 score per position
+│ Output: [40, 1, 1, 121]    │
+└────────────────────────────┘
+       │
+       ▼
+Unfold: [8, 5, 121]          ← scores for this period
+```
+
+**5 period discriminators run in parallel** (periods = 2, 3, 5, 7, 11). Each catches artifacts at different frequencies.
 
 ---
 
-## The Three Losses (This Is Where GANs Get Tricky)
+## 5. The Three Losses
 
-```python
-total_generator_loss = λ_mel × L_mel + λ_fm × L_fm + λ_adv × L_adv
-```
+**File:** `src/hifigan/losses.py`
 
-**Math notation guide for loss equations:**
+The Generator uses **three losses combined**. The Discriminator uses a separate hinge loss.
 
-| Symbol | What it means | Example |
-|--------|--------------|---------|
-| **λ** (lambda) | A weight — how important this loss is | λ_mel=45 means mel loss is 45× stronger |
-| **L_mel** | Mel spectrogram loss (a number) | Lower = generated audio matches input mel better |
-| **L_fm** | Feature matching loss (a number) | Lower = generated audio features look more like real audio |
-| **L_adv** | Adversarial loss (a number) | Lower = discriminator thinks the audio is real |
-| **×** | Multiplication | λ_mel × L_mel means: multiply the loss by the weight |
+### Loss 1: Mel L1 Loss (λ = 45)
 
-### Loss 1: Mel Spectrogram Loss (λ_mel = 45) — THE ANCHOR
-
-**File:** `losses.py` — class `MelL1Loss`
+**Code:** `losses.py` line ~20, class `MelL1Loss`
 
 ```python
 class MelL1Loss(nn.Module):
+    def __init__(self, sample_rate, n_fft, hop_length, n_mels, ...):
+        self.mel_transform = MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft,
+            hop_length=hop_length, n_mels=n_mels, power=1)
+
     def forward(self, fake_audio, real_audio):
-        fake_mel = self.mel_transform(fake_audio.squeeze(1))
-        real_mel = self.mel_transform(real_audio.squeeze(1))
-        return F.l1_loss(fake_mel, real_mel)
+        fake_mel = self.mel_transform(fake_audio.squeeze(1))   # [B, 64, T]
+        real_mel = self.mel_transform(real_audio.squeeze(1))   # [B, 64, T]
+        return F.l1_loss(fake_mel, real_mel)                   # mean(|a-b|)
 ```
 
-**What it does:**
+**What it does:** Compares the mel spectrogram of generated audio vs real audio.  
+**Why weight = 45:** This is the PRIMARY objective. Without it, the Generator ignores the input mel and produces any "realistic" audio (e.g., human speech instead of dog barks).
 
-```
-1. Take generated audio → compute its mel spectrogram
-2. Take real audio → compute its mel spectrogram
-3. Compare: how different are they? (L1 = absolute difference)
-4. Lower difference = better
-```
+### Loss 2: Feature Matching Loss (λ = 2)
 
-**In plain English:** "Does the generated audio have the SAME frequency content
-as the real audio?"
-
-**Why the weight is 45 (VERY high):**
-
-This is the MOST important loss. It forces the generator to match the **input
-mel spectrogram**. Without a strong mel loss, the generator can invent ANY
-"realistic" audio — it might generate human speech, music, or noise instead
-of a dog bark.
-
-> 🚨 **What we learned the hard way:** With λ_mel=1.0, the generator produced
-> human speech instead of dog barks. The adversarial loss dominated, so
-> "sounds like real audio" mattered more than "sounds like the INPUT mel."
->
-> **Fix:** Set λ_mel=45 so mel matching is the PRIMARY objective.
-
----
-
-### Loss 2: Feature Matching Loss (λ_fm = 2) — THE GUIDE
-
-**File:** `losses.py` — function `feature_matching_loss()`
+**Code:** `losses.py` line ~36
 
 ```python
 def feature_matching_loss(real_features, fake_features):
@@ -544,790 +323,279 @@ def feature_matching_loss(real_features, fake_features):
     count = 0
     for real_group, fake_group in zip(real_features, fake_features):
         for r, f in zip(real_group, fake_group):
-            loss += F.l1_loss(f, r.detach())  # compare feature by feature
+            loss += F.l1_loss(f, r.detach())    # |fake_feat - real_feat|
             count += 1
     return loss / max(count, 1)
 ```
 
-**What it does:**
+**What it does:** Compares the Discriminator's internal layer outputs for real vs fake audio.  
+**Why it helps:** The Discriminator's layers extract "what makes audio sound real" at different levels. Matching these guides the Generator toward natural waveforms.
 
-```
-Discriminator has multiple internal layers.
-Each layer produces "features" — intermediate representations of the audio.
+**Example:** If Layer 1 of D outputs `[0.5, 0.3, 0.8]` for real and `[0.1, 0.9, 0.2]` for fake, the Generator learns to make its Layer 1 output closer to `[0.5, 0.3, 0.8]`.
 
-For REAL audio:  discriminator produces features = [f1_real, f2_real, f3_real, ...]
-For FAKE audio:  discriminator produces features = [f1_fake, f2_fake, f3_fake, ...]
+### Loss 3: Adversarial Loss (λ = 1)
 
-Feature matching loss = how different are these features?
-  |f1_fake - f1_real| + |f2_fake - f2_real| + |f3_fake - f3_real| + ...
-```
-
-**In plain English:** "Do the internal features of fake audio look like the
-internal features of real audio?"
-
-**Why it helps:** The discriminator's intermediate layers capture "what makes
-audio sound real" at different levels of abstraction. Matching these features
-guides the generator toward producing realistic waveforms — even before the
-discriminator's final output score says "this is real."
-
-**Analogy:** Instead of just saying "this painting is fake," the art expert
-says "the brush strokes look wrong, the color mixing is off, the shading is
-unnatural." Each specific feedback helps the forger improve.
-
----
-
-### Loss 3: Adversarial Loss (λ_adv = 1) — THE POLISH
-
-**File:** `losses.py` — function `generator_loss()`
+**Code:** `losses.py` line ~65, inside `generator_loss()`
 
 ```python
-# Adversarial (generator wants discriminator to say "real")
-loss_adv = 0.0
-count = 0
-for scores in fake_scores:
-    loss_adv += -scores.mean()  # negative because generator wants HIGH scores
-    count += 1
-loss_adv = loss_adv / max(count, 1)
+def generator_loss(fake_audio, real_audio, fake_scores, fake_features,
+                   real_features, mel_loss_fn, lambda_mel, lambda_fm, lambda_adv):
+
+    loss_mel = mel_loss_fn(fake_audio, real_audio)
+    loss_fm  = feature_matching_loss(real_features, fake_features)
+
+    # ── ADVERSARIAL LOSS ──
+    loss_adv = 0.0
+    count = 0
+    for scores in fake_scores:          # 5 score tensors (one per period)
+        loss_adv += -scores.mean()      # NEGATIVE of average D score
+        count += 1
+    loss_adv = loss_adv / max(count, 1)
+
+    total = lambda_mel * loss_mel + lambda_fm * loss_fm + lambda_adv * loss_adv
+    return total, {"g_mel": loss_mel.item(), "g_fm": loss_fm.item(),
+                   "g_adv": loss_adv.item(), "g_total": total.item()}
 ```
 
-**What it does:**
+**What it does:** Measures how positive the Discriminator's scores are for fake audio.  
+**Why `-score`:** The Generator minimizes loss. Minimizing `-score` = maximizing `score`. If D says `+5` (real), loss = `-5` (good). If D says `-5` (fake), loss = `+5` (bad).
 
-```
-Discriminator scores fake audio:
-  score = 10 → "this looks REAL"
-  score = -10 → "this looks FAKE"
+**Why weight = 1:** Just a gentle polish. Too strong and the Generator ignores the mel to chase D's approval.
 
-Generator wants: score to be HIGH (looks real)
-So generator loss = -score  (minimize negative = maximize score)
+### Discriminator Hinge Loss
 
-If discriminator says "fake" (score=-5):
-  generator loss = -(-5) = 5  → HIGH loss → generator will update
+**Code:** `losses.py` line ~93
 
-If discriminator says "real" (score=5):
-  generator loss = -(5) = -5  → LOW loss → generator is doing well
-```
-
-**In plain English:** "Can the discriminator tell this is fake? If yes,
-generate different audio."
-
-**Why the weight is 1 (VERY low):** The adversarial loss is powerful and can
-destabilize training if too strong. It's the final polish, not the main objective.
-
----
-
-### How the Three Losses Work Together
-
-```
-Generator receives 3 signals each update:
-
-  1. Mel loss (weight 45):  "Your audio must match THIS mel spectrogram!"
-     → Controls CONTENT (dog vs cat vs bird)
-
-  2. Feature matching (weight 2):  "Your audio features must look natural!"
-     → Controls REALISM (does it sound like real audio?)
-
-  3. Adversarial (weight 1):  "Can the discriminator tell it's fake?"
-     → Controls QUALITY (crisp vs grainy)
-
-Without mel loss:    generator makes "realistic" audio of WRONG content
-Without FM loss:     generator matches mel but sounds artificial
-Without adversarial: generator matches mel but lacks fine details
-```
-
----
-
-## Training Loop: Generator vs. Discriminator Dance
-
-**File:** `train.py` — function `train_epoch()`
-
-### Step-by-Step for Each Batch
-
-```
-Batch: real_audio [B, 1, 8192]
-
-Step A: Generate fake audio
-  real_mel = compute_mel(real_audio)
-  fake_audio = generator(real_mel)
-
-Step B: Train Discriminator
-  real_score = discriminator(real_audio)    # should be HIGH
-  fake_score = discriminator(fake.detach()) # should be LOW (detach = don't update generator)
-  d_loss = hinge_loss(real_score, fake_score)
-  d_loss.backward()
-  optimizer_d.step()
-
-Step C: Train Generator
-  fake_score = discriminator(fake_audio)    # NOW update generator through discriminator
-  mel_loss = MelL1Loss(fake_audio, real_audio)
-  fm_loss = feature_matching(real_features, fake_features)
-  adv_loss = adversarial(fake_score)
-  g_loss = 45×mel_loss + 2×fm_loss + 1×adv_loss
-  g_loss.backward()
-  optimizer_g.step()
-```
-
-**Key insight:** Step B and Step C are **alternating updates** on the same batch.
-First the discriminator learns to catch fakes, then the generator learns to
-fool the updated discriminator. They're literally playing a game — each one's
-update makes the other one's job harder.
-
-**Code reference:** `train.py` line 293-340
 ```python
-# ── Discriminator ──
+def discriminator_loss(real_scores, fake_scores):
+    loss_real = 0.0
+    loss_fake = 0.0
+    count = 0
+    for r_scores, f_scores in zip(real_scores, fake_scores):
+        loss_real += F.relu(1.0 - r_scores).mean()   # real must be ≥ 1
+        loss_fake += F.relu(1.0 + f_scores).mean()   # fake must be ≤ -1
+        count += 1
+    return (loss_real + loss_fake) / count, {"d_real": ..., "d_fake": ..., "d_total": ...}
+```
+
+**What it does:** Forces a margin of 2 between real and fake scores.  
+**Why hinge:** Prevents the Discriminator from outputting extreme scores forever, which would give the Generator no gradient to learn from.
+
+---
+
+## 6. Training — Two Phases
+
+**File:** `src/hifigan/train.py`
+
+HiFi-GAN trains in two phases. You run them sequentially.
+
+### Phase I: Meltrain — Generator Only (30 epochs)
+
+**Mode:** `CONFIG["mode"] = "meltrain"`  
+**Function:** `train_epoch_mel_only()` (line ~200)  
+**What happens:**
+
+```python
+for audio in train_loader:              # audio = [B, 1, 16384]
+    real_mel = compute_mel(audio)       # [B, 64, 82]
+    target_len = real_mel.shape[-1] * cfg.hop_length   # 82 × 200 = 16400
+    real_trim = audio[..., :target_len] # [B, 1, 16400]
+
+    fake = generator(real_mel, target_length=target_len)  # [B, 1, 16400]
+
+    mel_loss = mel_loss_fn(fake, real_trim)    # |mel(fake) - mel(real)|
+    time_loss = F.l1_loss(fake, real_trim)     # |fake - real| directly
+    loss = mel_loss + 1.0 * time_loss
+
+    opt_g.zero_grad()
+    loss.backward()
+    clip_grad_norm_(generator.parameters(), 1.0)
+    opt_g.step()
+```
+
+**Why train Generator first?** GANs are unstable. If you throw both networks together from scratch, the Discriminator dominates and the Generator never learns. Meltrain gives the Generator a solid baseline first.
+
+**What to watch:**
+```
+Epoch 1:  mel_loss = 6.5    ← random noise
+Epoch 10: mel_loss = 1.8    ← rough shape
+Epoch 30: mel_loss = 0.5    ← good baseline, ready for GAN
+```
+
+### Phase II: Full GAN — Both Together (60 epochs)
+
+**Mode:** `CONFIG["mode"] = "train"`  
+**Function:** `train_epoch()` (line ~293)  
+**What happens per batch:**
+
+```
+STEP A: Generate fake
+─────────────────────────────────────────────────────────────
+fake = generator(real_mel, target_len)     # [B, 1, 16400]
+
+
+STEP B: Train DISCRIMINATOR
+─────────────────────────────────────────────────────────────
+Code: train.py lines 298-330
+
 opt_d.zero_grad()
-r_score, r_feat = discriminator(d_real)
-f_score_d, _ = discriminator(d_fake)
+
+d_real = real_trim + noise(0.01)
+d_fake = fake.detach() + noise(0.01)       # .detach() = stop gradient to G
+
+r_score, r_feat = discriminator(d_real)    # D scores real audio
+f_score_d, _    = discriminator(d_fake)    # D scores fake audio
+
 d_loss, d_dict = discriminator_loss(r_score, f_score_d)
+# d_loss = max(0, 1 - r_score) + max(0, 1 + f_score_d)
+
 d_loss.backward()
-opt_d.step()
+clip_grad_norm_(discriminator.parameters(), 1.0)
+opt_d.step()                                # ONLY D updates
 
-# ── Generator ──
+
+STEP C: Train GENERATOR
+─────────────────────────────────────────────────────────────
+Code: train.py lines 333-365
+
 opt_g.zero_grad()
-f_score_g, f_feat_g = discriminator(fake)
+
+f_score_g, f_feat_g = discriminator(fake)   # NO .detach()!
+# Gradients flow through D into G
+
 g_loss, g_dict = generator_loss(
-    fake, real_trim, f_score_g, f_feat_g, r_feat, mel_loss_fn,
-    lambda_mel=cfg.lambda_mel,  # 45
-    lambda_fm=cfg.lambda_fm,     # 2
-    lambda_adv=cfg.lambda_adv,   # 1
+    fake, real_trim,
+    f_score_g, f_feat_g, r_feat, mel_loss_fn,
+    lambda_mel=45, lambda_fm=2, lambda_adv=1,
 )
+# g_loss = 45 × mel_loss + 2 × fm_loss + 1 × adv_loss
+
 g_loss.backward()
-opt_g.step()
+clip_grad_norm_(generator.parameters(), 1.0)
+opt_g.step()                                # ONLY G updates
 ```
 
----
-
-## Training Strategy: Meltrain → Full GAN
-
-### Phase 1: Mel-Only Pretraining (`mode="meltrain"`)
-
-```python
-# train.py — MODE == "meltrain"
-# Generator trains WITHOUT discriminator
-# Loss = mel_loss + time_loss
-```
-
-**What happens:**
-- Generator learns "mel → audio" mapping from scratch
-- No adversarial instability in early training
-- Converges to a reasonable baseline in 15-30 epochs
+**Why D first in each batch?** The Generator plays against the **updated** Discriminator. If G trained first, it would be playing against an outdated D — too easy, no learning.
 
 **What to watch:**
 ```
-Epoch 1: mel=6.6  ← generator starts blind
-Epoch 2: mel=2.5  ← huge improvement (first gradient updates are massive)
-Epoch 5: mel=1.8  ← steady learning
-Epoch 15: mel=1.0 ← plateau approaching
+Healthy:
+  G mel_loss: 6 → 3 → 2 → 1.5 → 1.0  (drops steadily)
+  D loss: hovers around 0.5-1.5        (challenged but not crushed)
+
+Unhealthy:
+  D loss → 0:    Discriminator too strong → generator can't learn
+  D loss > 5:    Discriminator collapsed → restart or lower LR
+  G mel_loss flat:  Generator plateaued → check data loading
 ```
 
-**If mel=0.0000 from epoch 1:** Data loading bug — audio files not loading.
-Check data paths and file formats.
+---
 
-### Phase 2: Full GAN Training (`mode="train"`)
+## 7. How Generator and Discriminator Play Against Each Other
 
+```
+BATCH 1:
+  G makes terrible fake → D easily spots it (score = -5)
+  D trains → gets better
+  G trains → wants score = +5, gets -5, big loss, improves slightly
+
+BATCH 2:
+  G makes slightly better fake → D still spots it (score = -3)
+  D trains → gets better
+  G trains → wants +5, gets -3, medium loss, improves more
+
+BATCH 100:
+  G makes very good fake → D confused (score = 0.1)
+  D trains → barely improves
+  G trains → almost there, loss ≈ 0
+
+BATCH 1000:
+  G makes audio indistinguishable from real → D gives up (score = 0)
+  Neither improves much → equilibrium → training converges
+```
+
+The Discriminator is the **grading machine**. The Generator is the **student**. Each batch:
+1. The grader learns to spot the student's latest tricks.
+2. The student learns to beat the updated grader.
+
+---
+
+## 8. Critical Hyperparameters
+
+| Parameter | Value | Controls | If wrong |
+|-----------|-------|----------|----------|
+| `lambda_mel` | **45** | How hard G must match input mel | 1.0 → G drifts to wrong content (speech instead of bark) |
+| `lambda_fm` | **2** | How much D's internal features guide G | 10 → overwhelms mel loss, similar drift |
+| `lambda_adv` | **1** | How much G chases D's approval | 5 → G ignores mel, invents any "real" audio |
+| `segment_size` | **16384** | Audio context per sample | 8192 → too short, misses full bark pattern |
+| `batch_size` (GAN) | **8** | Samples per update | < 4 → D memorizes, mode collapse |
+| `learning_rate` | **2e-4** | Step size | Higher → unstable; lower → painfully slow |
+| `adam_betas` | **(0.8, 0.99)** | Momentum | (0.9, 0.999) → D overshoots |
+| `num_workers` | **0** | Data loading workers | > 0 → silent data bugs on CUDA |
+
+**The most important lesson:** Mel loss MUST dominate. It is the only thing that keeps the Generator producing the RIGHT sound (dog bark, not human speech). The Discriminator only cares about "does it sound real?" — it has no idea what animal it should be.
+
+---
+
+## 9. Quick File Reference
+
+| What you want | File | Function/Class | Line |
+|---------------|------|----------------|------|
+| Generator model | `generator.py` | `HiFiGANGenerator` | ~160 |
+| Generator pre-conv | `generator.py` | `self.pre_conv` | ~175 |
+| Generator post-conv | `generator.py` | `self.post_conv` | ~188 |
+| ResBlock | `generator.py` | `ResBlock` | ~30 |
+| MRFBlock | `generator.py` | `MRFBlock` | ~65 |
+| Discriminator model | `discriminator.py` | `PeriodDiscriminator` | ~20 |
+| Discriminator folding | `discriminator.py` | `forward()` | ~81-90 |
+| Discriminator Conv2D | `discriminator.py` | `__init__()` | ~55-62 |
+| Mel L1 loss | `losses.py` | `MelL1Loss` | ~20 |
+| Feature matching loss | `losses.py` | `feature_matching_loss()` | ~36 |
+| Generator total loss | `losses.py` | `generator_loss()` | ~65 |
+| Discriminator hinge loss | `losses.py` | `discriminator_loss()` | ~93 |
+| Data loading | `train.py` | `HiFiGANDataset` | ~118 |
+| Mel computation | `train.py` | `compute_mel()` | ~145 |
+| Phase I training | `train.py` | `train_epoch_mel_only()` | ~200 |
+| Phase II training | `train.py` | `train_epoch()` | ~293 |
+| Main loop | `train.py` | `training_loop()` | ~380 |
+| Config | `config.py` | `HiFiGANConfig` | ~1 |
+
+---
+
+## 10. How to Run Training
+
+```bash
+# Phase I: Generator only (30 epochs)
+# Edit CONFIG["mode"] = "meltrain" in train.py
+python src/hifigan/train.py
+
+# Phase II: Full GAN (60 epochs)
+# Edit CONFIG["mode"] = "train" in train.py
+python src/hifigan/train.py
+```
+
+**Models saved:**
+- `models/hifigan_generator_meltrain_best.pth` — after Phase I
+- `models/hifigan_generator_train_best.pth` — after Phase II
+- `models/hifigan_generator_train.pth` — final checkpoint
+
+**At inference time, you only need the Generator:**
 ```python
-# train.py — MODE == "train"
-# Generator + discriminator train together
-# Loss = 45×mel_loss + 2×fm_loss + 1×adv_loss
-```
+from src.hifigan.generator import HiFiGANGenerator
+from src.hifigan.config import config
 
-**What happens:**
-- Generator already knows mel → audio from Phase 1
-- Discriminator refines waveform quality
-- Feature matching adds naturalness
-- ~20-30 epochs for convergence
+generator = HiFiGANGenerator(config)
+checkpoint = torch.load("models/hifigan_generator_train_best.pth")
+generator.load_state_dict(checkpoint["generator"])
 
-**What to watch:**
-```
-Healthy training:
-  G mel loss: drops steadily (6→3→2→1.5→1.0...)
-  D loss: hovers around 1-2 (hinge loss equilibrium)
-  Val mel: similar to train mel (no overfitting)
+# Your VAE produces a mel spectrogram
+mel = vae.generate("dog")        # [1, 64, 82]
 
-Unhealthy training:
-  D loss → 0:       Discriminator too strong → generator can't learn
-  D loss → very high: Discriminator collapsed → adversarial loss meaningless
-  G mel loss stops:  Generator plateaued → need more epochs or LR warmup
-  D loss oscillates wildly: Learning rate too high
+# HiFi-GAN converts to audio
+audio = generator(mel)           # [1, 1, 16400]
+torchaudio.save("dog_bark.wav", audio.squeeze(0), 22050)
 ```
 
 ---
 
-## Critical Hyperparameters (Learned the Hard Way)
-
-| Parameter | Value | What it controls | What happens if wrong |
-|-----------|-------|-----------------|----------------------|
-| `segment_size` | **16384** (0.74s) | How much audio context generator sees per sample | 8192 (0.37s) → too short for full bark, generator sees incomplete patterns |
-| `lambda_mel` | **45** | How hard generator must match input mel | 1.0 → generator drifts to speech/wrong content |
-| `lambda_fm` | **2** | How much feature matching guides realism | 10 → overwhelms mel loss, similar drift |
-| `lambda_adv` | **1** | How much adversarial loss polishes | 2+ → discriminator dominates, generator ignores mel |
-| `learning_rate` | **2e-4** | How big each training step is | Higher → unstable GAN; lower → painfully slow |
-| `batch_size` | **8** | How many samples per update | < 4 → discriminator memorizes, mode collapse |
-| `beta1` (Adam) | **0.8** | Momentum for optimizer | 0.9 (default) → discriminator overshoots |
-| `num_workers` | **0** | Multiprocessing for data loading | > 0 → silent data bugs on CUDA (relative paths break) |
-
-### The Mel Loss Lesson (Most Important)
-
-```
-WRONG: lambda_mel=1.0, lambda_adv=2.0
-→ Generator: "I'll make realistic audio" (ignores input mel)
-→ Result: Human speech instead of dog barks ❌
-
-CORRECT: lambda_mel=45.0, lambda_adv=1.0
-→ Generator: "I must match THIS mel spectrogram"
-→ Discriminator: "But make it sound natural"
-→ Result: Correct content + natural waveform ✅
-```
-
-**Rule of thumb:** Mel loss should be the HEAVIEST weight (45×).
-The discriminator only polishes what the mel loss constrains.
-
----
-
-## Why This is Industry Standard
-
-HiFi-GAN was published by Kong, Kim, and Bae (2020) at NeurIPS. It's used in:
-
-| Company/Product | Uses HiFi-GAN for |
-|----------------|-------------------|
-| VITS (TTS system) | Text → speech vocoder |
-| YourTTS (Coqui) | Voice cloning vocoder |
-| Matcha-TTS | Text → speech vocoder |
-| Bark (Suno AI) | Text → speech vocoder (similar architecture) |
-| AudioCraft (Meta) | Music generation vocoder |
-
-The MRF architecture and multi-discriminator design became the **standard**
-because it produces high-quality audio with fast inference (real-time on GPU).
-
----
-
-## Key Lessons from Our Implementation
-
-### 1. Data loading bugs are the #1 cause of "loss = 0"
-
-If training shows `mel=0.0000` from epoch 1, audio files aren't loading.
-The generator outputs zeros, real audio is zeros, loss = |0-0| = 0.
-
-**Fix:** Always validate data before training:
-```python
-# train.py — added data validation
-_check = next(iter(train_loader))
-_check_max = _check.abs().max().item()
-if _check_max < 1e-6:
-    print("🚨 ALL ZEROS — audio files not loading correctly.")
-    return None  # stop training immediately
-```
-
-### 2. torchaudio 2.11+ requires FFmpeg shared libraries
-
-On systems without FFmpeg, `torchaudio.load()` fails with:
-`Could not load libtorchcodec`
-
-**Fix:** Fall back to `soundfile` (reads WAV natively, no FFmpeg needed):
-```python
-# train.py — _load_audio()
-def _load_audio(path):
-    try:
-        return torchaudio.load(path)  # fast, native
-    except Exception:
-        pass
-    try:
-        import soundfile as sf
-        data, sr = sf.read(path, dtype='float32')
-        wav = torch.from_numpy(data)
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)
-        return wav, sr
-    except Exception as e:
-        warnings.warn(f"⚠️ Audio load FAILED: {path} → {e}")
-        return None, None
-```
-
-### 3. Relative paths break in multiprocessing workers
-
-With `num_workers > 0`, spawned worker processes may have a different working
-directory. `data/animal_audio/Dog/file.wav` becomes an invalid path.
-
-**Fix:** Use absolute paths + `num_workers=0`:
-```python
-# dataset stores absolute paths
-self.files.append(os.path.abspath(os.path.join(cls_dir, fname)))
-
-# config sets workers to 0
-"num_workers": 0,
-```
-
-### 4. The discriminator easily overpowers the generator
-
-With strong adversarial loss (λ_adv=2), the generator produces "realistic"
-but **wrong** content. Human speech sounds "real" but isn't a dog bark.
-
-**Fix:** Mel loss must dominate:
-```
-λ_mel (45) >> λ_fm (2) > λ_adv (1)
-  ↑                  ↑           ↑
-PRIMARY            GUIDE       POLISH
-```
-
-### 5. Segment size must match the signal
-
-```
-8192 samples (0.37s) → too short, misses full bark pattern
-16384 samples (0.74s) → captures most animal sounds
-44100 samples (2.00s) → ideal but slower training
-```
-
----
-
-## HiFi-GAN vs. Your VAE: Different Problems, Same Goal
-
-```
-VAE (Phase 4):
-  Input:  class label (e.g., "dog")
-  Output: mel spectrogram [1, 64, T]
-  Goal:   "What should a dog sound look like?"
-  Quality: Blurred (averages over possibilities)
-  Conversion to audio: Griffin-Lim (grainy)
-
-HiFi-GAN (Phase 7a):
-  Input:  mel spectrogram [1, 64, T]
-  Output: waveform [1, 1, T×200]
-  Goal:   "How do I convert THIS mel into audio?"
-  Quality: Crisp (learned phase + waveform)
-  Conversion to audio: Neural network (natural)
-
-Together:
-  "dog" → VAE → [mel spectrogram] → HiFi-GAN → [crisp audio ✨]
-```
-
-**VAE and HiFi-GAN are complementary.** The VAE generates the spectrogram
-(the **what**). HiFi-GAN converts it to audio (the **how**).
-
----
-
-## Next Steps After HiFi-GAN
-
-| Phase | What | Builds on HiFi-GAN |
-|-------|------|-------------------|
-| **7b: Diffusion** | Sharpen the VAE's blurry mel output | HiFi-GAN still needed as vocoder |
-| **7c: Sequential** | Generate long sounds, chain animals | HiFi-GAN handles any length via chunking |
-| **7d: Latent mixing** | Blend animals in z-space | HiFi-GAN converts any mel, even mixed ones |
-| **7e: UI v2** | Add vocoder selector to web app | Users can hear Griffin-Lim vs HiFi-GAN |
-
-The full quality pipeline:
-```
-"dog" → VAE → [blurry mel] → Diffusion → [sharp mel] → HiFi-GAN → [crisp audio ✨]
-```
-
----
-
-## Appendix: Layer-by-Layer Architecture Diagrams
-
-These diagrams trace exact tensor shapes (batch=1, T=41 frames ≈ 0.37s) through your actual code.
-
-### Generator — mel → waveform
-
-```
-[1, 64, 41]          ← mel spectrogram (64 freq bins × 41 time frames)
-     │
-     ▼
-┌─────────────────────────────────────────────────────┐
-│  PRE-CONV                                           │
-│  Conv1d(64 → 256, kernel=7, padding=3)              │
-│  No activation                                      │
-└─────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 256, 41]
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  MRF BLOCK 1  — upsample ×5, channels: 256→128                                  │
-│                                                                                  │
-│   [1, 256, 41]                                                                   │
-│        │                                                                         │
-│        ▼                                                                         │
-│   ┌──────────────────────────┐                                                   │
-│   │ ConvTranspose1d          │  stride=5, kernel=10, pad=2                       │
-│   │ 256 → 128                │  Time stretches: 41 × 5 = 205                     │
-│   └──────────────────────────┘                                                   │
-│        │                                                                         │
-│        ▼                                                                         │
-│   [1, 128, 205]                                                                  │
-│        │                                                                         │
-│        ├──┬──────────────────────────────────────────────────┬──┐                │
-│        │  │                                                  │  │                │
-│        │  ▼                                                  ▼  ▼                │
-│        │ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │  │                │
-│        │ │ ResBlock    │  │ ResBlock    │  │ ResBlock    │  │  │                │
-│        │ │ kernel=3    │  │ kernel=7    │  │ kernel=11   │  │  │                │
-│        │ │ dil=1,3,5   │  │ dil=1,3,5   │  │ dil=1,3,5   │  │  │                │
-│        │ │             │  │             │  │             │  │  │                │
-│        │ │ catch FAST  │  │ catch MID   │  │ catch SLOW  │  │  │                │
-│        │ │ transients  │  │ timbre      │  │ pitch       │  │  │                │
-│        │ │ [128,205]   │  │ [128,205]   │  │ [128,205]   │  │  │                │
-│        │ └─────────────┘  └─────────────┘  └─────────────┘  │  │                │
-│        │         │                │                │         │  │                │
-│        │         └────────────────┴────────────────┘         │  │                │
-│        │                      SUM (add together)             │  │                │
-│        │                           │                         │  │                │
-│        └───────────────────────────┘                         │  │                │
-│                                    ▼                         │  │                │
-│                             [1, 128, 205]                    │  │                │
-└─────────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 128, 205]
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  MRF BLOCK 2  — upsample ×5, channels: 128→64                                   │
-│  ConvTranspose1d(128→64, stride=5, kernel=10)                                   │
-│  3×ResBlock(3,7,11) → SUM                                                       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 64, 1025]        ← 205 × 5 = 1025
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  MRF BLOCK 3  — upsample ×4, channels: 64→32                                    │
-│  ConvTranspose1d(64→32, stride=4, kernel=8)                                     │
-│  3×ResBlock(3,7,11) → SUM                                                       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 32, 4100]        ← 1025 × 4 = 4100
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  MRF BLOCK 4  — upsample ×2, channels: 32→16                                    │
-│  ConvTranspose1d(32→16, stride=2, kernel=4)                                     │
-│  3×ResBlock(3,7,11) → SUM                                                       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 16, 8200]        ← 4100 × 2 = 8200  (also 41 × 200)
-     │
-     ▼
-┌─────────────────────────────────────────────────────┐
-│  POST-CONV                                          │
-│  Conv1d(16 → 1, kernel=7, padding=3)                │
-│  No activation (learned amplitude)                  │
-└─────────────────────────────────────────────────────┘
-     │
-     ▼
-[1, 1, 8200]         ← AUDIO WAVEFORM 🎵
-```
-
-**Shape evolution table:**
-
-| Stage | Operation | Shape In | Shape Out | Time dim |
-|-------|-----------|----------|-----------|----------|
-| Pre | Conv1d | `[1, 64, 41]` | `[1, 256, 41]` | 41 |
-| MRF1 | ConvTranspose + 3×ResBlock | `[1, 256, 41]` | `[1, 128, 205]` | 41×5 |
-| MRF2 | ConvTranspose + 3×ResBlock | `[1, 128, 205]` | `[1, 64, 1025]` | 205×5 |
-| MRF3 | ConvTranspose + 3×ResBlock | `[1, 64, 1025]` | `[1, 32, 4100]` | 1025×4 |
-| MRF4 | ConvTranspose + 3×ResBlock | `[1, 32, 4100]` | `[1, 16, 8200]` | 4100×2 |
-| Post | Conv1d | `[1, 16, 8200]` | `[1, 1, 8200]` | 8200 |
-
----
-
-### Zoom: Inside One ResBlock
-
-```
-Input x  ───────────────────────────┐
-  [128, 205]                        │
-                                    │   ← residual / skip connection
-                                    │
-     x → LeakyReLU(0.1) ────────────┤
-                │                   │
-                ▼                   │
-        Conv1d(128→128, k=3,       │
-                dilation=1,         │
-                padding=1)          │
-                │                   │
-                ▼                   │
-           LeakyReLU(0.1) ──────────┤
-                │                   │
-                ▼                   │
-        Conv1d(128→128, k=3,       │
-                dilation=3,         │
-                padding=3)          │
-                │                   │
-                ▼                   │
-           LeakyReLU(0.1) ──────────┤
-                │                   │
-                ▼                   │
-        Conv1d(128→128, k=3,       │
-                dilation=5,         │
-                padding=5)          │
-                │                   │
-                ▼                   │
-              output                │
-                │                   │
-                └──────────(+)──────┘   ← x + output (element-wise)
-                            │
-                            ▼
-                         new x
-                         [128, 205]
-```
-
-**Each ResBlock repeats this 3 times** (for dilations 1, 3, 5). The residual connection means if the convolutions output garbage, the original signal is still preserved.
-
----
-
-### Discriminator — "Is this audio real?"
-
-Your code uses **MPD only** (5 period discriminators). Here's how ONE works:
-
-#### Period Discriminator (period = 5)
-
-```
-[1, 1, 8200]         ← waveform
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  FOLD into 2D grid at period=5                                              │
-│                                                                             │
-│  Pad to multiple of 5: 8200 already divisible                               │
-│                                                                             │
-│  Reshape: [1, 1, 8200] → [1, 1, 5, 1640]    (5 rows, 1640 columns)        │
-│  Permute: [1, 5, 1, 1640]                                                   │
-│  View:    [5, 1, 1, 1640]    ← batch now 5!                               │
-│                                                                             │
-│  Visual: samples [1,2,3,4,5,6,7,8...] folded into grid:                   │
-│     row 0:  1, 6, 11, 16...   ← every 5th, offset 0                        │
-│     row 1:  2, 7, 12, 17...   ← every 5th, offset 1                        │
-│     row 2:  3, 8, 13, 18...                                                │
-│     row 3:  4, 9, 14, 19...                                                │
-│     row 4:  5, 10, 15, 20...                                               │
-│                                                                             │
-│  A 4.4kHz tone (period ≈ 5 samples) becomes a VERTICAL stripe              │
-│  that 2D convolution detects instantly!                                     │
-└────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[5, 1, 1, 1640]      ← B=5, C=1, H=1, W=1640
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 1                                                                    │
-│  Conv2d(1 → 16, kernel=(5,5), stride=(3,3), padding=(2,2))                  │
-│  LeakyReLU(0.1)                                                             │
-└────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[5, 16, 1, 547]      ← H stays 1, W ≈ 1640/3
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 2                                                                    │
-│  Conv2d(16 → 64, kernel=(5,5), stride=(3,3), padding=(2,2))                 │
-│  LeakyReLU(0.1)                                                             │
-└────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[5, 64, 1, 183]
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 3                                                                    │
-│  Conv2d(64 → 128, kernel=(5,5), stride=(3,3), padding=(2,2))                │
-│  LeakyReLU(0.1)                                                             │
-└────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[5, 128, 1, 61]
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  POST-CONV                                                                  │
-│  Conv2d(128 → 1, kernel=(3,1), padding=(1,0))                               │
-└────────────────────────────────────────────────────────────────────────────┘
-     │
-     ▼
-[5, 1, 1, 61]
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│  UNFOLD back: [5, 1, 1, 61] → [1, 5, 61]                                   │
-│                                                                             │
-│  Score: [1, 5, 61]  ← each value = "how real is this chunk?"               │
-│  (higher = discriminator thinks it's real)                                  │
-│                                                                             │
-│  Features saved at every layer for feature-matching loss!                   │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Full Multi-Period Discriminator (all 5 periods)
-
-```
-                         [1, 1, 8200]  waveform
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-        ▼                     ▼                     ▼
-  ┌──────────┐          ┌──────────┐          ┌──────────┐
-  │ Period=2 │          │ Period=3 │          │ Period=5 │
-  │(11kHz)   │          │(7.35kHz) │          │(4.4kHz)  │
-  │ Conv2d×3 │          │ Conv2d×3 │          │ Conv2d×3 │
-  │ score[]  │          │ score[]  │          │ score[]  │
-  │ feats[]  │          │ feats[]  │          │ feats[]  │
-  └────┬─────┘          └────┬─────┘          └────┬─────┘
-       │                     │                     │
-       ▼                     ▼                     ▼
-  ┌──────────┐          ┌──────────┐
-  │ Period=7 │          │ Period=11│
-  │(3.15kHz) │          │(2.0kHz)  │
-  │ Conv2d×3 │          │ Conv2d×3 │
-  │ score[]  │          │ score[]  │
-  │ feats[]  │          │ feats[]  │
-  └────┬─────┘          └────┬─────┘
-       │                     │
-       └─────────────────────┘
-                │
-       ┌────────┴────────┐
-       ▼                 ▼
-  all_scores (5)     all_features (5 groups)
-       │                 │
-       ▼                 ▼
-   adversarial loss    feature matching loss
-   (G wants HIGH)      (match real vs fake layers)
-```
-
----
-
-### Training Flow — One Batch Step
-
-```
-BATCH: real_audio = [8, 1, 16384]   ← 8 clips, 0.74s each
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP A: Generate fake audio                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-  real_audio [8,1,16384]
-       │
-       ▼
-  compute_mel()
-       │
-       ▼
-  real_mel [8, 64, 82]    ← 16384 / 200 = ~82 frames
-       │
-       ▼
-  ┌─────────────┐
-  │  GENERATOR  │
-  │  (mel →     │
-  │   waveform) │
-  └─────────────┘
-       │
-       ▼
-  fake_audio [8, 1, 16384]
-
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP B: Train DISCRIMINATOR (freeze generator)                             │
-│  Goal: D(real) = HIGH, D(fake) = LOW                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-  real_audio ─────────┐
-                      ▼
-              ┌───────────────┐
-              │     D_MPD     │
-              │  (5 periods)  │
-              └───────┬───────┘
-                      │
-              real_scores (HIGH ✓)
-              real_features (saved)
-
-  fake_audio ─────────┐
-                      ▼
-              ┌───────────────┐
-              │     D_MPD     │
-              │  (detached —  │
-              │   no gradient │
-              │   to G)       │
-              └───────┬───────┘
-                      │
-              fake_scores (LOW ✓)
-
-  d_loss = hinge_loss(real_scores, fake_scores)
-  d_loss.backward()
-  optimizer_d.step()
-
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP C: Train GENERATOR (discriminator now provides gradients)             │
-│  Goal: fool D + match mel + match features                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-  fake_audio ─────────┐
-                      ▼
-              ┌───────────────┐
-              │     D_MPD     │
-              │  (NOT detached│
-              │   — gradient  │
-              │   flows to G) │
-              └───────┬───────┘
-                      │
-              fake_scores (G wants HIGH)
-              fake_features
-
-  ┌─────────────────────────────────────────────────────────────────────────┐
-│  COMPUTE 3 LOSSES                                                        │
-│                                                                          │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
-│  │  L_mel      │    │  L_fm       │    │  L_adv      │                  │
-│  │  (weight 45)│    │  (weight 2) │    │  (weight 1) │                  │
-│  │             │    │             │    │             │                  │
-│  │ mel(fake)   │    │ compare     │    │ -mean(fake  │                  │
-│  │ vs          │    │ D's internal│    │ _scores)    │                  │
-│  │ mel(real)   │    │ layers      │    │             │                  │
-│  │ L1 loss     │    │ L1 loss     │    │             │                  │
-│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                  │
-│         │                  │                  │                          │
-│         └──────────────────┼──────────────────┘                          │
-│                            ▼                                             │
-│         g_loss = 45×L_mel + 2×L_fm + 1×L_adv                             │
-│                            │                                             │
-│                            ▼                                             │
-│                    g_loss.backward()                                     │
-│                    optimizer_g.step()                                    │
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  What each loss does:                                               │  │
-│  │                                                                     │  │
-│  │  L_mel (45×):  "Match THIS spectrogram!" ← CONTENT (dog, not cat) │  │
-│  │  L_fm  (2×):   "Look natural inside D's brain" ← REALISM          │  │
-│  │  L_adv (1×):   "Fool D into saying real" ← POLISH                 │  │
-│  └────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### The Alternating Dance
-
-```
-Epoch 1, Batch 0:
-  G: terrible fake  ──▶  D: easily catches it  ──▶  G improves slightly
-Epoch 1, Batch 50:
-  G: okay fake      ──▶  D: still catches it    ──▶  G improves more
-Epoch 5, Batch 0:
-  G: good fake      ──▶  D: struggles           ──▶  D improves
-Epoch 10, Batch 0:
-  G: great fake     ──▶  D: barely catches it   ──▶  both improve
-...
-Epoch 30:
-  G: perfect fake   ──▶  D: coin flip (50/50)   ──▶  Nash equilibrium ✓
-```
-
-At equilibrium, the discriminator outputs scores near zero for both real and fake — it genuinely can't tell the difference. That's when your generator produces audio indistinguishable from real recordings.
-
----
-
-## References
-
-- **Kong, Kim, Bae (2020):** "HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis" — [Paper](https://arxiv.org/abs/2010.05646)
-- **Original repo:** [jik876/hifi-gan](https://github.com/jik876/hifi-gan)
-- **Kazuki's explanation:** [Understanding HiFi-GAN](https://kazemnejad.com/blog/2024-03-19-hifi-gan/)
-- **GAN basics:** [Ian Goodfellow's original paper (2014)](https://arxiv.org/abs/1406.2661)
-- **Feature matching:** [Salimans et al. (2016)](https://arxiv.org/abs/1606.03498)
+*Updated 2026-05-11. Refer to actual source code for exact line numbers as files may change.*
