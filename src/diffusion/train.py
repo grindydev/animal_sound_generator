@@ -71,7 +71,7 @@ CONFIG = {
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 8,
+        "batch_size": 1,
         "num_workers": 0,
     },
 }

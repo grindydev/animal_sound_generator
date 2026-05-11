@@ -25,7 +25,7 @@ class DiffusionConfig:
 
     # ── U-Net ────────────────────────────────────────────
     base_channels: int = 64               # channels at first level
-    channel_multipliers: tuple = (1, 2, 4, 4)  # [64, 128, 256, 256]
+    channel_multipliers: tuple = (1, 2, 3, 3)  # [64, 128, 192, 192]
     res_blocks_per_level: int = 2
     attention_levels: tuple = (2, 3)      # apply self-attention at levels 2 and 3
     time_emb_dim: int = 256               # sinusoidal time embedding size
