@@ -253,12 +253,14 @@ class DiffusionDataset(Dataset):
         # Compute mel on the smart-cropped segment
         mel = compute_mel(wav)  # [1, 64, ~segment_frames]
 
-        # Trim/pad to exact segment_frames
+        # Trim/pad to exact segment_frames (mel is 3D: [1, 64, T] = [ch, freq, time])
         T = mel.shape[-1]
         if T > self.segment_frames:
-            mel = mel[:, :, :self.segment_frames]
+            mel = mel[..., :self.segment_frames]
         elif T < self.segment_frames:
-            pad = torch.zeros(1, 64, self.segment_frames - T)
+            pad_shape = list(mel.shape)
+            pad_shape[-1] = self.segment_frames - T
+            pad = torch.zeros(pad_shape)
             mel = torch.cat([mel, pad], dim=-1)
 
         # VAE mix-in: randomly replace real mel with VAE reconstruction
@@ -266,13 +268,15 @@ class DiffusionDataset(Dataset):
             if np.random.random() < self.vae_mix_ratio:
                 vae_device = next(self.vae_model.parameters()).device
                 label_tensor = torch.tensor([label], dtype=torch.long, device=vae_device)
+                # VAE expects [B=1, C=1, H=64, W=T] — add channel dim
+                vae_input = mel.unsqueeze(1).to(vae_device)  # [1, 1, 64, T]
                 with torch.no_grad():
-                    vae_recon, _, _ = self.vae_model(mel.unsqueeze(0).to(vae_device), label_tensor)
-                    # vae_recon: [1, 1, 64, T] — interpolate to match exact segment_frames
+                    vae_recon, _, _ = self.vae_model(vae_input, label_tensor)
+                    # vae_recon: [1, 1, 64, T] — remove channel dim back to dataset format
                     vae_recon = torch.nn.functional.interpolate(
                         vae_recon, size=(64, self.segment_frames), mode='bilinear'
                     )
-                    mel = vae_recon.squeeze(0).cpu()  # [1, 64, segment_frames]
+                    mel = vae_recon[:, 0, :, :].cpu()  # [1, 64, segment_frames]
 
         return mel, torch.tensor(label, dtype=torch.long)
 
@@ -290,7 +294,10 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     """
     Compute normalized mel spectrogram matching VAE training format.
     Uses the same params as data_loader.py and hifigan/config.py.
-    Returns [1, n_mels, time_frames].
+
+    MelSpectrogram on [time] returns [1, n_mels, time] (includes batch dim).
+    We add unsqueeze(0) → [1, 1, n_mels, time] so after DataLoader collation:
+    [B, 1, n_mels, T] = [B, spec_channels, n_mels, segment_frames] — U-Net expects this.
     """
     from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
@@ -309,8 +316,10 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     mel_tfm = _mel_tfm_cache[d]
     db_tfm = _db_tfm_cache[d]
 
-    spec = mel_tfm(audio.squeeze(1))  # [n_mels, time_frames]
-    mel = (db_tfm(spec) - norm_mean) / norm_std
+    # audio is [1, samples] — squeeze batch dim for MelSpectrogram (expects 1D [time])
+    spec = mel_tfm(audio.squeeze(0))  # [n_mels, time_frames]
+    mel = (db_tfm(spec) - norm_mean) / norm_std  # [n_mels, time_frames]
+    # Return [1, n_mels, time_frames] — DataLoader collates to [B, 1, n_mels, T] for U-Net
     return mel.unsqueeze(0)  # [1, n_mels, time_frames]
 
 
@@ -454,7 +463,7 @@ def training_loop():
     print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M)")
     print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
     print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
-    print(f"   VAE mix-in ratio: {vae_mix_ratio*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")
+    print(f"   VAE mix-in ratio: {CONFIG.get('vae_mix_ratio', 0)*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")
     print(f"   Best model → {BEST_MODEL_PATH}")
 
     # ═════════════════════════════════════════════════════════
