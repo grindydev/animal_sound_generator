@@ -1,14 +1,12 @@
 # Phase 7b — Diffusion Refinement
 
-> **What it does:** A small U-Net sharpens VAE-generated blurry spectrograms before HiFi-GAN converts them to audio.
+> **One doc to learn from. You understand this, you can rebuild diffusion for any project.**
 
 ---
 
 ## 1. The Problem
 
-Your VAE generates mel spectrograms, but they're blurry — VAEs average over possibilities, so edges get smoothed out. HiFi-GAN converts whatever mel you give it, blur included.
-
-Diffusion is a **refiner**: it takes the blurry VAE output and sharpens it.
+VAE generates blurry spectrograms — it averages over possibilities, so edges get smoothed out. HiFi-GAN converts whatever mel you give it, blur included. Diffusion is the sharpener.
 
 ```
 "dog" → VAE → blurry mel → Diffusion → sharp mel → HiFi-GAN → crisp audio ✨
@@ -16,179 +14,317 @@ Diffusion is a **refiner**: it takes the blurry VAE output and sharpens it.
 
 ---
 
-## 2. How Diffusion Works (Two Processes)
+## 2. The Two Processes
 
 ### Training: Add noise, learn to remove it
 
-Take a real spectrogram. Add random noise. Ask the U-Net: "where's the noise?" Grade the answer. Repeat millions of times.
+Take a spectrogram. Add random noise. Ask U-Net: "where's the noise?" Grade the answer. Repeat.
+
+**70% of training data is real mels, 30% is VAE-reconstructed mels.** This teaches the model what VAE-quality data looks like — so at inference, when it receives an actual VAE output, it's not surprised by the blurriness.
 
 ```
-Real mel (clean) + noise → Noisy mel
-                              ↓
-                         U-Net guesses noise
-                              ↓
-                      Compare guess to real noise
-                              ↓
-                        Adjust model weights
+Real mel or VAE-reconstructed mel → add noise → U-Net guesses → compare → adjust
 ```
 
 ### Inference: Start noisy, clean it up
 
-Start with the VAE output + some noise added. Run the U-Net repeatedly, each time removing a little predicted noise. After ~50 steps, you get a sharp spectrogram.
+Take VAE output + some noise. Run U-Net ~50 times, each time removing a little predicted noise. Result: sharp spectrogram. This is "img2img" — start from an existing image, refine it.
 
 ```
-VAE mel + noise → [U-Net cleans a bit] → [U-Net cleans more] → ... → sharp mel
+VAE mel + noise → [clean a bit] → [clean more] → ... → sharp mel
 ```
 
 ---
 
-## 3. The Critical Thing: Why t Matters
+## 3. Why t Is Essential
 
-Here's the problem. The U-Net receives a noisy spectrogram and must predict what noise was added. But:
+The U-Net receives a noisy spectrogram and must predict what noise was added. **But the same noisy result can come from different situations:**
 
-- A clean sound + heavy noise (t=900) can look **identical** to
-- An already-noisy sound + light noise (t=100)
+- Clean sound + heavy noise (t=900)
+- Already-noisy sound + light noise (t=100)
 
-Same input, different correct answer. **The U-Net can't know which case it is just by looking.**
+Both look identical. The model can't know which case it is just by looking.
 
-**t solves this.** t is a number (0 to 999) saying "I added noise to level 347 out of 1000." Now the model knows exactly how much noise to predict.
+**t solves this.** t is a number (0–999) saying exactly how much noise was added:
 
 ```
 Without t:  U-Net sees noisy image → has to guess → often wrong
-With t:     U-Net sees noisy image + "t=347" → predicts 35% noise → correct
+With t:     U-Net sees noisy image + "t=347" → "ah, 35% noise" → correct
 ```
+
+t also tells the model the **strategy** to use:
+
+| t | Noise level | Strategy |
+|---|------------|----------|
+| 0–100 | ~clean | "Almost everything is signal. Predict tiny noise." |
+| 400–600 | half-half | "Hardest case. Must separate signal from noise carefully." |
+| 900–999 | pure noise | "Almost everything is noise. Just output what I see." |
 
 ---
 
-## 4. How t Works Inside the Model (Code Trace)
+## 4. How t Works Inside the Model
 
-### Step 1: t is just an integer
+### Step 1: Pick t (training)
 
 ```python
-# train.py, inside train_epoch():
-t = torch.randint(0, 1000, (B,))   # e.g., [347, 891, 12]
+# train.py, train_epoch():
+t = torch.randint(0, 1000, (B,))   # e.g., [347, 891, 12]  — shape [B]
 ```
 
-### Step 2: t gets converted to a rich pattern (Clock Hands)
+### Step 2: t → clock hands → rich vector
 
 ```python
 # unet.py, SinusoidalTimeEmbedding.forward():
 # t = [347]
-# → 128 "clock hands" spin to positions based on 347
-# → sin + cos = 256 numbers
-# → small neural network = 1024 numbers
+# → 128 clock hands spin to different positions based on t
+# → sin + cos = 256 numbers (128 hands × 2 coordinates)
+# → MLP (256 → 1024 → 1024)
 t_emb = self.time_embed(t)     # [B] → [B, 1024]
 ```
 
-### Step 3: t never touches the spectrogram directly
+Why 128 hands at different speeds? Fast hands encode "exact step number." Slow hands encode "early, middle, or late." Together they form a unique fingerprint for every t. Same idea as Transformer positional encoding.
 
-t goes through a **separate path** and becomes **knobs** inside every ResBlock:
+### Step 3: t becomes knobs inside every ResBlock (FiLM)
+
+t never touches the spectrogram pixels. Instead, it controls **how** features get processed:
 
 ```python
 # unet.py, ResBlock.forward():
-h = self.conv1(x)                        # process the spectrogram features
+h = self.conv1(x)                    # process spectrogram features
 
-t_knobs = self.time_mlp(t_emb)           # [B, 1024] → [B, channels*2]
-t_scale, t_shift = t_knobs.chunk(2)      # one volume knob + one bias per channel
+t_knobs = self.time_mlp(t_emb)       # [B, 1024] → [B, out_ch*2]
+scale, shift = t_knobs.chunk(2)      # one volume + one bias per channel
 
-h = h * (1 + t_scale) + t_shift          # ← t touches features HERE
-
-# t=10:   knobs near zero → "pass through, tiny noise to predict"
-# t=500:  knobs at medium → "moderate transformation"
-# t=999:  knobs cranked up → "heavy noise to find"
+h = h * (1 + scale) + shift          # ← ONLY HERE does t touch features
 ```
 
-### Step 4: This happens in EVERY ResBlock
-
-The U-Net has ~20 ResBlocks. Every single one gets `t_emb` and produces its own knobs. Shallow layers might amplify edges, deep layers might suppress textures — each learns what's right for its level.
+This is **FiLM** (Feature-wise Linear Modulation): time → two numbers per channel → multiply and add.
 
 ```
-t_emb [B, 1024] ──┬──→ ResBlock 0: time_mlp(t_emb) → knobs
-                  ├──→ ResBlock 1: time_mlp(t_emb) → knobs  (different MLP!)
-                  ├──→ ResBlock 2: time_mlp(t_emb) → knobs
-                  ├──→ ...
-                  └──→ ResBlock N: time_mlp(t_emb) → knobs
+t=10:   scale ≈ 0,  shift ≈ 0    → "pass through, barely change anything"
+t=500:  scale ≈ 0.5, shift ≈ 0.2 → "moderate transformation"
+t=999:  scale ≈ 2.0, shift ≈ -0.5 → "aggressively transform to find noise"
 ```
 
-### Step 5: The model outputs a noise prediction
+### Step 4: Every ResBlock gets its own time MLP
+
+Each ResBlock has a **separate learned MLP** that converts the same `t_emb` into different knobs:
+
+```
+t_emb [B, 1024] ──┬──→ ResBlock 0: time_mlp_0(t_emb) → knobs for edge detection
+                  ├──→ ResBlock 1: time_mlp_1(t_emb) → knobs for texture analysis
+                  ├──→ ResBlock 2: time_mlp_2(t_emb) → knobs for coarse structure
+                  └──→ ...  (every block learns its own knob settings)
+```
+
+Shallow layers amplify fine edges. Deep layers suppress textures. Each layer learns what's useful at its resolution.
+
+---
+
+## 5. What the Model Actually Learns
+
+The model doesn't just randomly nudge weights. **It learns animal sound patterns** so it can separate signal from noise.
+
+```
+Input: x_t = 0.6 × real_mel + 0.8 × noise       (scrambled together)
+
+Internally, the model separates:
+
+    STRUCTURED SIGNAL              RANDOM NOISE
+    (dog bark pattern)             (just static)
+
+    ██░░░░██░░░░  ← harmonic       ░░░░░░░░░░░░░░
+    ██░░░░██░░░░  ← overtone       ░░░░░░░░░░░░░░
+    ░░████████░░  ← formant        ░░░░░░░░░░░░░░
+```
+
+After thousands of dog barks, weights encode: "Dog barks have harmonics here, formants here, burst every ~100ms..." When given `x_t`, the model thinks: "These structured bands match dog patterns → signal. This random fuzz → noise."
+
+The class embedding tells it **which** animal's patterns to look for:
+
+```
+Class = "Dog":   look for barking harmonics, 200–2000Hz formants
+Class = "Frog":  look for croaking patterns, different bands
+Class = "Crow":  look for cawing structure, different temporal pattern
+```
+
+---
+
+## 6. The U-Net Architecture
+
+### Why U-Net? Why not just encoder → flat → decoder like VAE?
+
+Different goals:
+
+```
+VAE:                          U-Net (Diffusion):
+  Goal: generate from code      Goal: edit existing pixels
+
+  Compress to vector            Keep spatial grid throughout
+  Decoder REMEMBERS patterns    Decoder DECIDES per pixel
+  No skips (building fresh)     Skips (preserving what's there)
+```
+
+**VAE decoder remembers:** "I have z=[1024] and I know what a dog looks like. Let me draw one from my stored knowledge."
+
+**U-Net decoder decides:** "Encoder found dog patterns. Skips have the raw pixels. I just need to say: this pixel is signal (keep), this pixel is noise (remove)."
+
+The encoder does the heavy lifting (pattern recognition). The decoder is lightweight — mostly combining and filtering. The time embedding provides the decision strategy.
+
+### The 5 Building Blocks (Reusable Pattern)
+
+```
+┌─────────────────────────────────────────────┐
+│  1. INPUT PROJECTION                        │
+│     Conv2d(1 → 64)                          │
+│                                             │
+│  2. ENCODER (4 levels)                      │
+│     ResBlock × 2 → Downsample → save skip   │  Shrink resolution, grow channels
+│                                             │
+│  3. BOTTLENECK                              │
+│     ResBlock × 2 + Self-Attention           │  Deepest, most abstract
+│                                             │
+│  4. DECODER (4 levels, reversed)            │
+│     Upsample → Concat skip → ResBlock × 2   │  Rebuild with saved detail
+│                                             │
+│  5. OUTPUT PROJECTION                       │
+│     GroupNorm → Conv2d(64 → 1)              │
+└─────────────────────────────────────────────┘
+```
+
+### Only 2 things are diffusion-specific:
+
+**Addition 1: Time conditioning (FiLM)** — 3 extra lines in each ResBlock
 
 ```python
-# unet.py, SpectrogramUNet.forward():
-t_emb = self.time_embed(t)          # [B] → [B, 1024]
-c_emb = self.class_embed(labels)    # [B] → [B, 64]  (animal type)
+# Standard ResBlock:
+def forward(self, x):
+    h = conv1(norm(x)); h = conv2(norm(h)); return x + h
 
-h = self.input_proj(x_t)            # [B, 1, 64, 552] → [B, 64, 64, 552]
-
-# Encoder: down + apply ResBlocks with t_emb
-# Bottleneck: apply ResBlocks with t_emb + self-attention
-# Decoder: up + skip connections + ResBlocks with t_emb
-
-return self.output_proj(h)          # [B, 64, 64, 552] → [B, 1, 64, 552]
+# Diffusion ResBlock:
+def forward(self, x, t_emb):
+    h = conv1(norm(x))
+    scale, shift = time_mlp(t_emb).chunk(2)   # ← time → knobs
+    h = h * (1 + scale) + shift               # ← apply
+    h = conv2(norm(h)); return x + h
 ```
 
-Output is the **same shape** as input — a grid of noise values, one per pixel.
+**Addition 2: Class conditioning** — same FiLM pattern from learned embedding. Optional (drop for unconditional generation).
 
----
-
-## 5. The Full Training Picture
+### To rebuild for any project:
 
 ```
-For each batch:
-
-1. Take real spectrogram x₀   [B, 1, 64, 552]
-2. Pick random t              [B], e.g. [347, 12, 891]
-3. Add noise at that level    x_t = mix(x₀, noise, t)
-4. U-Net(x_t, t, class)       guesses noise
-5. Compare guess to real      loss = MSE(pred, real_noise)
-6. Update weights             model gets slightly better
-
-Repeat for 50 epochs × hundreds of batches.
-The model sees every t value thousands of times.
+Step 1: Build standard U-Net (encoder-decoder with skips)
+Step 2: Add FiLM in each ResBlock (time → MLP → scale+shift → apply)
+Step 3: Add optional conditioning (class, text) using same FiLM pattern
 ```
 
 ---
 
-## 6. Inference: How VAE Output Gets Sharpened
+## 7. Skip Connections — Two Reasons
+
+**Reason 1 (classic, what you learned): Gradient flow.** In deep networks, gradient shrinks at each layer. Skip gives gradient a direct highway back to early layers.
+
+**Reason 2 (U-Net specific): Detail preservation.** Downsampling throws away 93% of pixels. Without skips, the decoder must guess where edges were. With skips, it receives the original detail back:
+
+```
+Without skip:                          With skip:
+  [64×552] → compress → [8×69]          [64×552] → compress → [8×69]
+  [8×69] → stretch → [64×552]           [8×69] + [saved 64×552] → [64×552]
+  "Where was that edge again?"          "Here's the exact edge. Keep or remove?"
+  → blurry                              → sharp
+```
+
+---
+
+## 8. Bottleneck + Self-Attention
+
+**Bottleneck:** The deepest, most compressed layer. At [8×69], each cell represents an 8×8 region of the original spectrogram. Most abstract understanding — "this region contains a dog bark harmonic."
+
+**Self-attention:** Every cell talks to every other cell. "The 500Hz harmonic at position (3,40) should relate to the 1000Hz overtone at (6,40)."
+
+Only at the bottleneck because it's O(N²) — expensive at high resolution, but at [8×69] it's only 552 positions → 304K pairs → cheap and most useful (long-range relationships matter here).
+
+Without self-attention: each cell processes independently. With: cells share information globally.
+
+---
+
+## 9. Training
+
+### Dataset: 70% real + 30% VAE reconstructions
 
 ```python
-# inference.py, refine_spectrogram():
+# train.py, DiffusionDataset.__getitem__():
+mel = compute_mel(cropped_wav)           # real mel from audio
 
-# 1. Take VAE output, add partial noise
-strength = 0.6                    # how much to refine (0=no change, 1=full regen)
-start_t = 0.6 * 999 ≈ 599        # start from 60% noise level
-x = vae_mel * √0.4 + noise * √0.6
-
-# 2. Denoise in 50 steps
-for step in [599, 587, 575, ..., 12, 0]:
-    noise_guess = model(x, step, class_label)
-    x = remove_noise(x, step, noise_guess)
-
-# 3. Done: x is now a sharp spectrogram
+if random() < 0.3:                        # 30% of the time:
+    mel = vae_model(real_mel, label)      # replace with VAE reconstruction
 ```
 
----
+Why? If the model only sees perfect real mels during training, it panics at inference when VAE outputs are blurry. Mixing in VAE-quality data teaches it: "you'll get blurry inputs — that's normal, just sharpen them."
 
-## 7. Key Files
-
-| What | File | Key Class/Function |
-|------|------|-------------------|
-| Config | `src/diffusion/config.py` | `DiffusionConfig` |
-| U-Net model | `src/diffusion/unet.py` | `SpectrogramUNet` |
-| Time embedding | `src/diffusion/unet.py` | `SinusoidalTimeEmbedding` |
-| ResBlock + t injection | `src/diffusion/unet.py` | `ResBlock.forward()` |
-| Add/remove noise | `src/diffusion/diffusion.py` | `DiffusionProcess` |
-| Training loop | `src/diffusion/train.py` | `train_epoch()` |
-| Inference | `src/diffusion/inference.py` | `refine_spectrogram()` |
-
----
-
-## 8. Quick Config
+### Per-batch training loop
 
 ```python
-timesteps = 1000          # total noise levels
-inference_steps = 50      # DDIM steps (don't need all 1000)
-strength = 0.6            # how much refinement (recommended)
-time_emb_dim = 256        # size of time embedding
-base_channels = 64        # U-Net starting channels
-channel_multipliers = (1, 2, 3, 3)   # ~17.8M params
+# train.py, train_epoch():
+for mel, labels in train_loader:              # mel: [B, 1, 64, 552]
+    t = torch.randint(0, 1000, (B,))           # random t per sample
+    noise = torch.randn_like(mel)              # random noise
+    
+    x_t = diffusion.q_sample(mel, t, noise)    # x_t = √α·x₀ + √(1-α)·noise
+    pred_noise = model(x_t, t, labels)          # U-Net guesses noise
+    loss = MSE(pred_noise, noise)               # compare to real noise
+    
+    loss.backward()                             # compute gradients
+    optimizer.step()                            # nudge weights
 ```
+
+The model sees every t value thousands of times across epochs, on both real and VAE-quality data.
+
+---
+
+## 10. Key Files
+
+| File | Contains |
+|------|----------|
+| `src/diffusion/config.py` | All hyperparameters |
+| `src/diffusion/unet.py` | `SpectrogramUNet`, `ResBlock`, `SinusoidalTimeEmbedding`, `SelfAttention2D` |
+| `src/diffusion/diffusion.py` | `DiffusionProcess` — `q_sample()` (add noise), `p_sample()` (remove), DDIM |
+| `src/diffusion/train.py` | Dataset (with VAE mix-in), training loop, checkpointing |
+| `src/diffusion/inference.py` | `refine_spectrogram()`, `generate_refined()` |
+
+---
+
+## 11. Quick Config
+
+```python
+# config.py
+timesteps = 1000              # total noise levels
+time_emb_dim = 256            # time embedding size
+base_channels = 64            # U-Net starting channels
+channel_multipliers = (1, 2, 3, 3)   # encoder depths → ~17.8M params
+class_emb_dim = 64            # animal type embedding
+dropout = 0.1                 # regularization
+inference_steps = 50          # DDIM steps (don't need all 1000)
+
+# train.py CONFIG
+vae_mix_ratio = 0.3           # 30% VAE reconstructions in training
+```
+
+---
+
+## 12. Design Pattern Summary
+
+| Pattern | What It Does | Reusable For |
+|---------|-------------|--------------|
+| U-Net skeleton | Down-bottleneck-up with skips | Any pixel-level prediction |
+| FiLM conditioning | Time → scale+shift per channel in every block | Any conditional generation |
+| Sinusoidal embedding | Integer → multi-frequency fingerprints | Any time-step conditioning |
+| Skip connections | Bypass compression, preserve detail | Any encoder-decoder |
+| Self-attention at bottleneck | Long-range feature relationships | Any architecture with bottleneck |
+| EMA shadow model | Smoothed weights for inference | Any training loop |
+| VAE data mix-in | Train on target-domain data | Any refinement model |
+
+---
+
+*Built from code in `src/diffusion/`. Read this doc, then read the source — the concepts map 1:1.*

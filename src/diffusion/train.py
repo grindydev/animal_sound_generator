@@ -564,33 +564,34 @@ def training_loop():
     best_val = float("inf")
     BEST_PATH = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best.pth")
 
-    for epoch in range(start_epoch, NUM_EPOCHS):
-        t0 = time.time()
+    try:
+        for epoch in range(start_epoch, NUM_EPOCHS):
+            t0 = time.time()
 
-        avg_loss = train_epoch(model, diffusion, train_loader, optimizer, ema_model)
-        scheduler.step()
-        lr = scheduler.get_last_lr()[0]
+            avg_loss = train_epoch(model, diffusion, train_loader, optimizer, ema_model)
+            scheduler.step()
+            lr = scheduler.get_last_lr()[0]
 
-        val_loss = validate(model, diffusion, val_loader, ema_model)
+            val_loss = validate(model, diffusion, val_loader, ema_model)
 
-        dt = time.time() - t0
-        trend = "📉" if val_loss < best_val else "➡️"
-        print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
-              f"({dt:.0f}s) ── "
-              f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
+            dt = time.time() - t0
+            trend = "📉" if val_loss < best_val else "➡️"
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+                  f"({dt:.0f}s) ── "
+                  f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
 
-        # Save checkpoint
-        if (epoch + 1) % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS - 1:
+            # Save checkpoint EVERY epoch (safe for Ctrl+C resume)
             save_checkpoint(model, optimizer, epoch + 1, CHECKPOINT_DIR)
 
-        # Save best (using EMA weights — these are what you want at inference)
-        if val_loss < best_val:
-            best_val = val_loss
-            # Save timestamped best + overwrite latest best
-            best_epoch_path = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best_epoch{epoch+1:03d}.pth")
-            torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, best_epoch_path)
-            torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_PATH)
-            print(f"      💾 Best model saved → {best_epoch_path} (val={best_val:.4f})")
+            # Save best (using EMA weights — these are what you want at inference)
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch_path = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best_epoch{epoch+1:03d}.pth")
+                torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, best_epoch_path)
+                torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_PATH)
+                print(f"      💾 Best model saved → {best_epoch_path} (val={best_val:.4f})")
+    except KeyboardInterrupt:
+        print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 
     # Save final model (EMA weights)
     torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_MODEL_PATH)
