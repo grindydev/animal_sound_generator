@@ -174,8 +174,9 @@ class SelfAttention1D(nn.Module):
     Multi-head self-attention applied along the temporal (width) dimension.
     
     For bottleneck features [B, C, H, W]:
+      - Apply LayerNorm across channels first (stabilises training)
       - Reshape to [B*H, W, C] — each frequency row attends across time
-      - Apply multi-head attention
+      - Apply multi-head attention with logit clamping (prevents softmax overflow)
       - Reshape back to [B, C, H, W]
     
     This lets the model capture long-range temporal dependencies (e.g., 
@@ -188,6 +189,9 @@ class SelfAttention1D(nn.Module):
         self.head_dim = channels // num_heads
         assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
 
+        # Pre-normalization prevents inputs with extreme magnitudes
+        # from causing softmax overflow (exp(>89) → inf → NaN in downstream GroupNorm)
+        self.norm = nn.LayerNorm(channels)
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
 
@@ -196,6 +200,9 @@ class SelfAttention1D(nn.Module):
 
         # [B, C, H, W] → [B*H, W, C] — treat each frequency row independently across time
         x_flat = x.reshape(B * H, C, W).permute(0, 2, 1)  # [B*H, W, C]
+
+        # Pre-normalize to stabilise QK magnitudes
+        x_flat = self.norm(x_flat)
 
         # QKV projection using Linear-like operation on last dim
         qkv_weight = self.qkv.weight.squeeze(-1).squeeze(-1)  # [3C, C]
@@ -208,10 +215,14 @@ class SelfAttention1D(nn.Module):
         k = k.view(B * H, W, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B * H, W, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention with logit clamping
+        # clamp logits to [-50, 50]: exp(50) ≈ 5.2e21 fits in float32 (max 3.4e38),
+        # while exp(89) ≈ 4.5e38 already overflows.  Capping at 50 guarantees
+        # softmax never produces inf, regardless of input feature magnitude.
         scale = self.head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale  # [B*H, heads, W, W]
-        attn = F.softmax(attn, dim=-1)
+        attn_logits = (q @ k.transpose(-2, -1)) * scale  # [B*H, heads, W, W]
+        attn_logits = attn_logits.clamp(-50.0, 50.0)
+        attn = F.softmax(attn_logits, dim=-1)
         out = attn @ v  # [B*H, heads, W, head_dim]
 
         # Reshape back

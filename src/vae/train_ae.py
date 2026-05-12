@@ -5,17 +5,25 @@ Trains the ImprovedAutoencoder with skip connections, residual blocks, and atten
 Uses 80/20 train/val split (test data folded into train for +33% data).
 
 Features:
-  - Tqdm-style per-batch progress
+  - Clean tqdm per-batch progress (matches diffusion/train.py style)
   - Checkpoint resume (Ctrl+C → save → restart → continue)
 """
 import copy
 import os
 import sys
+import time
 import warnings
+
+# Prevent CUDA memory fragmentation OOMs — MUST be set before torch import
+# 149M-param model on 4GB VRAM: fragmentation between epochs causes
+# "Tried to allocate 280 MiB" even when free memory exists
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from torch import nn
 from torch import optim
 from torch.amp import autocast, GradScaler
+from tqdm import tqdm
 
 # Ensure project root and src/ are importable
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,7 +32,6 @@ sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 
 from data_loader import get_dataloaders, get_transformations
 from vae.autoencoder import ImprovedAutoencoder
-import helper_utils
 
 warnings.filterwarnings("ignore")
 
@@ -43,14 +50,14 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 8,       # smaller batch for bigger model (GTX 1650 4GB)
+        "batch_size": 2,       # 149M model + optimizer + activations ≈ 3.5GB peak
         "patience": 3,
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 8,
+        "batch_size": 2,       # 149M model on 4GB: batch=2 safe, batch=4 fragments
         "patience": 8,
         "num_workers": 4,
     }
@@ -139,7 +146,13 @@ def load_checkpoint(model, optimizer, scheduler):
         return 0
     path = os.path.join(CHECKPOINT_DIR, files[-1])
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model"])
+    # strict=False allows loading checkpoints from older model versions
+    # (new layers like LayerNorm in SelfAttention1D use default init)
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing:
+        print(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
+    if unexpected:
+        print(f"   ⚠️  Unexpected keys (ignored): {unexpected}")
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
@@ -156,18 +169,21 @@ eval_transform = eval_transform.to(device)
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
-                scaler, use_amp, pbar=None):
+                scaler, use_amp):
+    """Train one epoch. Returns average loss."""
     model.train()
     running_loss = 0.0
     nan_count = 0
 
-    for batch_idx, (waveforms, _) in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc="  Train", leave=False)
+
+    for waveforms, _ in pbar:
         waveforms = waveforms.to(device)
         spectrograms = train_tfm(waveforms)
 
-        # Safety: check for NaN in input
-        if torch.isnan(spectrograms).any():
-            print(f"⚠️  NaN in input spectrograms — skipping batch")
+        # Safety: check for NaN / inf in input
+        if torch.isnan(spectrograms).any() or torch.isinf(spectrograms).any():
+            print(f"\n⚠️  NaN/inf in input spectrograms — skipping batch")
             continue
 
         optimizer.zero_grad(set_to_none=True)
@@ -175,7 +191,7 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed = model(spectrograms)
-                reconstructed = torch.clamp(reconstructed, -10, 10)  # prevent explosion
+                reconstructed = torch.clamp(reconstructed, -10, 10)
                 loss = loss_fn(reconstructed, spectrograms)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -190,35 +206,39 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        if torch.isnan(loss):
+        if torch.isnan(loss) or torch.isinf(loss):
             nan_count += 1
             if nan_count <= 3:
-                print(f"⚠️  NaN loss at batch {batch_idx} — skipping")
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                tqdm.write(f"⚠️  NaN/inf loss (grad_norm={total_norm:.2f}) — skipping")
             continue
 
         running_loss += loss.item() * spectrograms.size(0)
-        if pbar:
-            pbar.update_batch(batch_idx + 1, postfix_dict={"mse": f"{loss.item():.4f}"})
+        pbar.set_postfix({"mse": f"{loss.item():.4f}"})
 
     if nan_count > 0:
-        print(f"⚠️  {nan_count} batches had NaN — model may be unstable, check LR")
+        tqdm.write(f"⚠️  {nan_count} batches had NaN — model may be unstable, check LR")
 
     return running_loss / max(len(train_loader.dataset), 1)
 
 
-def validate_epoch(model, val_loader, loss_fn, device, eval_tfm, pbar=None):
+def validate_epoch(model, val_loader, loss_fn, device, eval_tfm):
+    """Validate — returns average MSE loss."""
     model.eval()
     running_loss = 0.0
 
     with torch.no_grad():
-        for batch_idx, (waveforms, _) in enumerate(val_loader):
+        for waveforms, _ in val_loader:
             waveforms = waveforms.to(device)
             spectrograms = eval_tfm(waveforms)
             reconstructed = model(spectrograms)
             loss = loss_fn(reconstructed, spectrograms)
             running_loss += loss.item() * spectrograms.size(0)
-            if pbar:
-                pbar.update_batch(batch_idx + 1)
 
     return running_loss / len(val_loader.dataset)
 
@@ -237,33 +257,35 @@ def training_loop():
     best_epoch = 0
     patience_counter = 0
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*60}")
     print(f"🚀 AUTOENCODER V2 TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
-    print(f"{'='*70}\n")
+    print(f"{'='*60}\n")
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS):
-            train_pbar = helper_utils.NestedProgressBar(
-                total_epochs=NUM_EPOCHS, total_batches=len(train_loader), mode="train")
-            train_pbar.update_epoch(epoch + 1)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-            epoch_loss = train_epoch(model, train_loader, loss_function, optimizer, device,
-                                     train_transform, scaler, use_amp, pbar=train_pbar)
-            train_pbar.batch_bar.close()
+            t0 = time.time()
 
-            val_pbar = helper_utils.NestedProgressBar(
-                total_epochs=1, total_batches=len(val_loader), mode="eval")
-            epoch_val_loss = validate_epoch(model, val_loader, loss_function, device,
-                                            eval_transform, pbar=val_pbar)
-            val_pbar.close()
+            epoch_loss = train_epoch(model, train_loader, loss_function, optimizer,
+                                     device, train_transform, scaler, use_amp)
+            epoch_val_loss = validate_epoch(model, val_loader, loss_function,
+                                            device, eval_transform)
+            scheduler.step()
+
+            # Defragment GPU memory between epochs
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             current_lr = scheduler.get_last_lr()[0]
-            train_pbar.update_epoch(epoch + 1, postfix_dict={
-                "train_mse": f"{epoch_loss:.4f}", "val_mse": f"{epoch_val_loss:.4f}",
-                "lr": f"{current_lr:.6f}",
-            })
-            scheduler.step()
+            dt = time.time() - t0
+            trend = "📉" if epoch_val_loss < best_val_loss else "➡️"
+
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+                  f"({dt:.0f}s) ── "
+                  f"loss={epoch_loss:.4f} val={epoch_val_loss:.4f} {trend} lr={current_lr:.2e}")
 
             # Save checkpoint EVERY epoch (safe for Ctrl+C)
             save_checkpoint(model, optimizer, scheduler, epoch + 1)
@@ -277,13 +299,14 @@ def training_loop():
                     'latent_dim': LATENT_DIM, 'val_mse': best_val_loss,
                     'epoch': best_epoch, 'mode': MODE,
                 }, BEST_MODEL_PATH)
-                print(f"  → ✅ Best model (MSE={best_val_loss:.6f}, epoch {best_epoch})")
+                print(f"      💾 Best model saved (val_mse={best_val_loss:.6f})")
                 patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= PATIENCE:
-                    print(f"\n⏹️ Early stopping: {patience_counter} epochs no improvement")
+                    print(f"\n⏹️  Early stopping: {patience_counter} epochs no improvement")
                     break
+
     except KeyboardInterrupt:
         print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 

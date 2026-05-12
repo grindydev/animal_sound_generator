@@ -11,12 +11,17 @@ Strategy:
 import math
 import os
 import sys
+import time
 import warnings
 import torch
 from torch import nn
 from torch import optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
+from tqdm import tqdm
+
+# Prevent CUDA memory fragmentation OOMs
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Ensure project root and src/ are importable
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,7 +31,6 @@ sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 from data_loader import get_dataloaders, get_transformations
 from vae.model import ImprovedVAE
 from vae.autoencoder import ImprovedAutoencoder
-import helper_utils
 
 warnings.filterwarnings("ignore")
 
@@ -54,13 +58,13 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 8,       # smaller batch for bigger model
+        "batch_size": 2,       # 4GB VRAM safe
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 8,
+        "batch_size": 2,       # 4GB VRAM safe
         "num_workers": 4,
     }
 }
@@ -195,7 +199,9 @@ def load_checkpoint(model, optimizer, scheduler):
         return 0
     path = os.path.join(CHECKPOINT_DIR, files[-1])
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing:
+        tqdm.write(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
@@ -246,11 +252,15 @@ def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0,
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_tfm,
-                scaler, use_amp, beta, free_bits, classifier, class_loss_weight, pbar=None):
+                scaler, use_amp, beta, free_bits, classifier, class_loss_weight):
+    """Train one epoch. Returns (avg_loss, avg_recon, avg_kl)."""
     model.train()
     running_loss, running_recon, running_kl = 0.0, 0.0, 0.0
+    nan_count = 0
 
-    for batch_idx, (waveforms, labels) in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc="  Train", leave=False)
+
+    for waveforms, labels in pbar:
         waveforms = waveforms.to(device)
         labels = labels.to(device)
         spectrograms = train_tfm(waveforms)
@@ -280,29 +290,33 @@ def train_epoch(model, train_loader, optimizer, device, train_tfm,
             optimizer.step()
 
         if torch.isnan(loss):
+            nan_count += 1
             continue
 
         running_loss += loss.item() * spectrograms.size(0)
         running_recon += recon_val * spectrograms.size(0)
         running_kl += kl_val * spectrograms.size(0)
 
-        if pbar:
-            pbar.update_batch(batch_idx + 1, postfix_dict={
-                "loss": f"{loss.item():.4f}", "mse": f"{recon_val:.4f}",
-                "kl": f"{kl_val:.1f}", "β": f"{beta:.4f}",
-            })
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}", "mse": f"{recon_val:.4f}",
+            "kl": f"{kl_val:.1f}",
+        })
+
+    if nan_count > 0:
+        tqdm.write(f"⚠️  {nan_count} batches had NaN loss — skipping")
 
     n = len(train_loader.dataset)
     return running_loss / n, running_recon / n, running_kl / n
 
 
 def validate_epoch(model, val_loader, device, eval_tfm, beta, free_bits,
-                   classifier, class_loss_weight, pbar=None):
+                   classifier, class_loss_weight):
+    """Validate — returns (avg_loss, avg_recon, avg_kl, avg_cls)."""
     model.eval()
     running_loss, running_recon, running_kl, running_cls = 0.0, 0.0, 0.0, 0.0
 
     with torch.no_grad():
-        for batch_idx, (waveforms, labels) in enumerate(val_loader):
+        for waveforms, labels in val_loader:
             waveforms = waveforms.to(device)
             labels = labels.to(device)
             spectrograms = eval_tfm(waveforms)
@@ -316,9 +330,6 @@ def validate_epoch(model, val_loader, device, eval_tfm, beta, free_bits,
             running_recon += recon_val * spectrograms.size(0)
             running_kl += kl_val * spectrograms.size(0)
             running_cls += cls_val * spectrograms.size(0)
-
-            if pbar:
-                pbar.update_batch(batch_idx + 1)
 
     n = len(val_loader.dataset)
     return running_loss / n, running_recon / n, running_kl / n, running_cls / n
@@ -355,38 +366,41 @@ def training_loop():
         unfreeze_all(model)
         print(f"\n🔥 All layers unfrozen (resumed after warmup)")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*60}")
     print(f"🚀 VAE V2 FINE-TUNING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
-    print(f"{'='*70}\n")
+    print(f"{'='*60}\n")
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS):
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             # Unfreeze at end of warmup
             if epoch == WARMUP_EPOCHS:
                 unfreeze_all(model)
-                print(f"\n🔥 Unfrozen: all layers (full fine-tuning)\n")
+                tqdm.write("🔥 Unfrozen: all layers (full fine-tuning)\n")
 
             beta_val = get_beta(epoch)
-
-            train_pbar = helper_utils.NestedProgressBar(
-                total_epochs=NUM_EPOCHS, total_batches=len(train_loader), mode="train")
-            train_pbar.update_epoch(epoch + 1)
+            t0 = time.time()
 
             epoch_loss, epoch_recon, epoch_kl = train_epoch(
                 model, train_loader, optimizer, device, train_transform,
                 scaler, use_amp, beta_val, FREE_BITS,
-                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT, pbar=train_pbar)
-            train_pbar.batch_bar.close()
+                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT)
 
-            val_pbar = helper_utils.NestedProgressBar(
-                total_epochs=1, total_batches=len(val_loader), mode="eval")
             _, epoch_val_recon, epoch_val_kl, epoch_val_cls = validate_epoch(
                 model, val_loader, device, eval_transform, beta_val, FREE_BITS,
-                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT, pbar=val_pbar)
-            val_pbar.close()
+                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT)
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            if epoch >= WARMUP_EPOCHS:
+                scheduler.step()
 
             current_lr = optimizer.param_groups[0]['lr']
+            dt = time.time() - t0
 
             ramp_end = WARMUP_EPOCHS + RAMP_EPOCHS
             if epoch < WARMUP_EPOCHS:
@@ -396,20 +410,17 @@ def training_loop():
             else:
                 phase = "β fixed"
 
-            train_pbar.update_epoch(epoch + 1, postfix_dict={
-                "phase": phase,
-                "train": f"{epoch_loss:.4f}",
-                "val_mse": f"{epoch_val_recon:.4f}",
-                "kl": f"{epoch_val_kl:.1f}",
-                "β": f"{beta_val:.5f}",
-                "lr": f"{current_lr:.1e}",
-            })
-
-            if epoch >= WARMUP_EPOCHS:
-                scheduler.step()
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} ({dt:.0f}s) ── "
+                  f"loss={epoch_loss:.4f} val_mse={epoch_val_recon:.4f} "
+                  f"kl={epoch_val_kl:.1f} β={beta_val:.4f} "
+                  f"[{phase}] lr={current_lr:.2e}")
 
             # Save checkpoint EVERY epoch (safe for Ctrl+C)
             save_checkpoint(model, optimizer, scheduler, epoch + 1)
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
     except KeyboardInterrupt:
         print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 
