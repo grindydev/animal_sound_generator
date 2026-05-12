@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.vae.blocks import ResEncoderBlock
+from vae.blocks import ResEncoderBlock
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -74,22 +74,26 @@ class ImprovedAutoencoder(nn.Module):
     Decoder: Linear → 4 DecoderStages (512→256→128→64→32) → Conv → 1ch
     """
 
-    def __init__(self, latent_dim: int = 2048):
+    def __init__(self, latent_dim: int = 2048, base_channels: int = 32):
         super().__init__()
 
+        # Channel progression: base → 2*base → 4*base → 8*base
+        c1, c2, c3, c4 = base_channels, base_channels * 2, base_channels * 4, base_channels * 8
+        self.c4 = c4
+
         # ── Encoder ──────────────────────────────────────
-        self.enc1 = ResEncoderBlock(1, 64)
-        self.enc2 = ResEncoderBlock(64, 128)
-        self.enc3 = ResEncoderBlock(128, 256)
-        self.enc4 = ResEncoderBlock(256, 512)
+        self.enc1 = ResEncoderBlock(1, c1)
+        self.enc2 = ResEncoderBlock(c1, c2)
+        self.enc3 = ResEncoderBlock(c2, c3)
+        self.enc4 = ResEncoderBlock(c3, c4)
 
         # ── Bottleneck ───────────────────────────────────
-        # After 4 stride-2: 552→276→138→69→35 → [B, 512, 4, 35]
-        self.flat_dim = 512 * 4 * 35  # 71,680
+        # After 4 stride-2: 552→276→138→69→35 → [B, c4, 4, 35]
+        self.flat_dim = c4 * 4 * 35
 
         # Self-attention
-        from src.vae.blocks import SelfAttention1D
-        self.attn = SelfAttention1D(512, num_heads=4)
+        from vae.blocks import SelfAttention1D
+        self.attn = SelfAttention1D(c4, num_heads=4)
 
         self.fc_encode = nn.Linear(self.flat_dim, latent_dim)
         self.fc_decode = nn.Linear(latent_dim, self.flat_dim)
@@ -97,13 +101,13 @@ class ImprovedAutoencoder(nn.Module):
         # ── Decoder ──────────────────────────────────────
         # Levels: (in_ch, out_ch, enc_skip_ch)
         # enc_skip_ch matches the encoder output channels at the corresponding level
-        self.dec4 = DecoderStage(512, 256, 256)   # skip from enc3 (256ch)
-        self.dec3 = DecoderStage(256, 128, 128)   # skip from enc2 (128ch)
-        self.dec2 = DecoderStage(128, 64, 64)     # skip from enc1 (64ch)
-        self.dec1 = DecoderStage(64, 32, 0)       # no skip for last level
+        self.dec4 = DecoderStage(c4, c3, c3)   # skip from enc3
+        self.dec3 = DecoderStage(c3, c2, c2)   # skip from enc2
+        self.dec2 = DecoderStage(c2, c1, c1)   # skip from enc1
+        self.dec1 = DecoderStage(c1, base_channels // 2, 0)  # final level, no skip
 
         # Final output conv
-        self.output_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        self.output_conv = nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
 
         self._init_weights()
 
@@ -141,7 +145,7 @@ class ImprovedAutoencoder(nn.Module):
         B = z.shape[0]
 
         h = self.fc_decode(z)             # [B, 71680]
-        h = h.view(B, 512, 4, 35)         # [B, 512, 4, 35]
+        h = h.view(B, self.c4, 4, 35)         # [B, c4, 4, 35]
 
         h = self.dec4(h, skips[2])        # [B, 256, 8, 70]
         h = self.dec3(h, skips[1])        # [B, 128, 16, 140]

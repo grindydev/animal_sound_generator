@@ -1,8 +1,9 @@
 """
 src/vae/__init__.py — VAE Package
 
-Exports the improved autoencoder and VAE models.
+When imported from scripts that have src/ in sys.path, use relative imports.
+When used as a regular package, absolute imports work.
 """
-from .autoencoder import ImprovedAutoencoder, DecoderStage
-from .model import ImprovedVAE, FiLMDecoderStage
-from .blocks import ResEncoderBlock, ResDecoderBlock, SelfAttention1D, FiLM
+from vae.autoencoder import ImprovedAutoencoder, DecoderStage
+from vae.model import ImprovedVAE, FiLMDecoderStage
+from vae.blocks import ResEncoderBlock, ResDecoderBlock, SelfAttention1D, FiLM

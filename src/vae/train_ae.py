@@ -17,11 +17,13 @@ from torch import nn
 from torch import optim
 from torch.amp import autocast, GradScaler
 
-# Ensure src/ is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Ensure project root and src/ are importable
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _PROJECT_ROOT)
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 
 from data_loader import get_dataloaders, get_transformations
-from src.vae.autoencoder import ImprovedAutoencoder
+from vae.autoencoder import ImprovedAutoencoder
 import helper_utils
 
 warnings.filterwarnings("ignore")
@@ -34,7 +36,8 @@ CONFIG = {
     "val_fraction": 0.2,      # 20% val
     "lr": 1e-3,
     "weight_decay": 1e-3,
-    "latent_dim": 2048,       # 2× larger than v1
+    "latent_dim": 2048,
+    "base_channels": 32,       # 32→64→128→256 = 149M params, fits 4GB VRAM
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -106,7 +109,8 @@ train_loader, val_loader, test_loader, num_classes = get_dataloaders(
 print(f"✅ Data: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val / {len(test_loader.dataset)} test (unused)")
 
 # ==================== MODEL ====================
-model = ImprovedAutoencoder(latent_dim=LATENT_DIM)
+BASE_CH = CONFIG["base_channels"]
+model = ImprovedAutoencoder(latent_dim=LATENT_DIM, base_channels=BASE_CH)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"✅ Model: {n_params:,} params ({n_params/1e6:.1f}M)")
 

@@ -19,10 +19,11 @@ import torchaudio
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
 
-from src.vae import ImprovedVAE
-from src.diffusion.inference import refine_spectrogram
-from src.hifigan.inference import mel_to_waveform
+from vae import ImprovedVAE
+from diffusion.inference import refine_spectrogram
+from hifigan.inference import mel_to_waveform
 
 
 CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen', 'Noise']
@@ -31,10 +32,11 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
 def load_vae(device):
     """Load the finetuned VAE model."""
-    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128).to(device)
+    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=32).to(device)
     ckpt_path = "models/best_vae_finetune_train.pth"
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Load with strict=False in case checkpoint has different keys
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     print(f"✅ VAE loaded from {ckpt_path}")
     return model

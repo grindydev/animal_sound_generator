@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.vae.blocks import FiLM
+from vae.blocks import FiLM
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,18 +82,21 @@ class ImprovedVAE(nn.Module):
     Decoder: 4 FiLMDecoderStages (512→256→128→64→32) → Conv → 1ch
     """
 
-    def __init__(self, latent_dim: int = 2048, num_classes: int = 8, embed_dim: int = 128):
+    def __init__(self, latent_dim: int = 2048, num_classes: int = 8, embed_dim: int = 128,
+                 base_channels: int = 32):
         super().__init__()
+        c1, c2, c3, c4 = base_channels, base_channels * 2, base_channels * 4, base_channels * 8
+        self.c4 = c4  # store for decode methods
 
-        # ── Encoder (same as ImprovedAutoencoder) ────────
-        from src.vae.blocks import ResEncoderBlock, SelfAttention1D
-        self.enc1 = ResEncoderBlock(1, 64)
-        self.enc2 = ResEncoderBlock(64, 128)
-        self.enc3 = ResEncoderBlock(128, 256)
-        self.enc4 = ResEncoderBlock(256, 512)
+        # ── Encoder ──────────────────────────────────────
+        from vae.blocks import ResEncoderBlock, SelfAttention1D
+        self.enc1 = ResEncoderBlock(1, c1)
+        self.enc2 = ResEncoderBlock(c1, c2)
+        self.enc3 = ResEncoderBlock(c2, c3)
+        self.enc4 = ResEncoderBlock(c3, c4)
 
-        self.flat_dim = 512 * 4 * 35  # 71,680
-        self.attn = SelfAttention1D(512, num_heads=4)
+        self.flat_dim = c4 * 4 * 35
+        self.attn = SelfAttention1D(c4, num_heads=4)
 
         # ── VAE Bottleneck ───────────────────────────────
         self.fc_mu = nn.Linear(self.flat_dim, latent_dim)
@@ -105,13 +108,12 @@ class ImprovedVAE(nn.Module):
         # ── Decoder with FiLM ────────────────────────────
         self.fc_decode = nn.Linear(latent_dim, self.flat_dim)
 
-        # Encoder skip channels at each level: enc4=512, enc3=256, enc2=128, enc1=64
-        self.dec4 = FiLMDecoderStage(512, 256, 256, embed_dim)
-        self.dec3 = FiLMDecoderStage(256, 128, 128, embed_dim)
-        self.dec2 = FiLMDecoderStage(128, 64, 64, embed_dim)
-        self.dec1 = FiLMDecoderStage(64, 32, 0, embed_dim)
+        self.dec4 = FiLMDecoderStage(c4, c3, c3, embed_dim)
+        self.dec3 = FiLMDecoderStage(c3, c2, c2, embed_dim)
+        self.dec2 = FiLMDecoderStage(c2, c1, c1, embed_dim)
+        self.dec1 = FiLMDecoderStage(c1, base_channels // 2, 0, embed_dim)
 
-        self.output_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        self.output_conv = nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
 
         self._init_weights()
 
@@ -169,12 +171,12 @@ class ImprovedVAE(nn.Module):
         # At TRAINING time (forward pass), we DO have skips from the encoder.
 
         h = self.fc_decode(z)
-        h = h.view(B, 512, 4, 35)
+        h = h.view(B, self.c4, 4, 35)
 
-        h = self.dec4(h, class_emb)           # [B, 256, 8, 70]
-        h = self.dec3(h, class_emb)           # [B, 128, 16, 140]
-        h = self.dec2(h, class_emb)           # [B, 64, 32, 280]
-        h = self.dec1(h, class_emb)           # [B, 32, 64, 560]
+        h = self.dec4(h, class_emb)           # [B, c3, 8, 70]
+        h = self.dec3(h, class_emb)           # [B, c2, 16, 140]
+        h = self.dec2(h, class_emb)           # [B, c1, 32, 280]
+        h = self.dec1(h, class_emb)           # [B, c1/2, 64, 560]
 
         h = self.output_conv(h)
         h = F.interpolate(h, size=target_size, mode='bilinear')
@@ -184,11 +186,11 @@ class ImprovedVAE(nn.Module):
                           skips: list, target_size: tuple):
         """
         Decode WITH encoder skip connections (used during training/reconstruction).
-        skips = [s0 (64ch), s1 (128ch), s2 (256ch)]
+        skips = [s0 (c1ch), s1 (c2ch), s2 (c3ch)]
         """
         B = z.shape[0]
         h = self.fc_decode(z)
-        h = h.view(B, 512, 4, 35)
+        h = h.view(B, self.c4, 4, 35)
 
         h = self.dec4(h, class_emb, skips[2])   # enc3 skip (256ch)
         h = self.dec3(h, class_emb, skips[1])   # enc2 skip (128ch)

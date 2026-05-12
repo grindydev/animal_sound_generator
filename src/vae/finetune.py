@@ -18,12 +18,14 @@ from torch import optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
-# Ensure src/ is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Ensure project root and src/ are importable
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _PROJECT_ROOT)
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 
 from data_loader import get_dataloaders, get_transformations
-from src.vae.model import ImprovedVAE
-from src.vae.autoencoder import ImprovedAutoencoder
+from vae.model import ImprovedVAE
+from vae.autoencoder import ImprovedAutoencoder
 import helper_utils
 
 warnings.filterwarnings("ignore")
@@ -36,7 +38,8 @@ CONFIG = {
     "train_fraction": 0.8,     # 80% train (test folded in)
     "val_fraction": 0.2,
     "lr": 5e-4,                # lower LR for fine-tuning
-    "latent_dim": 2048,        # 2× larger
+    "latent_dim": 2048,
+    "base_channels": 32,       # must match autoencoder
     "embed_dim": 128,          # class embedding for FiLM (was 64)
     "beta": 0.01,              # target KL weight
     "free_bits": 0.1,          # prevent dead latent dims
@@ -122,7 +125,9 @@ train_loader, val_loader, test_loader, num_classes = get_dataloaders(
 print(f"✅ Data: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val")
 
 # ==================== MODEL ====================
-model = ImprovedVAE(latent_dim=LATENT_DIM, num_classes=num_classes, embed_dim=EMBED_DIM)
+BASE_CH = CONFIG["base_channels"]
+model = ImprovedVAE(latent_dim=LATENT_DIM, num_classes=num_classes, embed_dim=EMBED_DIM,
+                    base_channels=BASE_CH)
 
 # Load pretrained autoencoder weights
 if os.path.exists(AE_CHECKPOINT):
