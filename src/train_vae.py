@@ -82,13 +82,13 @@ CONFIG = {
     "lr_warmup_epochs": 3,               # LR ramps 0→target over N epochs
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
-    "beta": 0.002,                       # Target KL weight (after ramp, lower = more class distinct)
-    "beta_free_epochs": 8,               # Epochs with β=0 (MSE-only head start)
-    "beta_ramp_epochs": 17,              # β ramps over N epochs AFTER free epochs
+    "beta": 0.01,                        # Target KL weight (higher = better organized latent space)
+    "beta_free_epochs": 5,                # Epochs with β=0 (quick MSE head start)
+    "beta_ramp_epochs": 15,              # β ramps over N epochs AFTER free epochs
     "beta_schedule": "exponential",      # "exponential" or "linear"
     "beta_k": 3,                         # Curve steepness for exponential
-    "free_bits": 0.0,                    # Disabled — let KL flow freely with lower β
-    "class_loss_weight": 0.1,            # γ — weight for classification supervision loss
+    "free_bits": 0.1,                     # Prevent dead latent dimensions
+    "class_loss_weight": 0.5,            # γ — 5x stronger class supervision!
     "classifier_path": "models/best_audio_cnn_train.pth",  # Pretrained classifier for class loss
     "optimizer": "Adam",                 # "Adam" recommended for VAEs (not AdamW)
     "scheduler": "CosineAnnealingLR",

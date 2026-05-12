@@ -64,13 +64,11 @@ CONFIG = {
     "save_interval": cfg.save_interval,
     "log_interval": cfg.log_interval,
 
-    # ── VAE Mix-in (teaches diffusion to handle VAE-quality data) ──
+    # ── VAE Mix-in (teaches diffusion to handle VAE-generated data) ──
     "vae_checkpoint": "models/best_vae_finetune_train.pth",  # path to trained VAE
-    "vae_mix_ratio": 0.3,    # 30% VAE reconstructions, 70% real mels
-                              # 0.0 = original behavior (real-only) — DON'T USE
-                              # 0.3 = recommended starting point
-                              # 0.5 = balanced
-                              # 1.0 = VAE-only (if VAE output is good enough)
+    "vae_mix_ratio": 1.0,    # 100% VAE-generated — train ONLY on what inference sees
+                              # VAE output has low variance (std≈0.33 vs real≈0.70)
+                              # So keep strength ≤ 0.10 at inference for safe SNR > 2
 
     "test": {
         "num_epochs": 5,
@@ -263,20 +261,22 @@ class DiffusionDataset(Dataset):
             pad = torch.zeros(pad_shape)
             mel = torch.cat([mel, pad], dim=-1)
 
-        # VAE mix-in: randomly replace real mel with VAE reconstruction
+        # VAE mix-in: randomly replace real mel with VAE-GENERATED sample.
+        # Uses vae.sample() (generation) NOT vae.forward() (reconstruction) —
+        # this matches what the diffusion will see at inference time.
         if self.vae_model is not None and self.vae_mix_ratio > 0:
             if np.random.random() < self.vae_mix_ratio:
                 vae_device = next(self.vae_model.parameters()).device
-                label_tensor = torch.tensor([label], dtype=torch.long, device=vae_device)
-                # VAE expects [B=1, C=1, H=64, W=T] — add channel dim
-                vae_input = mel.unsqueeze(1).to(vae_device)  # [1, 1, 64, T]
                 with torch.no_grad():
-                    vae_recon, _, _ = self.vae_model(vae_input, label_tensor)
-                    # vae_recon: [1, 1, 64, T] — remove channel dim back to dataset format
-                    vae_recon = torch.nn.functional.interpolate(
-                        vae_recon, size=(64, self.segment_frames), mode='bilinear'
+                    # Generate from scratch (same as generate.py does at inference)
+                    vae_gen = self.vae_model.sample(
+                        label, num_samples=1, device=vae_device, temperature=0.7,
+                    )  # [1, 1, 64, T]
+                    # Remove channel dim to match dataset format [1, 64, T]
+                    vae_gen = torch.nn.functional.interpolate(
+                        vae_gen, size=(64, self.segment_frames), mode='bilinear'
                     )
-                    mel = vae_recon[:, 0, :, :].cpu()  # [1, 64, segment_frames]
+                    mel = vae_gen[:, 0, :, :].cpu()  # [1, 64, segment_frames]
 
         return mel, torch.tensor(label, dtype=torch.long)
 

@@ -52,12 +52,12 @@ CONFIG = {
     "lr": 1e-3,
     "latent_dim": 1024,
     "embed_dim": 64,                     # class embedding size
-    "beta": 0.002,                       # Target KL weight after warmup (lower = more class distinct)
-    "free_bits": 0.0,                    # Disabled — let KL flow freely with lower β
-    "warmup_epochs": 8,                  # Frozen encoder/decoder, β=0
-    "ramp_epochs": 17,                  # β exponential ramp (8+17=25, then 5 epochs full β)
+    "beta": 0.01,                        # Target KL weight (5x stronger = organized latent space)
+    "free_bits": 0.1,                     # Prevent dead latent dimensions
+    "warmup_epochs": 5,                   # Frozen encoder/decoder, β=0
+    "ramp_epochs": 15,                   # β exponential ramp (5+15=20, then 10 epochs full β)
     "beta_k": 3,                         # Curve steepness for exponential ramp
-    "class_loss_weight": 0.1,            # γ — weight for classification supervision loss
+    "class_loss_weight": 0.5,            # γ — 5x stronger class supervision!
     "classifier_path": "models/best_audio_cnn_train.pth",
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
@@ -69,7 +69,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 30,
+        "num_epochs": 40,
         "batch_size": 16,
         "num_workers": 4,
     }
