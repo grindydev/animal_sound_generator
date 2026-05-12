@@ -64,6 +64,14 @@ CONFIG = {
     "save_interval": cfg.save_interval,
     "log_interval": cfg.log_interval,
 
+    # ── VAE Mix-in (teaches diffusion to handle VAE-quality data) ──
+    "vae_checkpoint": "models/best_vae_finetune_train.pth",  # path to trained VAE
+    "vae_mix_ratio": 0.3,    # 30% VAE reconstructions, 70% real mels
+                              # 0.0 = original behavior (real-only) — DON'T USE
+                              # 0.3 = recommended starting point
+                              # 0.5 = balanced
+                              # 1.0 = VAE-only (if VAE output is good enough)
+
     "test": {
         "num_epochs": 5,
         "batch_size": 4,
@@ -119,8 +127,8 @@ else:
     device = torch.device(CONFIG["device"])
     is_cuda = (CONFIG["device"] == "cuda")
 
-use_amp = is_cuda
-scaler = torch.amp.GradScaler() if use_amp else None
+use_amp = is_cuda  # mixed precision only supported on CUDA
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,14 +174,29 @@ class DiffusionDataset(Dataset):
     """
     Loads audio files, computes mel spectrograms, pairs with class labels.
 
+    Supports mixed training: randomly returns VAE-reconstructed mels instead of
+    real mels, teaching the diffusion model to denoise VAE-quality data.
+
     Returns:
         mel: normalized mel spectrogram [1, 64, segment_frames]
         label: class index [1]
     """
 
-    def __init__(self, data_dir: str, segment_frames: int, split: str = "train"):
+    def __init__(self, data_dir: str, segment_frames: int, split: str = "train",
+                 vae_model=None, vae_mix_ratio: float = 0.0):
+        """
+        Args:
+            data_dir: path to animal_audio directory
+            segment_frames: number of mel time frames per sample
+            split: "train" or "val"
+            vae_model: trained SimpleAudioVAE instance (None = no VAE mixing)
+            vae_mix_ratio: fraction of samples to replace with VAE reconstructions
+                           (0.0 = all real, 0.3 = 30% VAE, 1.0 = all VAE)
+        """
         self.data_dir = data_dir
         self.segment_frames = segment_frames
+        self.vae_model = vae_model
+        self.vae_mix_ratio = vae_mix_ratio
         self.samples = []  # list of (path, class_idx)
 
         for cls_name in sorted(os.listdir(data_dir)):
@@ -238,6 +261,19 @@ class DiffusionDataset(Dataset):
             pad = torch.zeros(1, 64, self.segment_frames - T)
             mel = torch.cat([mel, pad], dim=-1)
 
+        # VAE mix-in: randomly replace real mel with VAE reconstruction
+        if self.vae_model is not None and self.vae_mix_ratio > 0:
+            if np.random.random() < self.vae_mix_ratio:
+                vae_device = next(self.vae_model.parameters()).device
+                label_tensor = torch.tensor([label], dtype=torch.long, device=vae_device)
+                with torch.no_grad():
+                    vae_recon, _, _ = self.vae_model(mel.unsqueeze(0).to(vae_device), label_tensor)
+                    # vae_recon: [1, 1, 64, T] — interpolate to match exact segment_frames
+                    vae_recon = torch.nn.functional.interpolate(
+                        vae_recon, size=(64, self.segment_frames), mode='bilinear'
+                    )
+                    mel = vae_recon.squeeze(0).cpu()  # [1, 64, segment_frames]
+
         return mel, torch.tensor(label, dtype=torch.long)
 
 
@@ -245,27 +281,37 @@ class DiffusionDataset(Dataset):
 #  MEL COMPUTATION (on-the-fly, matches data_loader.py format)
 # ═══════════════════════════════════════════════════════════════
 
+# Pre-create mel transform (cached per device for efficiency)
+_mel_tfm_cache = {}
+_db_tfm_cache = {}
+
+
 def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     """
     Compute normalized mel spectrogram matching VAE training format.
     Uses the same params as data_loader.py and hifigan/config.py.
+    Returns [1, n_mels, time_frames].
     """
     from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
-    # Use the norm stats from HiFi-GAN config (matches data_loader.py SimpleNormalize)
     norm_mean = -18.4903
     norm_std = 19.8031
-
     d = audio.device
-    mel_tfm = MelSpectrogram(
-        sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
-        hop_length=cfg.hop_length, win_length=cfg.n_fft,
-        n_mels=cfg.n_mels, f_min=cfg.f_min, f_max=cfg.f_max, power=2,
-    ).to(d)
 
-    db_tfm = AmplitudeToDB(stype='power', top_db=None).to(d)
-    spec = mel_tfm(audio.squeeze(1))
-    return (db_tfm(spec) - norm_mean) / norm_std
+    if d not in _mel_tfm_cache:
+        _mel_tfm_cache[d] = MelSpectrogram(
+            sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
+            hop_length=cfg.hop_length, win_length=cfg.n_fft,
+            n_mels=cfg.n_mels, f_min=cfg.f_min, f_max=cfg.f_max, power=2,
+        ).to(d)
+        _db_tfm_cache[d] = AmplitudeToDB(stype='power', top_db=80).to(d)
+
+    mel_tfm = _mel_tfm_cache[d]
+    db_tfm = _db_tfm_cache[d]
+
+    spec = mel_tfm(audio.squeeze(1))  # [n_mels, time_frames]
+    mel = (db_tfm(spec) - norm_mean) / norm_std
+    return mel.unsqueeze(0)  # [1, n_mels, time_frames]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -356,6 +402,12 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         optimizer.step()
         optimizer.zero_grad()
 
+        # Update EMA for leftover batches too
+        if ema_model is not None:
+            with torch.no_grad():
+                for ema_p, model_p in zip(ema_model.parameters(), model.parameters()):
+                    ema_p.data.mul_(EMA_DECAY).add_(model_p.data, alpha=1 - EMA_DECAY)
+
     return total_loss / len(train_loader)
 
 
@@ -402,15 +454,43 @@ def training_loop():
     print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M)")
     print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
     print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
+    print(f"   VAE mix-in ratio: {vae_mix_ratio*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")
     print(f"   Best model → {BEST_MODEL_PATH}")
 
     # ═════════════════════════════════════════════════════════
     #  DATA
     # ═════════════════════════════════════════════════════════
-    train_ds = DiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="train")
-    val_ds = DiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="val")
 
-    print(f"\n✅ Data loaded: {len(train_ds)} train / {len(val_ds)} val")
+    # Load VAE for mix-in training (teaches diffusion to handle VAE-quality data)
+    vae_mix_ratio = CONFIG.get("vae_mix_ratio", 0.0)
+    vae_model_for_dataset = None
+    if vae_mix_ratio > 0:
+        vae_ckpt_path = CONFIG.get("vae_checkpoint", "models/best_vae_finetune_train.pth")
+        if os.path.exists(vae_ckpt_path):
+            from src.vae import SimpleAudioVAE
+            vae_device_for_data = torch.device("cpu")  # VAE runs on CPU for dataset
+            vae_model_for_dataset = SimpleAudioVAE(latent_dim=1024, num_classes=8, embed_dim=64)
+            vae_model_for_dataset.load_state_dict(
+                torch.load(vae_ckpt_path, map_location=vae_device_for_data, weights_only=True)["model_state_dict"]
+            )
+            vae_model_for_dataset.eval()
+            for p in vae_model_for_dataset.parameters():
+                p.requires_grad_(False)
+            print(f"✅ VAE loaded for mix-in from: {vae_ckpt_path}")
+        else:
+            print(f"⚠️  VAE checkpoint not found at {vae_ckpt_path} — disabling VAE mix-in")
+            vae_mix_ratio = 0.0
+
+    train_ds = DiffusionDataset(
+        CONFIG["data_dir"], SEGMENT_FRAMES, split="train",
+        vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
+    )
+    val_ds = DiffusionDataset(
+        CONFIG["data_dir"], SEGMENT_FRAMES, split="val",
+        vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
+    )
+
+    print(f"\n✅ Data loaded: {len(train_ds)} train / {len(val_ds)} val | VAE mix-in: {vae_mix_ratio*100:.0f}%")
 
     pin_mem = NUM_WORKERS > 0 and is_cuda
     train_loader = DataLoader(
@@ -437,13 +517,13 @@ def training_loop():
     #  MODELS
     # ═════════════════════════════════════════════════════════
     model = model.to(device)
-    diffusion = DiffusionProcess(cfg)
+    diffusion = DiffusionProcess(cfg).to(device)
 
     # ═════════════════════════════════════════════════════════
     #  OPTIMIZER
     # ═════════════════════════════════════════════════════════
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas, weight_decay=1e-4
+        model.parameters(), lr=cfg.learning_rate, betas=cfg.adam_betas, weight_decay=cfg.adam_weight_decay
     )
     # Cosine annealing with warm restarts — better for diffusion than exponential decay
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(

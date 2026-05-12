@@ -58,7 +58,7 @@ def get_diffusion_model(device: torch.device = None):
         return _unet, _diffusion
 
     _unet = SpectrogramUNet(cfg).to(device)
-    _diffusion = DiffusionProcess(cfg)
+    _diffusion = DiffusionProcess(cfg).to(device)
 
     # Try loading checkpoint
     paths_to_try = [
@@ -126,10 +126,10 @@ def refine_spectrogram(
 
     # Ensure correct shape
     if vae_output.dim() == 3:
-        vae_output = vae_output.unsqueeze(0)  # [64, T] → [1, 1, 64, T]
+        vae_output = vae_output.unsqueeze(1)  # [B, 64, T] → [B, 1, 64, T]
 
     x = vae_output.to(device)
-    labels = torch.tensor([label_idx], device=device, dtype=torch.long)
+    labels = torch.full((x.shape[0],), label_idx, device=device, dtype=torch.long)
 
     refined = diffusion.refine(
         model, x, labels,

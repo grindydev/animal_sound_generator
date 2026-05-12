@@ -16,6 +16,7 @@ References:
 import os
 import sys
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
@@ -23,33 +24,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.diffusion.config import config as cfg
 
 
-class DiffusionProcess:
+class DiffusionProcess(nn.Module):
     """
     Manages the noise schedule and forward/reverse diffusion steps.
     """
 
     def __init__(self, config=None):
+        super().__init__()
         if config is None:
             config = cfg
         self.config = config
         self.timesteps = config.timesteps
-        self.device_param = None  # set on first use
 
         # Build noise schedule
         betas = self._cosine_beta_schedule(config.timesteps, config.cosine_s)
-        self.register_buffers(betas)
+        self.register_schedule_buffers(betas)
 
-    def register_buffers(self, betas: torch.Tensor):
-        """Compute and register all schedule-derived tensors."""
-        self.betas = betas                         # [T]
-        alphas = 1.0 - betas                       # [T]
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)  # [T]
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
-        self.posterior_variance = betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+    def register_schedule_buffers(self, betas: torch.Tensor):
+        """Compute and register all schedule-derived tensors as persistent buffers."""
+        self.register_buffer('betas', betas)                         # [T]
+        alphas = 1.0 - betas                                         # [T]
+        alphas_cumprod = torch.cumprod(alphas, dim=0)                # [T]
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
+        self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod))
+        self.register_buffer('posterior_variance', betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod))
 
     def _cosine_beta_schedule(self, timesteps: int, s: float = 0.008) -> torch.Tensor:
         """
@@ -108,33 +111,16 @@ class DiffusionProcess:
         # Predict noise
         pred_noise = model(x_t, t, labels)
 
-        # Compute x_0 estimate
-        sqrt_recip_alpha = self._get(self.sqrt_recip_alphas, t, x_t)
-        sqrt_recip_cumprod = self._get(self.sqrt_recip_alphas_cumprod, t, x_t)
-        x_0_pred = sqrt_recip_cumprod * x_t - sqrt_recip_alpha * pred_noise
-
-        # Clamp x_0 to valid spectrogram range (optional but helps stability)
-        x_0_pred = torch.clamp(x_0_pred, -5.0, 5.0)
-
-        # Posterior mean
-        posterior_mean = (
-            self._get(self.betas, t, x_t) * self._get(self.alphas_cumprod_prev, t, x_t) / (1.0 - self.alphas_cumprod[t].view(-1, 1, 1, 1).to(x_t.device)) * x_0_pred
-            + (1.0 - self.alphas_cumprod_prev[t].view(-1, 1, 1, 1).to(x_t.device)) * self._get(torch.sqrt(self.alphas), t, x_t) / (1.0 - self.alphas_cumprod[t].view(-1, 1, 1, 1).to(x_t.device)) * x_t
-        )
-
-        # Simplified: mean = (x_t - beta_t/sqrt(1-alpha_cumprod) * pred_noise) / sqrt(alpha_t)
+        # Simplified posterior mean: (x_t - beta_t/sqrt(1-alpha_cumprod) * pred_noise) / sqrt(alpha_t)
         beta_t = self._get(self.betas, t, x_t)
         alpha_t = 1.0 - beta_t
         sqrt_one_minus_cumprod = self._get(self.sqrt_one_minus_alphas_cumprod, t, x_t)
-        posterior_mean_simple = (x_t - beta_t / sqrt_one_minus_cumprod * pred_noise) / torch.sqrt(alpha_t)
+        posterior_mean = (x_t - beta_t / sqrt_one_minus_cumprod * pred_noise) / torch.sqrt(alpha_t)
 
-        # Add noise for t > 0
-        if t.min() > 0:
-            noise = torch.randn_like(x_t)
-            posterior_var = self._get(self.posterior_variance, t, x_t)
-            return posterior_mean_simple + torch.sqrt(posterior_var) * noise
-        else:
-            return posterior_mean_simple
+        # Add noise (posterior_variance[0] == 0, so t=0 adds nothing automatically)
+        noise = torch.randn_like(x_t)
+        posterior_var = self._get(self.posterior_variance, t, x_t)
+        return posterior_mean + torch.sqrt(posterior_var) * noise
 
     # ═════════════════════════════════════════════════════════
     #  DDIM Sampling (accelerated, deterministic)
@@ -177,15 +163,15 @@ class DiffusionProcess:
             pred_noise = model(x_t, t_batch, labels)
 
             # Predict x_0
-            alpha_cumprod_t = self.alphas_cumprod[t].to(device)
+            alpha_cumprod_t = self.alphas_cumprod[t]
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_cumprod_t)
             x_0_pred = (x_t - sqrt_one_minus_alpha_t * pred_noise) / torch.sqrt(alpha_cumprod_t)
 
-            # Clamp
-            x_0_pred = torch.clamp(x_0_pred, -5.0, 5.0)
+            # Clamp to valid normalized spectrogram range (wider, won't corrupt VAE output)
+            x_0_pred = torch.clamp(x_0_pred, -10.0, 10.0)
 
             # Compute sigma (stochasticity)
-            alpha_cumprod_next = self.alphas_cumprod[t_next].to(device)
+            alpha_cumprod_next = self.alphas_cumprod[t_next]
             sigma = eta * torch.sqrt((1.0 - alpha_cumprod_next) / (1.0 - alpha_cumprod_t) * (1.0 - alpha_cumprod_t / alpha_cumprod_next))
 
             # Direction pointing to x_t
@@ -282,11 +268,11 @@ class DiffusionProcess:
 
                 pred_noise = model(x_t, t_batch, labels)
 
-                alpha_t = self.alphas_cumprod[t].to(device)
-                alpha_next = self.alphas_cumprod[t_next].to(device)
+                alpha_t = self.alphas_cumprod[t]
+                alpha_next = self.alphas_cumprod[t_next]
 
                 x_0_pred = (x_t - torch.sqrt(1.0 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-                x_0_pred = torch.clamp(x_0_pred, -5.0, 5.0)
+                x_0_pred = torch.clamp(x_0_pred, -10.0, 10.0)
 
                 direction = torch.sqrt(1.0 - alpha_next) * pred_noise
                 x_t = torch.sqrt(alpha_next) * x_0_pred + direction
@@ -308,7 +294,7 @@ class DiffusionProcess:
         Index into a schedule buffer and broadcast to match `ref` shape.
         Buffer has shape [T], t has shape [B] → output [B, 1, 1, 1]
         """
-        out = buffer.to(ref.device)[t].float()
+        out = buffer[t].float()
         while out.dim() < ref.dim():
             out = out.unsqueeze(-1)
         return out

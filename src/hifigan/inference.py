@@ -295,14 +295,7 @@ def mel_to_waveform(
             n_mels=cfg.n_mels,
         )
 
-    # Step 3: Low-Pass Filter (Industry Standard: Removes HiFi-GAN electric noise)
-    # HiFi-GAN often hallucinates high-frequency noise (>11kHz).
-    # We cut off frequencies above the Nyquist limit for clean audio.
-    from torchaudio.functional import lowpass_biquad
-    waveform = lowpass_biquad(waveform, sample_rate=cfg.sample_rate, cutoff_freq=11025.0)
-
-    # Step 3: Low-Pass Filter (Industry Standard: Removes HiFi-GAN high-freq artifacts)
-    # HiFi-GAN often hallucinates noise above 11kHz. We cut it off.
+    # Step 3: Low-Pass Filter (Removes HiFi-GAN high-freq artifacts above Nyquist)
     from torchaudio.functional import lowpass_biquad
     waveform = lowpass_biquad(waveform, sample_rate=cfg.sample_rate, cutoff_freq=11025.0)
 
