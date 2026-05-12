@@ -139,7 +139,7 @@ class HiFiGANInference:
         # Chunked inference with overlap-add
         output = torch.zeros(1, total_samples)
         weight = torch.zeros(1, total_samples)
-        fade = self._get_fade_window()
+        fade = self._get_fade_window().cpu()  # keep on CPU (output is CPU)
 
         for start in range(0, n_frames - self.segment_frames + 1, self.hop_frames):
             end = start + self.segment_frames
@@ -154,7 +154,7 @@ class HiFiGANInference:
                     target_length=chunk_samples,
                 ).cpu()
 
-            # Apply crossfade
+            # Apply crossfade (both on CPU now)
             chunk_audio = chunk_audio * fade
 
             # Add to output
@@ -207,7 +207,7 @@ def griffin_lim_refine(
     mel_db = torch.clamp(mel_db, min=-80.0, max=0.0)
 
     # dB → power
-    mel_power = F.db_to_amplitude(mel_db, ref=1.0, power=2.0)
+    mel_power = 10 ** (mel_db / 10.0)
 
     # Mel → linear via pseudo-inverse of mel filterbank
     n_stft = n_fft // 2 + 1
@@ -222,12 +222,19 @@ def griffin_lim_refine(
     linear_mag = torch.sqrt(linear_power)  # [n_stft, T]
 
     # Griffin-Lim with HiFi-GAN audio as initial estimate
+    gl_length = (linear_mag.shape[-1] - 1) * hop_length  # match spectrogram exactly
     griffin_lim = T.GriffinLim(
         n_fft=n_fft, hop_length=hop_length, power=1,
-        n_iter=n_iter, momentum=0.99, length=waveform.shape[-1],
+        n_iter=n_iter, momentum=0.99, length=gl_length,
     ).to(device)
 
-    refined = griffin_lim(linear_mag.T.unsqueeze(0))  # [1, num_samples]
+    refined = griffin_lim(linear_mag.unsqueeze(0))  # [1, n_stft, T] -> [1, num_samples]
+
+    # Pad/trim to match original waveform length
+    if refined.shape[-1] < waveform.shape[-1]:
+        refined = torch.nn.functional.pad(refined, (0, waveform.shape[-1] - refined.shape[-1]))
+    elif refined.shape[-1] > waveform.shape[-1]:
+        refined = refined[:, :waveform.shape[-1]]
 
     # Blend with original to preserve naturalness
     refined = 0.7 * refined + 0.3 * waveform
