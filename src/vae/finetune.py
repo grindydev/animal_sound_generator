@@ -113,7 +113,7 @@ else:
     device = torch.device(CONFIG["device"])
     is_cuda = (CONFIG["device"] == "cuda")
 
-use_amp = is_cuda
+use_amp = False  # disabled — float16 overflows with large model
 
 # ==================== LOAD DATA ====================
 train_loader, val_loader, test_loader, num_classes = get_dataloaders(
@@ -260,6 +260,7 @@ def train_epoch(model, train_loader, optimizer, device, train_tfm,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed, mu, log_var = model(spectrograms, labels)
+                reconstructed = torch.clamp(reconstructed, -10, 10)
                 loss, recon_val, kl_val, cls_val = vae_loss(
                     reconstructed, spectrograms, mu, log_var, beta, free_bits,
                     classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
@@ -270,12 +271,16 @@ def train_epoch(model, train_loader, optimizer, device, train_tfm,
             scaler.update()
         else:
             reconstructed, mu, log_var = model(spectrograms, labels)
+            reconstructed = torch.clamp(reconstructed, -10, 10)
             loss, recon_val, kl_val, cls_val = vae_loss(
                 reconstructed, spectrograms, mu, log_var, beta, free_bits,
                 classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+
+        if torch.isnan(loss):
+            continue
 
         running_loss += loss.item() * spectrograms.size(0)
         running_recon += recon_val * spectrograms.size(0)

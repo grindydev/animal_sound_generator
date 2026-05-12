@@ -34,7 +34,7 @@ CONFIG = {
     "device": "auto",
     "train_fraction": 0.8,    # 80% train (was 60% — test folded in)
     "val_fraction": 0.2,      # 20% val
-    "lr": 1e-3,
+    "lr": 3e-4,               # lower LR for stability (300M model)
     "weight_decay": 1e-3,
     "latent_dim": 2048,
     "base_channels": 32,       # 32→64→128→256 = 149M params, fits 4GB VRAM
@@ -96,7 +96,7 @@ else:
     device = torch.device(CONFIG["device"])
     is_cuda = (CONFIG["device"] == "cuda")
 
-use_amp = is_cuda
+use_amp = False  # disabled — float16 overflows with large random model
 
 # ==================== LOAD DATA ====================
 train_loader, val_loader, test_loader, num_classes = get_dataloaders(
@@ -159,16 +159,23 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
                 scaler, use_amp, pbar=None):
     model.train()
     running_loss = 0.0
+    nan_count = 0
 
     for batch_idx, (waveforms, _) in enumerate(train_loader):
         waveforms = waveforms.to(device)
         spectrograms = train_tfm(waveforms)
+
+        # Safety: check for NaN in input
+        if torch.isnan(spectrograms).any():
+            print(f"⚠️  NaN in input spectrograms — skipping batch")
+            continue
 
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed = model(spectrograms)
+                reconstructed = torch.clamp(reconstructed, -10, 10)  # prevent explosion
                 loss = loss_fn(reconstructed, spectrograms)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -177,16 +184,26 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
             scaler.update()
         else:
             reconstructed = model(spectrograms)
+            reconstructed = torch.clamp(reconstructed, -10, 10)
             loss = loss_fn(reconstructed, spectrograms)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+        if torch.isnan(loss):
+            nan_count += 1
+            if nan_count <= 3:
+                print(f"⚠️  NaN loss at batch {batch_idx} — skipping")
+            continue
+
         running_loss += loss.item() * spectrograms.size(0)
         if pbar:
             pbar.update_batch(batch_idx + 1, postfix_dict={"mse": f"{loss.item():.4f}"})
 
-    return running_loss / len(train_loader.dataset)
+    if nan_count > 0:
+        print(f"⚠️  {nan_count} batches had NaN — model may be unstable, check LR")
+
+    return running_loss / max(len(train_loader.dataset), 1)
 
 
 def validate_epoch(model, val_loader, loss_fn, device, eval_tfm, pbar=None):
