@@ -58,6 +58,14 @@ def generate_one(
     # Step 1: VAE generates rough spectrogram
     vae_mel = vae.sample(label_idx, num_samples=1, device=device, temperature=temperature)
 
+    # Step 1b: Normalize VAE output — rescale to match real spectrogram statistics
+    # (Safety net: if decoder produces wrong distribution, this fixes it for HiFi-GAN)
+    vae_mel = torch.clamp(vae_mel, -4.0, 4.0)  # clip extreme outliers
+    mel_mean = vae_mel.mean()
+    mel_std = vae_mel.std()
+    if mel_std > 0.01:
+        vae_mel = (vae_mel - mel_mean) / mel_std * 0.7  # target std=0.7 (real is ~0.5-1.0)
+
     # Step 2: Diffusion refinement (optional)
     if use_diffusion:
         vae_mel = refine_spectrogram(
@@ -82,16 +90,16 @@ def main():
                         help=f"Animal class: {', '.join(CLASSES)} (default: all)")
     parser.add_argument("--count", type=int, default=1,
                         help="Number of sounds per class")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="VAE temperature (0.5=consistent, 1.0=normal, 1.5=wild)")
+    parser.add_argument("--temperature", type=float, default=0.5,
+                        help="VAE temperature (0.3=consistent, 0.5=normal, 1.0=wild)")
     parser.add_argument("--strength", type=float, default=0.6,
                         help="Diffusion refinement strength (0.0=none, 1.0=full)")
     parser.add_argument("--diffusion-steps", type=int, default=50,
                         help="DDIM sampling steps (fewer=faster, more=sharper)")
     parser.add_argument("--no-diff", action="store_true",
                         help="Skip diffusion refinement (VAE only)")
-    parser.add_argument("--no-griffin-lim", action="store_true",
-                        help="Skip Griffin-Lim phase refinement")
+    parser.add_argument("--griffin-lim", action="store_true",
+                        help="Enable Griffin-Lim phase refinement (off by default)")
     parser.add_argument("--output-dir", type=str, default="outputs/generated",
                         help="Directory to save audio files")
     parser.add_argument("--device", type=str, default="auto",
@@ -134,7 +142,7 @@ def main():
                 use_diffusion=not args.no_diff,
                 strength=args.strength,
                 diffusion_steps=args.diffusion_steps,
-                use_griffin_lim=not args.no_griffin_lim,
+                use_griffin_lim=args.griffin_lim,
             )
 
             # Normalize to [-1, 1]
