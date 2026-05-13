@@ -1,381 +1,294 @@
-# Audio Generation Workflow — Learning Notes
+# Audio Generation Workflow
 
-> A beginner-friendly reference covering everything from raw audio to HiFi-GAN.
-
----
-
-## 1. Raw Audio: What Is a Sample?
-
-Sound is air pressure wiggling. A microphone measures it many times per second.
-
-```
-Air pressure
-    ↑    ╱╲        ╱╲
-    │   ╱  ╲      ╱  ╲
-  0 ├──╱────╲────╱────╲───→ Time
-    │ ╱              ╲
-    └──────────────────
-         ↑    ↑    ↑
-      samples: each dot is one number
-```
-
-- **Sample** = one number (like `0.5`, `-0.3`, `0.8`)
-- **Sample rate** = how many samples per second (`22050` = 22,050 samples/sec)
-- **1 second of audio** = a list of 22,050 numbers
-- Range: typically **-1 to +1**
-  - `0` = silence
-  - `1` = max push
-  - `-1` = max pull
-
-```python
-# 1 second of audio at 22,050 Hz
-audio = [0.1, -0.3, 0.7, -0.9, 0.2, 0.5, -0.1, 0.8, ...]  # 22,050 numbers
-```
+> Complete pipeline: training order, model roles, and how sound is generated.
 
 ---
 
-## 2. Mel Spectrogram: A "Photo" of Sound
-
-Raw audio `[22050]` is just a wiggly line. Hard for a neural network to "see" patterns. So we convert it to a **2D grid** — like a grayscale image.
-
-### How It's Made
-
-Chop the audio into chunks, then ask: "What frequencies are loud in each chunk?"
-
-```
-Audio: [0.1, -0.3, 0.7, -0.9, 0.2, 0.5, ...]  ← 8,200 samples
-
-hop_length = 200
-
-Chunk 0:  samples 0-199    → "mostly 500Hz"
-Chunk 1:  samples 200-399  → "mostly 500Hz + 1kHz"
-Chunk 2:  samples 400-599  → "mostly 1kHz"
-...
-```
-
-For each chunk, compute **64 frequency buckets** (how loud is low, mid, high...).
-
-### The Grid
-
-```
-            Time →
-            frame0  frame1  frame2  ...  frame40
-            (0ms)   (9ms)   (18ms)       (369ms)
-Freq ↓
- bin0   [  0.1     0.2     0.3    ...    0.0  ]  ← deep rumble
- bin1   [  0.3     0.5     0.8    ...    0.1  ]
- bin2   [  0.0     0.1     0.2    ...    0.3  ]
-  ...   [  ...     ...     ...    ...    ...  ]
- bin63  [  0.2     0.1     0.0    ...    0.5  ]  ← high whistle
-
-Shape: [64, 41]  ← 64 frequency bins × 41 time frames
-```
-
-### Why Not Just Use Raw Audio?
-
-| | Raw Audio | Mel Spectrogram |
-|--|-----------|-----------------|
-| Shape | `[22050]` (1D line) | `[64, 110]` (2D grid) |
-| Pattern | Hard to see | Easy to see |
-| Size | Big | 200× smaller |
-| VAE can generate? | Hard | Easy |
-
-Think of it like: raw audio is a wiggly line drawing. Mel spectrogram is a barcode/fingerprint — structured and compact.
-
-### Key Terms
-
-| Term | Value | Meaning |
-|------|-------|---------|
-| `sample_rate` | 22,050 | Samples per second |
-| `hop_length` | 200 | How many audio samples per mel frame |
-| `n_mels` | 64 | Number of frequency buckets (arbitrary, usually 64/80/128) |
-
-**Formula:**
-```
-mel_frames = audio_samples / hop_length
-# 8200 / 200 = 41 frames
-```
-
-> **Important:** `hop_length` is a fixed setting. If you change it, you must regenerate your entire dataset and retrain everything.
-
-### Why 64 Frequency Buckets?
-
-64 = how many "equalizer bars" you split the sound into. NOT "64 sounds humans hear." It's arbitrary:
-- 32 = tiny, fast, blurry
-- 64 = good balance (this project)
-- 80 = sharper (common in papers)
-- 128 = very sharp
-
-More bins = finer frequency detail. 64 is enough for animal sounds.
-
----
-
-## 3. HiFi-GAN Generator: Mel → Waveform
-
-HiFi-GAN takes the compact mel grid and **reconstructs** the full audio wave.
-
-```
-Input:  [B, 64, 41]    ← mel spectrogram (B = batch size)
-            ↓
-     HiFi-GAN Generator
-            ↓
-Output: [B, 1, 8200]   ← audio waveform (41 × 200 = 8200 samples)
-```
-
-### Full Shape Evolution
-
-Using **B=1, T=41** (0.37 second clip):
-
-```
-Stage        Operation                    Shape In        Shape Out       Time Change
-──────────────────────────────────────────────────────────────────────────────────────
-Input        —                            [1, 64, 41]     [1, 64, 41]     —
-Pre-conv     Conv1d(64→256, k=7, p=3)     [1, 64, 41]     [1, 256, 41]    41 → 41 (no change)
-MRF Block 1  ConvTranspose(stride=5)      [1, 256, 41]    [1, 128, 205]   41 × 5 = 205
-MRF Block 2  ConvTranspose(stride=5)      [1, 128, 205]   [1, 64, 1025]   205 × 5 = 1025
-MRF Block 3  ConvTranspose(stride=4)      [1, 64, 1025]   [1, 32, 4100]   1025 × 4 = 4100
-MRF Block 4  ConvTranspose(stride=2)      [1, 32, 4100]   [1, 16, 8200]   4100 × 2 = 8200
-Post-conv    Conv1d(16→1, k=7, p=3)       [1, 16, 8200]   [1, 1, 8200]    8200 → 8200 (no change)
-```
-
-**Total upsample:** `5 × 5 × 4 × 2 = 200 = hop_length` ✅
-
----
-
-## 4. Key Concepts
-
-### 4.1 Kernel vs Stride vs Padding
-
-| Term | What it controls | In pre_conv | In ConvTranspose |
-|------|-----------------|-------------|------------------|
-| **Kernel size** | Width of the sliding window | 7 | 10, 10, 8, 4 |
-| **Stride** | How many steps to hop | 1 (time stays same) | 5, 5, 4, 2 (time grows) |
-| **Padding** | Zeros added at edges | 3 | calculated to keep math clean |
-
-**The #1 rule:**
-- `stride = 1` → output time = input time (no change)
-- `stride > 1` in ConvTranspose → output time = input time × stride (stretches!)
-
-### 4.2 Conv1d: How 64 Becomes 256
-
-```python
-nn.Conv1d(in_channels=64, out_channels=256, kernel_size=7)
-```
-
-**NOT one kernel.** **256 separate kernels**, each with shape `[64, 7]`.
-
-```
-Kernel 0:   [64, 7] weights → produces output channel 0
-Kernel 1:   [64, 7] weights → produces output channel 1
-...
-Kernel 255: [64, 7] weights → produces output channel 255
-```
-
-At each time position:
-1. Look at 7 time steps across all 64 input channels = 448 values
-2. Each of 256 filters does its own weighted sum + bias
-3. Output: 256 numbers
-
-**Total params:** `256 × 64 × 7 = 114,688 weights` + `256 biases` = **114,944**
-
-### 4.3 ConvTranspose1d (Upsample)
-
-How it stretches time:
-1. Insert zeros between samples
-2. Run a normal conv to fill the gaps
-
-```
-Input:     [A, B]
-           ↓ insert zeros (stride=2)
-Stretched: [A, 0, B, 0]
-           ↓ conv with kernel=4 fills the gaps
-Output:    [smooth A, smooth between, smooth B, smooth between]
-```
-
-Why `kernel = 2 × stride`? Bigger kernels = smoother fill, less artifacts.
-
-### 4.4 Dilation
-
-Dilation = **gaps between kernel teeth** (like a comb).
-
-```
-Normal (dilation=1):     ●●●      ← looks at 3 adjacent samples
-                         ───
-                         width = 3
-
-Dilated (dilation=2):    ● ● ●    ← 1-pixel gap between
-                         ─────
-                         width = 5 (sees farther!)
-
-Dilated (dilation=3):    ●   ●   ●  ← 2-pixel gap
-                         ───────
-                         width = 7
-```
-
-**Same number of weights (3), but sees a wider area.** HiFi-GAN uses `(1, 3, 5)` to catch fast, medium, and slow patterns at once.
-
-### 4.5 LeakyReLU
-
-An activation function. Applied after every conv layer.
-
-```
-Input:   -3   -1    0    1    3
-ReLU:     0    0    0    1    3     ← negatives die forever
-LeakyReLU(0.1):
-         -0.3  -0.1   0    1    3     ← negatives survive, shrunk by 10×
-```
-
-Why LeakyReLU? Normal ReLU kills negative neurons forever ("dead neurons"). LeakyReLU keeps them alive so gradients can flow back and they can learn.
-
-### 4.6 ResBlock
-
-```
-Input x ────────────────────────┐
-                                │ ← skip connection
-     x → LeakyReLU → Conv → LeakyReLU → Conv
-                                                │
-                                                ▼
-                                        x + output (add them)
-```
-
-The `+ x` is the residual/skip connection. If the conv layers mess up, the original signal still gets through. This lets you stack many layers without the signal dying.
-
-### 4.7 MRF Block
-
-```
-                    Input
-                      │
-                      ▼
-              ConvTranspose (upsample)
-                      │
-          ┌─────┬─────┴─────┬─────┐
-          │     │           │     │
-          ▼     ▼           ▼     ▼
-      ResBlock ResBlock ResBlock
-      k=3     k=7      k=11
-      (fast)  (mid)    (slow)
-          │     │           │
-          └─────┴─────┬─────┘
-                      │
-                    SUM
-```
-
-Three parallel paths with different kernel sizes (3, 7, 11) catch patterns at different time scales, then add them together.
-
----
-
-## 5. Discriminator (Brief)
-
-Checks if audio is real or fake.
-
-Your project uses **MPD only** (Multi-Period Discriminator):
-
-```
-Audio waveform [B, 1, 8200]
-       │
-       ├─── Period=2  → fold into grid → Conv2d → score
-       ├─── Period=3  → fold into grid → Conv2d → score
-       ├─── Period=5  → fold into grid → Conv2d → score
-       ├─── Period=7  → fold into grid → Conv2d → score
-       └─── Period=11 → fold into grid → Conv2d → score
-```
-
-Each period catches repeating artifacts at different frequencies. Returns scores + internal features.
-
----
-
-## 6. Training Flow (One Batch)
-
-```
-BATCH: real_audio = [8, 1, 16384]  ← 8 clips, 0.74s each
-
-STEP A: Generate fake
-  real_audio → compute_mel() → [8, 64, 82]
-  generator(mel) → fake_audio [8, 1, 16384]
-
-STEP B: Train Discriminator
-  D(real_audio) → high scores ✓
-  D(fake_audio.detach()) → low scores ✓
-  d_loss.backward()
-  optimizer_d.step()
-
-STEP C: Train Generator
-  D(fake_audio) → scores + features
-  Compute 3 losses:
-    L_mel  (weight 45): mel(fake) vs mel(real)  ← CONTENT
-    L_fm   (weight 2):  match D's inner layers  ← REALISM
-    L_adv  (weight 1):  make D say "real"       ← POLISH
-  g_loss = 45×L_mel + 2×L_fm + 1×L_adv
-  g_loss.backward()
-  optimizer_g.step()
-```
-
-Mel loss MUST dominate (45×) or the generator drifts to wrong content.
-
----
-
-## 7. Quick Formula Cheat Sheet
-
-```
-# Audio ↔ Mel relationship
-mel_frames = audio_samples / hop_length
-audio_samples = mel_frames × hop_length
-
-# Conv1d output length (stride=1)
-output_length = input_length + 2×padding - kernel_size + 1
-# With padding=(kernel-1)//2, output_length ≈ input_length
-
-# ConvTranspose1d output length
-output_length = input_length × stride
-
-# Total upsample must equal hop_length
-5 × 5 × 4 × 2 = 200
-```
-
----
-
-## 8. Glossary
-
-| Term | Simple Meaning |
-|------|---------------|
-| **Sample** | One number = air pressure at one instant |
-| **Waveform** | List of samples = the actual sound you hear |
-| **Mel spectrogram** | 2D grid = "photo" of sound (freq × time) |
-| **hop_length** | Audio samples per mel frame (200 in this project) |
-| **n_mels** | Number of frequency buckets (64) |
-| **Channel** | Like "color" — one slice of data |
-| **Kernel** | A filter/sliding window with learned weights |
-| **Stride** | How many steps the kernel hops |
-| **Padding** | Zeros added at edges so kernel can slide to the border |
-| **Dilation** | Gaps between kernel teeth — sees wider without more weights |
-| **ConvTranspose** | Upsample layer — stretches time by inserting zeros |
-| **ResBlock** | Conv + skip connection — prevents signal from dying in deep nets |
-| **LeakyReLU** | Activation that lets negative values survive (prevents dead neurons) |
-| **Feature matching loss** | "Make fake audio look like real audio inside the D's brain" |
-| **Adversarial loss** | "Fool the discriminator into saying real" |
-| **Mel loss** | "Your output must have the same spectrogram as the input" |
-
----
-
-## 9. The Big Pipeline
+## 1. The Pipeline (End-to-End)
 
 ```
 "dog" label
     ↓
-┌──────────┐
-│   VAE    │  ← generates "what should it look like"
-└────┬─────┘
-     ↓
-[64, 41] mel spectrogram  ← blurry thumbnail of sound
-     ↓
-┌──────────┐
-│ HiFi-GAN │  ← converts "thumbnail" → "full photo"
-│Generator │
-└────┬─────┘
-     ↓
-[1, 8200] audio waveform  ← crisp sound you can hear!
+┌──────────────────┐
+│   ImprovedVAE    │  Generates: "what should it look like"
+│   (src/vae/)     │  FiLM class conditioning in every decoder layer
+└────────┬─────────┘
+         ↓
+  [1, 64, 552] normalized mel spectrogram
+         ↓
+┌──────────────────┐
+│ Diffusion UNet   │  (OPTIONAL) Refines blurry VAE output
+│ (src/diffusion/) │  Only useful if VAE output has noise-like artifacts
+└────────┬─────────┘
+         ↓
+  [1, 64, 552] sharpened mel spectrogram
+         ↓
+┌──────────────────┐
+│    HiFi-GAN      │  Converts mel "thumbnail" → full audio waveform
+│ (src/hifigan/)   │  5×5×4×2 = 200 = hop_length
+└────────┬─────────┘
+         ↓
+  [1, 110400] audio waveform @ 22050 Hz  (5 seconds)
+         ↓
+     🔊 dog_bark.wav
 ```
 
 ---
 
-*Generated from conversation on 2026-05-08. Refer back to `phase-7a-hifigan.md` for deeper architecture details and training tips.*
+## 2. Training Order
+
+Train models in this sequence — each depends on the previous:
+
+```
+Step 0: Classifier  ← ALREADY TRAINED (91% accuracy)
+  python src/train_classifier.py
+  → models/best_audio_cnn_train.pth  (457K params, 1.8 MB)
+  Role: Classify animal sounds. Used by VAE for class supervision loss.
+
+Step 1: Autoencoder (foundation)
+  python src/vae/train_ae.py
+  → models/best_autoencoder_train.pth  (149M params, 596 MB)
+
+Step 2: VAE (adds generation capability)
+  python src/vae/finetune.py
+  → models/best_vae_finetune_train.pth  (223M params, 891 MB)
+  Role: Add class conditioning + probabilistic sampling
+  Uses: best_autoencoder_train.pth (encoder/decoder weights)
+         best_audio_cnn_train.pth (classifier for supervision)
+
+Step 3: HiFi-GAN (mel → audio)       ← ALREADY TRAINED
+  src/hifigan/train.py
+  → models/hifigan_generator_train.pth
+  Role: Convert mel spectrograms to audio waveforms
+
+Step 4: Diffusion (OPTIONAL refinement)
+  src/diffusion/train.py
+  → models/diffusion_unet_train_best.pth
+  Role: Sharpen VAE-generated spectrograms
+```
+
+---
+
+## 3. What Each Model Does
+
+### 3.1 Autoencoder (`ImprovedAutoencoder`)
+
+```
+Input:  mel spectrogram [B, 1, 64, 552]
+           ↓ Encoder (4 ResBlocks, stride=2)
+           ↓ 1→32→64→128→256 channels
+           ↓ [B, 256, 4, 35]
+           ↓ Self-Attention (temporal coherence)
+           ↓ Flatten → Linear → z [B, 2048]
+           ↓ Linear → Reshape → [B, 256, 4, 35]
+           ↓ Decoder (4 stages, skip connections from encoder)
+           ↓ 256→128→64→32→16→1 channels
+Output: reconstructed [B, 1, 64, 552]
+
+Loss: MSE(reconstructed, input)
+
+Params: 149M (base_channels=32) — fits GTX 1650 4GB
+```
+
+**Key improvements over v1:**
+- Residual blocks (gradient flow)
+- Skip connections encoder→decoder (detail preservation)
+- Self-attention at bottleneck (temporal patterns)
+- 2048-dim latent (2× larger, less compression)
+
+### 3.2 VAE (`ImprovedVAE`)
+
+Built on top of the autoencoder with two additions:
+
+**Addition 1: Probabilistic bottleneck**
+```
+Encoder output → fc_mu [B, 2048] + fc_log_var [B, 2048]
+z = mu + sigma * random_noise  ← reparameterization trick
+```
+
+**Addition 2: FiLM class conditioning**
+```
+Class "Dog" → Embedding(8, 128) → FiLM in EVERY decoder block
+Each decoder block: h = h * (1 + γ) + β
+```
+The class embedding modulates all 4 decoder stages (not just concatenated to z). This gives the class 4× more influence.
+
+```
+Training loss:
+  total = MSE(recon, input)
+        + beta * KL_divergence     ← organizes latent space
+        + 0.5 * CrossEntropy(      ← class supervision
+            classifier(recon), label
+          )
+
+  beta: 0 → 0.01 (exponential ramp over 20 epochs)
+  classifier: frozen SimpleAudioCNN (91% accuracy)
+
+Generation:
+  z ~ N(0, temperature * I)  ← sample from prior
+  z + class_embed → decoder → new spectrogram
+```
+
+**Checkpoints used by VAE finetuning:**
+| File | Size | Trained By | Role |
+|------|------|------------|------|
+| `best_autoencoder_train.pth` | 596 MB | `src/vae/train_ae.py` | Encoder/decoder weights |
+| `best_audio_cnn_train.pth` | 1.8 MB | `src/train_classifier.py` | Classifier for supervision loss |
+
+### 3.3 Classifier (`SimpleAudioCNN`)
+
+```bash
+# Trained by: python src/train.py
+# Output: models/best_audio_cnn_train.pth
+```
+
+```
+Input:  mel spectrogram [B, 1, 64, T]
+           ↓ 4 ConvBlocks (1→32→64→128→256)
+           ↓ AdaptiveAvgPool → [B, 256, 1, 1]
+           ↓ Flatten → Linear(256, 256)
+           ↓ Linear(256, 8)
+Output: class logits [B, 8]
+
+Accuracy: 91%
+Used by: VAE finetuning (class supervision loss)
+         evaluate.py (classifier evaluation)
+```
+
+### 3.4 HiFi-GAN
+
+```
+Input:  mel spectrogram [B, 64, T]
+           ↓ Pre-conv: Conv1d(64→256, k=7)
+           ↓ 4 MRF blocks (upsample + multi-kernel resblocks)
+           ↓ Total upsample: 5×5×4×2 = 200 = hop_length
+           ↓ Post-conv: Conv1d(16→1, k=7)
+Output: audio waveform [B, 1, T×200 samples]
+```
+
+### 3.5 Diffusion (Optional)
+
+```
+Input:  VAE-generated mel + noise
+           ↓ DDIM denoising (50 steps)
+Output: sharpened mel
+
+Training: U-Net predicts noise added to mel spectrograms
+Strength: 0.05-0.10 for safe SNR with VAE output
+```
+
+---
+
+## 4. Raw Audio vs Mel Spectrogram
+
+### Raw Audio
+```
+[0.1, -0.3, 0.7, -0.9, 0.2, ...]  ← 110,400 numbers for 5 seconds @ 22050 Hz
+1D — just a wiggly line. Hard for neural nets to "see" patterns.
+```
+
+### Mel Spectrogram
+```
+         Time (552 frames) →
+Freq ↓   frame0  frame1  ...  frame551
+ bin0  [  0.1     0.2   ...    0.0  ]  ← deep rumble
+ bin1  [  0.3     0.5   ...    0.1  ]
+  ...  [  ...     ...   ...    ...  ]
+bin63  [  0.2     0.1   ...    0.5  ]  ← high whistle
+
+Shape: [64, 552]  ← 64 frequency bins × 552 time frames
+2D grid — like a grayscale "photo" of sound, easy for Conv2d to process.
+```
+
+### Key Parameters
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `sample_rate` | 22050 | Samples per second |
+| `hop_length` | 200 | Audio samples per mel frame |
+| `n_mels` | 64 | Frequency bins |
+| `n_fft` | 1024 | FFT window size |
+| `segment_frames` | 552 | 5 seconds of mel frames |
+
+---
+
+## 5. File Structure
+
+```
+src/
+  vae/              ← VAE + Autoencoder package
+    blocks.py       — ResEncoderBlock, ResDecoderBlock, SelfAttention1D, FiLM
+    autoencoder.py  — ImprovedAutoencoder (149M params)
+    model.py        — ImprovedVAE (223M params, FiLM conditioning)
+    train_ae.py     — Train autoencoder (Ctrl+C resume)
+    finetune.py     — Finetune VAE from AE (Ctrl+C resume)
+
+  diffusion/        ← Diffusion package
+    config.py
+    diffusion.py    — DDPM/DDIM forward & reverse processes
+    inference.py    — refine_spectrogram() API
+    train.py        — Training with VAE mix-in
+    unet.py         — SpectrogramUNet (18M params)
+
+  hifigan/          ← HiFi-GAN package
+    config.py
+    generator.py    — HiFiGANGenerator
+    discriminator.py
+    inference.py    — mel_to_waveform() API
+    train.py
+
+  model.py          — SimpleAudioCNN (classifier, 457K params)
+  data_loader.py    — Shared dataloader (80/20 train/val split)
+  train_classifier.py — Train the classifier
+  generate.py       — Main entry: VAE → [Diffusion] → HiFi-GAN → audio
+  smart_crop.py     — Energy-based audio cropping
+  helper_utils.py   — Progress bars, plotting
+
+models/
+  best_audio_cnn_train.pth       — Classifier       (457K, 1.8 MB)
+  best_autoencoder_train.pth     — Autoencoder v2   (149M, 596 MB)
+  best_vae_finetune_train.pth    — VAE v2           (223M, 891 MB)
+  hifigan_generator_train.pth    — HiFi-GAN         (3.3M, 13 MB)
+  diffusion_unet_train_best.pth  — Diffusion UNet   (17.8M, 71 MB)
+```
+
+---
+
+## 6. Running the Pipeline
+
+### Training (one-time)
+```bash
+# Step 1: Autoencoder (~3 hrs)
+python src/vae/train_ae.py
+
+# Step 2: VAE (~3 hrs)
+python src/vae/finetune.py
+
+# Step 3 (optional): Diffusion (~5 hrs)
+python src/diffusion/train.py
+```
+
+### Generation
+```bash
+# VAE only
+python src/generate.py --label Dog --no-diff
+
+# VAE + Diffusion (use low strength!)
+python src/generate.py --label Dog --strength 0.07 --diffusion-steps 10
+
+# Multiple samples
+python src/generate.py --label Cat --count 5
+
+# All animals
+python src/generate.py
+```
+
+### Key Generate Flags
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--label` | all | Animal class |
+| `--temperature` | 0.7 | Diversity (0.5=consistent, 1.5=wild) |
+| `--strength` | 0.6 | Diffusion strength (keep ≤ 0.10) |
+| `--diffusion-steps` | 50 | DDIM steps |
+| `--no-diff` | — | Skip diffusion |
+| `--count` | 1 | Samples per class |
