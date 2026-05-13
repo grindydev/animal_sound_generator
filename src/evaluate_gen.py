@@ -66,20 +66,23 @@ def get_device():
 
 
 def load_vae(checkpoint_path, num_classes, device):
-    """Load a trained VAE model from checkpoint."""
+    """Load a trained VAE model from checkpoint. Auto-detects base_channels."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state = ckpt["model_state_dict"]
+    # Auto-detect base_channels from enc1 weight shape: [base_ch, 1, 3, 3]
+    base_ch = state["enc1.main.0.weight"].shape[0]
     model = ImprovedVAE(
         latent_dim=ckpt["latent_dim"],
         num_classes=num_classes,
         embed_dim=ckpt.get("embed_dim", 128),
-        base_channels=16,  # matches training config
+        base_channels=base_ch,
     )
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.load_state_dict(state, strict=False)
     model.to(device)
     model.eval()
     mode = ckpt.get("mode", "finetune")
     print(f"   ✅ Loaded VAE ({mode}): latent={ckpt['latent_dim']}, "
-          f"beta={ckpt.get('beta', '?')}")
+          f"base_ch={base_ch}, beta={ckpt.get('beta', '?')}")
     return model
 
 

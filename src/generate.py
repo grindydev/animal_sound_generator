@@ -31,14 +31,15 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
 
 def load_vae(device):
-    """Load the finetuned VAE model."""
-    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=16).to(device)
+    """Load the finetuned VAE model. Auto-detects base_channels."""
     ckpt_path = "models/best_vae_finetune_train.pth"
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    # Load with strict=False in case checkpoint has different keys
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    state = ckpt["model_state_dict"]
+    base_ch = state["enc1.main.0.weight"].shape[0]
+    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=base_ch).to(device)
+    model.load_state_dict(state, strict=False)
     model.eval()
-    print(f"✅ VAE loaded from {ckpt_path}")
+    print(f"✅ VAE loaded from {ckpt_path} (base_ch={base_ch})")
     return model
 
 
