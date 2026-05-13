@@ -64,7 +64,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 40,
+        "num_epochs": 30,
         "batch_size": 8,       # L4 24GB
         "gradient_accumulation_steps": 1,
         "num_workers": 4,

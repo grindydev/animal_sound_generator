@@ -45,13 +45,13 @@ MyDrive/animal_audio.tar.gz
 
 ## Current Config (in source files)
 
-| Model | lr | batch | base_ch | params | workers |
+| Model | lr | batch | base_ch | params | workers | epochs |
 |-------|:--:|:-----:|:-------:|:------:|:-------:|
-| Classifier | 1e-3 | 256 | — | 457K | 4 |
-| Autoencoder | 1e-3 | 16 | 32 | 149M | 4 |
-| VAE finetune | 3e-4 | 8 | 32 | 223M | 4 |
-| Diffusion | — | 16 | — | 18M | 4 |
-| HiFi-GAN | — | 16 | — | 3.3M | 4 |
+| Classifier | 1e-3 | 256 | — | 457K | 4 | 30 |
+| Autoencoder | 1e-3 | 16 | 32 | 149M | 4 | 30 |
+| VAE finetune | 3e-4 | 8 | 32 | 223M | 4 | 30 |
+| Diffusion | — | 16 | — | 18M | 4 | 30 |
+| HiFi-GAN | — | 16 | — | 3.3M | 4 | 30 |
 
 ---
 

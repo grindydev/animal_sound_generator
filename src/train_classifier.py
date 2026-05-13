@@ -50,7 +50,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 40,
+        "num_epochs": 30,
         "batch_size": 256,
         "patience": 8,
         "num_workers": 4,

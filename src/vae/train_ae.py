@@ -56,7 +56,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 40,
+        "num_epochs": 30,
         "batch_size": 16,      # T4/L4 16-24GB
         "patience": 8,
         "num_workers": 4,
