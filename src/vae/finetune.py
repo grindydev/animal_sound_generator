@@ -45,13 +45,14 @@ CONFIG = {
     "latent_dim": 2048,
     "base_channels": 16,       # must match autoencoder (was 32, now 16 → 74M params)
     "embed_dim": 128,          # class embedding for FiLM (was 64)
-    "beta": 0.01,              # target KL weight
-    "free_bits": 0.1,          # prevent dead latent dims
-    "warmup_epochs": 3,        # frozen encoder/decoder, β=0 (shorter — pretrained AE is good)
+    "beta": 0.005,             # target KL weight (lower — let MSE compete)
+    "free_bits": 0.01,         # prevent dead latent dims (was 0.1 — dominated loss)
+    "warmup_epochs": 5,        # frozen encoder/decoder, β=0 (FiLM needs time)
     "ramp_epochs": 15,         # β exponential ramp
     "beta_k": 3,               # curve steepness
     "class_loss_weight": 0.5,  # classifier supervision weight
     "classifier_path": "models/best_audio_cnn_train.pth",
+    "skip_dropout": 0.5,       # randomly drop decoder skip connections (force generation-capable decoder)
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
     "ae_checkpoint": "models/best_autoencoder_train.pth",  # pretrained autoencoder
@@ -59,14 +60,14 @@ CONFIG = {
     "test": {
         "num_epochs": 5,
         "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
-        "num_workers": 1,
+        "num_workers": 4,
     },
 
     "train": {
         "num_epochs": 40,
         "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
         "gradient_accumulation_steps": 2,  # effective batch = 2
-        "num_workers": 2,
+        "num_workers": 4,
     }
 }
 
@@ -87,6 +88,7 @@ BETA = CONFIG["beta"]
 FREE_BITS = CONFIG["free_bits"]
 CLASS_LOSS_WEIGHT = CONFIG["class_loss_weight"]
 CLASSIFIER_PATH = CONFIG["classifier_path"]
+SKIP_DROPOUT = CONFIG["skip_dropout"]
 WARMUP_EPOCHS = CONFIG["warmup_epochs"]
 RAMP_EPOCHS = CONFIG["ramp_epochs"]
 BETA_K = CONFIG["beta_k"]
@@ -162,8 +164,8 @@ n_params = sum(p.numel() for p in model.parameters())
 print(f"✅ Model: {n_params:,} params ({n_params/1e6:.1f}M)")
 
 # ==================== CLASSIFIER ====================
-from model import SimpleAudioCNN
-classifier = SimpleAudioCNN(num_classes=num_classes)
+from model import SimpleAudioCNN, ImprovedAudioCNN
+classifier = ImprovedAudioCNN(num_classes=num_classes)
 if os.path.exists(CLASSIFIER_PATH):
     cls_ckpt = torch.load(CLASSIFIER_PATH, map_location=device, weights_only=True)
     classifier.load_state_dict(cls_ckpt["model_state_dict"])
@@ -269,13 +271,13 @@ def train_epoch(model, train_loader, optimizer, device, train_tfm,
 
         if use_amp:
             with autocast(device_type="cuda"):
-                reconstructed, mu, log_var = model(spectrograms, labels)
+                reconstructed, mu, log_var = model(spectrograms, labels, skip_dropout=skip_dropout)
                 loss, recon_val, kl_val, cls_val = vae_loss(
                     reconstructed, spectrograms, mu, log_var, beta, free_bits,
                     classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
             scaler.scale(loss / grad_accum).backward()
         else:
-            reconstructed, mu, log_var = model(spectrograms, labels)
+            reconstructed, mu, log_var = model(spectrograms, labels, skip_dropout=skip_dropout)
             loss, recon_val, kl_val, cls_val = vae_loss(
                 reconstructed, spectrograms, mu, log_var, beta, free_bits,
                 classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
@@ -410,7 +412,7 @@ def training_loop():
                 model, train_loader, optimizer, device, train_transform,
                 scaler, use_amp, beta_val, FREE_BITS,
                 classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT,
-                grad_accum=GRAD_ACCUM)
+                grad_accum=GRAD_ACCUM, skip_dropout=SKIP_DROPOUT)
 
             _, epoch_val_recon, epoch_val_kl, epoch_val_cls = validate_epoch(
                 model, val_loader, device, eval_transform, beta_val, FREE_BITS,

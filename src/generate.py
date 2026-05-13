@@ -15,7 +15,7 @@ import os
 import sys
 import argparse
 import torch
-import torchaudio
+import soundfile as sf
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -32,7 +32,7 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
 def load_vae(device):
     """Load the finetuned VAE model."""
-    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=32).to(device)
+    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=16).to(device)
     ckpt_path = "models/best_vae_finetune_train.pth"
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     # Load with strict=False in case checkpoint has different keys
@@ -141,7 +141,7 @@ def main():
             if peak > 0:
                 waveform = waveform / peak * 0.95
 
-            torchaudio.save(out_path, waveform.cpu(), 22050)
+            sf.write(out_path, waveform.squeeze().cpu().numpy(), 22050)
             dur = waveform.shape[-1] / 22050
             print(f"✅ {dur:.1f}s → {out_path}")
 

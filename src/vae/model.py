@@ -201,9 +201,14 @@ class ImprovedVAE(nn.Module):
         h = F.interpolate(h, size=target_size, mode='bilinear')
         return h
 
-    def forward(self, x: torch.Tensor, labels: torch.Tensor):
+    def forward(self, x: torch.Tensor, labels: torch.Tensor, skip_dropout: float = 0.0):
         """
         Full forward pass WITH skip connections (training / reconstruction).
+        
+        Args:
+            skip_dropout: probability of dropping ALL decoder skip connections.
+                          Forces decoder to work without encoder skips (generation mode).
+                          Ramp from 0.0 (warmup) → 0.5 (full training).
 
         Returns: (reconstructed, mu, log_var)
         """
@@ -223,6 +228,11 @@ class ImprovedVAE(nn.Module):
 
         z = self.reparameterize(mu, log_var)
         class_emb = self.class_embed(labels)
+
+        # Randomly drop skip connections during training
+        # This forces the decoder to learn generation-capable outputs
+        if self.training and skip_dropout > 0 and torch.rand(1).item() < skip_dropout:
+            skips = [None, None, None]
 
         reconstructed = self.decode_with_skips(z, class_emb, skips, target_size)
         return reconstructed, mu, log_var

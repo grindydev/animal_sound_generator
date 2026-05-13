@@ -1,63 +1,57 @@
 """
-train_autoencoder.py — Autoencoder v2 Training Pipeline.
+train_classifier.py — Audio Classifier Training (ImprovedAudioCNN)
 
-Trains the ImprovedAutoencoder with skip connections, residual blocks, and attention.
-Uses 80/20 train/val split (test data folded into train for +33% data).
+Standard pattern matching src/diffusion/train.py and src/hifigan/train.py:
+  - CONFIG dict at top → mode/test/train settings
+  - Device auto-detection (CUDA > MPS > CPU)
+  - Separate functions: train_epoch(), validate_epoch(), training_loop()
+  - Checkpoint resume + best model tracking
+  - Progress: ── Epoch X/Y (Ts) ── loss=X val_acc=X% 📉/➡️ lr=X
 
-Features:
-  - Clean tqdm per-batch progress (matches diffusion/train.py style)
-  - Checkpoint resume (Ctrl+C → save → restart → continue)
+Usage:
+    python src/train_classifier.py
 """
 import copy
 import os
 import sys
 import time
 import warnings
-
-# Prevent CUDA memory fragmentation OOMs — MUST be set before torch import
-# 149M-param model on 4GB VRAM: fragmentation between epochs causes
-# "Tried to allocate 280 MiB" even when free memory exists
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import torch
-from torch import nn
-from torch import optim
+from torch import nn, optim
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
-# Ensure project root and src/ are importable
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 
 from data_loader import get_dataloaders, get_transformations
-from vae.autoencoder import ImprovedAutoencoder
+from model import ImprovedAudioCNN
 
 warnings.filterwarnings("ignore")
 
+
 # ==================== CONFIG ====================
 CONFIG = {
-    "mode": "train",          # "test" = 5 epoch smoke test | "train" = full training
+    "mode": "train",              # "test" = 5 epoch smoke test | "train" = full training
     "device": "auto",
-    "train_fraction": 0.8,    # 80% train (was 60% — test folded in)
-    "val_fraction": 0.2,      # 20% val
-    "lr": 3e-4,               # lower LR for stability (300M model)
-    "weight_decay": 1e-3,
-    "latent_dim": 2048,
-    "base_channels": 16,       # 16→32→64→128 = ~37M params
-    "optimizer": "AdamW",
-    "scheduler": "CosineAnnealingLR",
+    "train_fraction": 0.8,
+    "val_fraction": 0.2,
+    "lr": 1e-3,
+    "weight_decay": 0.05,
+    "label_smoothing": 0.1,
+    "dropout": 0.3,
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 2,       # 149M model + optimizer + activations ≈ 3.5GB peak
+        "batch_size": 64,
         "patience": 3,
         "num_workers": 8,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 2,       # 149M model on 4GB: batch=2 safe, batch=4 fragments
+        "batch_size": 64,
         "patience": 8,
         "num_workers": 8,
     }
@@ -75,13 +69,14 @@ TRAIN_FRACTION = CONFIG["train_fraction"]
 VAL_FRACTION = CONFIG["val_fraction"]
 LR = CONFIG["lr"]
 WEIGHT_DECAY = CONFIG["weight_decay"]
-LATENT_DIM = CONFIG["latent_dim"]
+LABEL_SMOOTHING = CONFIG["label_smoothing"]
+DROPOUT = CONFIG["dropout"]
 
-BEST_MODEL_PATH = f"models/best_autoencoder_{MODE}.pth"
-CHECKPOINT_DIR = f"models/autoencoder_checkpoints/{MODE}"
+BEST_MODEL_PATH = f"models/best_audio_cnn_{MODE}.pth"
+CHECKPOINT_DIR = f"models/classifier_checkpoints/{MODE}"
 
-print(f"🔧 CONFIG → {MODE.upper()} MODE (Improved V2)")
-print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Latent: {LATENT_DIM}")
+print(f"🔧 CONFIG → {MODE.upper()} MODE (ImprovedAudioCNN)")
+print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR}")
 print(f"   Split: {TRAIN_FRACTION*100:.0f}% train / {VAL_FRACTION*100:.0f}% val")
 print(f"   Checkpoints: {CHECKPOINT_DIR} | Best: {BEST_MODEL_PATH}")
 
@@ -103,7 +98,7 @@ else:
     device = torch.device(CONFIG["device"])
     is_cuda = (CONFIG["device"] == "cuda")
 
-use_amp = False  # disabled — float16 overflows with large random model
+use_amp = is_cuda
 
 # ==================== LOAD DATA ====================
 train_loader, val_loader, test_loader, num_classes = get_dataloaders(
@@ -112,24 +107,28 @@ train_loader, val_loader, test_loader, num_classes = get_dataloaders(
     val_fraction=VAL_FRACTION,
     num_workers=NUM_WORKERS,
 )
-
 print(f"✅ Data: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val / {len(test_loader.dataset)} test (unused)")
 
 # ==================== MODEL ====================
-BASE_CH = CONFIG["base_channels"]
-model = ImprovedAutoencoder(latent_dim=LATENT_DIM, base_channels=BASE_CH)
+model = ImprovedAudioCNN(num_classes=num_classes, dropout=DROPOUT)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"✅ Model: {n_params:,} params ({n_params/1e6:.1f}M)")
 
-loss_function = nn.MSELoss()
+loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+scaler = GradScaler() if use_amp else None
+
+train_transform, eval_transform = get_transformations()
+train_transform = train_transform.to(device)
+eval_transform = eval_transform.to(device)
+
 
 # ==================== CHECKPOINTING ====================
 
 def save_checkpoint(model, optimizer, scheduler, epoch):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, f"ae_{epoch:06d}.pth")
+    path = os.path.join(CHECKPOINT_DIR, f"classifier_{epoch:06d}.pth")
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -141,29 +140,16 @@ def save_checkpoint(model, optimizer, scheduler, epoch):
 def load_checkpoint(model, optimizer, scheduler):
     if not os.path.isdir(CHECKPOINT_DIR):
         return 0
-    files = sorted([f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("ae_")])
+    files = sorted([f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("classifier_")])
     if not files:
         return 0
     path = os.path.join(CHECKPOINT_DIR, files[-1])
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    # strict=False allows loading checkpoints from older model versions
-    # (new layers like LayerNorm in SelfAttention1D use default init)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-    if missing:
-        print(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
-    if unexpected:
-        print(f"   ⚠️  Unexpected keys (ignored): {unexpected}")
+    model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
     return ckpt["epoch"]
-
-
-scaler = GradScaler() if use_amp else None
-
-train_transform, eval_transform = get_transformations()
-train_transform = train_transform.to(device)
-eval_transform = eval_transform.to(device)
 
 
 # ==================== TRAINING FUNCTIONS ====================
@@ -173,72 +159,58 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
     """Train one epoch. Returns average loss."""
     model.train()
     running_loss = 0.0
-    nan_count = 0
-
     pbar = tqdm(train_loader, desc="  Train", leave=False)
 
-    for waveforms, _ in pbar:
-        waveforms = waveforms.to(device)
+    for waveforms, labels in pbar:
+        waveforms, labels = waveforms.to(device), labels.to(device)
         spectrograms = train_tfm(waveforms)
-
-        # Safety: check for NaN / inf in input
-        if torch.isnan(spectrograms).any() or torch.isinf(spectrograms).any():
-            print(f"\n⚠️  NaN/inf in input spectrograms — skipping batch")
-            continue
 
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
             with autocast(device_type="cuda"):
-                reconstructed = model(spectrograms)
-                loss = loss_fn(reconstructed, spectrograms)
+                outputs = model(spectrograms)
+                loss = loss_fn(outputs, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            reconstructed = model(spectrograms)
-            loss = loss_fn(reconstructed, spectrograms)
+            outputs = model(spectrograms)
+            loss = loss_fn(outputs, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            nan_count += 1
-            if nan_count <= 3:
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                tqdm.write(f"⚠️  NaN/inf loss (grad_norm={total_norm:.2f}) — skipping")
-            continue
-
         running_loss += loss.item() * spectrograms.size(0)
-        pbar.set_postfix({"mse": f"{loss.item():.4f}"})
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    if nan_count > 0:
-        tqdm.write(f"⚠️  {nan_count} batches had NaN — model may be unstable, check LR")
-
-    return running_loss / max(len(train_loader.dataset), 1)
+    return running_loss / len(train_loader.dataset)
 
 
 def validate_epoch(model, val_loader, loss_fn, device, eval_tfm):
-    """Validate — returns average MSE loss."""
+    """Validate — returns (avg_loss, accuracy%)."""
     model.eval()
     running_loss = 0.0
+    correct = total = 0
 
     with torch.no_grad():
-        for waveforms, _ in val_loader:
-            waveforms = waveforms.to(device)
+        for waveforms, labels in val_loader:
+            waveforms, labels = waveforms.to(device), labels.to(device)
             spectrograms = eval_tfm(waveforms)
-            reconstructed = model(spectrograms)
-            loss = loss_fn(reconstructed, spectrograms)
-            running_loss += loss.item() * spectrograms.size(0)
 
-    return running_loss / len(val_loader.dataset)
+            outputs = model(spectrograms)
+            loss = loss_fn(outputs, labels)
+
+            running_loss += loss.item() * spectrograms.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    val_loss = running_loss / len(val_loader.dataset)
+    val_acc = 100.0 * correct / total
+    return val_loss, val_acc
 
 
 # ==================== TRAINING LOOP ====================
@@ -250,54 +222,47 @@ def training_loop():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     start_epoch = load_checkpoint(model, optimizer, scheduler)
 
-    best_val_loss = float("inf")
-    best_model_state = None
+    best_val_acc = 0.0
     best_epoch = 0
     patience_counter = 0
 
     print(f"\n{'='*60}")
-    print(f"🚀 AUTOENCODER V2 TRAINING — {MODE.upper()} MODE")
+    print(f"🚀 CLASSIFIER TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
     print(f"{'='*60}\n")
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS):
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
             t0 = time.time()
 
             epoch_loss = train_epoch(model, train_loader, loss_function, optimizer,
                                      device, train_transform, scaler, use_amp)
-            epoch_val_loss = validate_epoch(model, val_loader, loss_function,
-                                            device, eval_transform)
+            val_loss, val_acc = validate_epoch(model, val_loader, loss_function,
+                                               device, eval_transform)
             scheduler.step()
-
-            # Defragment GPU memory between epochs
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
             current_lr = scheduler.get_last_lr()[0]
             dt = time.time() - t0
-            trend = "📉" if epoch_val_loss < best_val_loss else "➡️"
+            trend = "📉" if val_acc > best_val_acc else "➡️"
 
             print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
                   f"({dt:.0f}s) ── "
-                  f"loss={epoch_loss:.4f} val={epoch_val_loss:.4f} {trend} lr={current_lr:.2e}")
+                  f"loss={epoch_loss:.4f} val_acc={val_acc:.1f}% {trend} lr={current_lr:.2e}")
 
             # Save checkpoint EVERY epoch (safe for Ctrl+C)
             save_checkpoint(model, optimizer, scheduler, epoch + 1)
 
-            if epoch_val_loss < best_val_loss:
-                best_val_loss = epoch_val_loss
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
                 best_epoch = epoch + 1
-                best_model_state = copy.deepcopy(model.state_dict())
                 torch.save({
                     'model_state_dict': model.state_dict(),
-                    'latent_dim': LATENT_DIM, 'val_mse': best_val_loss,
-                    'epoch': best_epoch, 'mode': MODE,
+                    'num_classes': num_classes,
+                    'val_accuracy': best_val_acc,
+                    'epoch': best_epoch,
+                    'mode': MODE,
                 }, BEST_MODEL_PATH)
-                print(f"      💾 Best model saved (val_mse={best_val_loss:.6f})")
+                print(f"      💾 Best model saved (val_acc={best_val_acc:.1f}%)")
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -308,10 +273,16 @@ def training_loop():
     except KeyboardInterrupt:
         print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+    # Save final
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'num_classes': num_classes,
+        'val_accuracy': best_val_acc,
+        'epoch': best_epoch,
+        'mode': MODE,
+    }, BEST_MODEL_PATH)
+    print(f"\n💾 Best model → {BEST_MODEL_PATH} (val_acc={best_val_acc:.1f}% at epoch {best_epoch})")
 
-    print(f"\n💾 Best model → {BEST_MODEL_PATH} (val_mse={best_val_loss:.6f})")
     return model
 
 

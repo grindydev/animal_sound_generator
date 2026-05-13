@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 from data_loader import get_dataloaders, get_transformations
-from vae import SimpleAudioVAE
-from model import SimpleAudioCNN
+from vae.model import ImprovedVAE
+from model import SimpleAudioCNN, ImprovedAudioCNN
 
 warnings.filterwarnings("ignore")
 
@@ -40,8 +40,7 @@ CONFIG = {
 
     # Model paths
     "classifier_path": "models/best_audio_cnn_train.pth",
-    "vae_scratch_path": "models/best_vae_scratch_train.pth",
-    "vae_finetune_path": "models/best_vae_finetune_train.pth",
+    "vae_path": "models/best_vae_finetune_train.pth",
 
     # Evaluation settings
     "num_generated_per_class": 50,       # Samples for classification agreement
@@ -69,24 +68,25 @@ def get_device():
 def load_vae(checkpoint_path, num_classes, device):
     """Load a trained VAE model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model = SimpleAudioVAE(
+    model = ImprovedVAE(
         latent_dim=ckpt["latent_dim"],
         num_classes=num_classes,
-        embed_dim=ckpt.get("embed_dim", 64),
+        embed_dim=ckpt.get("embed_dim", 128),
+        base_channels=16,  # matches training config
     )
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.to(device)
     model.eval()
-    source = ckpt.get("type", "finetune")
-    print(f"   ✅ Loaded VAE ({source}): latent={ckpt['latent_dim']}, "
-          f"epoch={ckpt.get('epoch', '?')}, β={ckpt.get('beta', '?')}")
+    mode = ckpt.get("mode", "finetune")
+    print(f"   ✅ Loaded VAE ({mode}): latent={ckpt['latent_dim']}, "
+          f"beta={ckpt.get('beta', '?')}")
     return model
 
 
 def load_classifier(checkpoint_path, num_classes, device):
     """Load the Phase 2 audio classifier for evaluation."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model = SimpleAudioCNN(num_classes=num_classes)
+    model = ImprovedAudioCNN(num_classes=num_classes)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
@@ -165,7 +165,8 @@ def diversity_score(vae, device, num_samples=20):
 def compute_tsne(vae, loader, classifier, device, eval_transform, n_samples=200):
     """
     Fit t-SNE on real + generated encodings.
-    For real samples, use encoder μ. For generated, use random z + class embedding.
+    Real: encoder μ (2048-dim). Generated: random z ~ N(0,I) (2048-dim).
+    Both in same latent space — no class concatenation (FiLM handles class).
 
     Returns: tsne_coords (2D), labels (0=real, 1=generated), class_labels
     """
@@ -180,10 +181,7 @@ def compute_tsne(vae, loader, classifier, device, eval_transform, n_samples=200)
             labels = labels.to(device)
             specs = eval_transform(waveforms)
             mu, _ = vae.encode_to_params(specs)
-            # Concatenate class embedding to match 1088-dim latent
-            class_emb = vae.class_embed(labels)
-            mu_full = torch.cat([mu, class_emb], dim=1)
-            all_encodings.append(mu_full.cpu().numpy())
+            all_encodings.append(mu.cpu().numpy())
             all_types.extend([0] * len(mu))
             all_classes.extend(labels.cpu().numpy())
             if len(all_types) >= n_samples // 2:
@@ -200,12 +198,7 @@ def compute_tsne(vae, loader, classifier, device, eval_transform, n_samples=200)
     gen_classes = []
     for class_idx in range(len(CLASS_NAMES)):
         z = torch.randn(gen_per_class, vae.fc_mu.out_features, device=device)
-        class_emb = vae.class_embed(
-            torch.full((gen_per_class,), class_idx, dtype=torch.long, device=device)
-        )
-        # Concatenation: z (1024) + class_emb (64) = 1088-dim latent
-        z_cond = torch.cat([z, class_emb], dim=1)
-        gen_encodings.append(z_cond.detach().cpu().numpy())
+        gen_encodings.append(z.detach().cpu().numpy())
         gen_classes.extend([class_idx] * gen_per_class)
 
     gen_encodings = np.concatenate(gen_encodings, axis=0)
@@ -412,29 +405,30 @@ if __name__ == "__main__":
     # ── Load data ──
     train_loader, val_loader, test_loader, num_classes = get_dataloaders(
         batch_size=CONFIG["batch_size"],
-        train_fraction=0.6,
+        train_fraction=0.8,
         val_fraction=0.2,
         num_workers=CONFIG["num_workers"],
     )
     _, eval_transform = get_transformations()
     eval_transform = eval_transform.to(device)
-    print(f"✅ Data loaded: {len(test_loader.dataset)} test samples")
+    print(f"✅ Data loaded: {len(val_loader.dataset)} val samples")
 
     # ── Load classifier ──
     print("\n📦 Loading models...")
     classifier = load_classifier(CONFIG["classifier_path"], num_classes, device)
 
-    # ── Load VAE models ──
-    vae_scratch = load_vae(CONFIG["vae_scratch_path"], num_classes, device)
-    vae_finetune = load_vae(CONFIG["vae_finetune_path"], num_classes, device)
+    # ── Load VAE ──
+    vae = load_vae(CONFIG["vae_path"], num_classes, device)
 
-    # ── Evaluate both ──
-    scratch_results = evaluate_model(
-        vae_scratch, classifier, test_loader, device, eval_transform, "From-Scratch VAE"
-    )
-    finetune_results = evaluate_model(
-        vae_finetune, classifier, test_loader, device, eval_transform, "Finetune VAE"
+    # ── Evaluate ──
+    results = evaluate_model(
+        vae, classifier, val_loader, device, eval_transform, "Finetune VAE"
     )
 
-    # ── Print comparison ──
-    print_comparison(scratch_results, finetune_results)
+    print(f"\n\n{'='*70}")
+    print(f"🏆 Evaluation Complete")
+    print(f"{'='*70}")
+    print(f"\n   Reconstruction MSE:      {results['mse']:.6f}")
+    print(f"   Classification Agreement: {results['agreement']['Average']:.1%}")
+    print(f"   Diversity Score:          {results['diversity']['Average']:.2f}")
+    print(f"\n   Visualizations saved to: {CONFIG['output_dir']}/")

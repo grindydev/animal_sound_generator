@@ -28,7 +28,7 @@ import torch.nn as nn
 from pathlib import Path
 from sklearn.metrics import confusion_matrix, classification_report
 
-from model import SimpleAudioCNN
+from model import SimpleAudioCNN, ImprovedAudioCNN
 from data_loader import get_dataloaders, get_transformations
 from helper_utils import plot_confusion_matrix
 
@@ -50,7 +50,7 @@ def evaluate(model_path=None):
 
     # ==================== RECREATE MODEL & LOAD WEIGHTS ====================
     num_classes = checkpoint['num_classes']
-    model = SimpleAudioCNN(num_classes=num_classes)
+    model = ImprovedAudioCNN(num_classes=num_classes)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     print("   Model in eval mode (ready for inference)")
@@ -64,9 +64,9 @@ def evaluate(model_path=None):
     print(f"   Device: {device}")
 
     # ==================== TEST SET ====================
-    _, _, test_loader, _ = get_dataloaders(
+    _, val_loader, _, _ = get_dataloaders(
         batch_size=16,
-        train_fraction=0.6,
+        train_fraction=0.8,
         val_fraction=0.2,
         num_workers=0,  # eval doesn't need multiprocessing
     )
@@ -79,7 +79,7 @@ def evaluate(model_path=None):
     all_labels = []
 
     with torch.no_grad():
-        for waveforms, labels in test_loader:
+        for waveforms, labels in val_loader:
             waveforms, labels = waveforms.to(device), labels.to(device)
             waveforms = eval_transform(waveforms)
 
