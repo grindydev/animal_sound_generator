@@ -48,7 +48,9 @@ client/frontend/dist/
 *.sqlite
 *.sqlite3
 
-models/
+models/*
+!models/best_audio_cnn_train.pth
+!models/.gitkeep
 evaluation_output/
 generated_audio/
-diagnosis/
+diagnosis/animal_audio.tar.gz

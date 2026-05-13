@@ -41,25 +41,25 @@ CONFIG = {
     "device": "auto",
     "train_fraction": 0.8,    # 80% train (was 60% — test folded in)
     "val_fraction": 0.2,      # 20% val
-    "lr": 3e-4,               # lower LR for stability (300M model)
-    "weight_decay": 1e-3,
+    "lr": 1e-3,               # higher LR for large model
+    "weight_decay": 1e-4,
     "latent_dim": 2048,
-    "base_channels": 16,       # 16→32→64→128 = ~37M params
+    "base_channels": 32,       # 32→64→128→256 = ~149M params
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 2,       # 149M model + optimizer + activations ≈ 3.5GB peak
+        "batch_size": 8,       # smoke test
         "patience": 3,
-        "num_workers": 8,
+        "num_workers": 4,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 2,       # 149M model on 4GB: batch=2 safe, batch=4 fragments
+        "batch_size": 16,      # T4/L4 16-24GB
         "patience": 8,
-        "num_workers": 8,
+        "num_workers": 4,
     }
 }
 

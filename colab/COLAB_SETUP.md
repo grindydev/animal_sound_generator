@@ -1,183 +1,74 @@
 # Colab Training Guide — Animal Sound Generator
 
-> Move training from GTX 1650 (4GB) → Google Colab T4 (16GB)
+> All source configs are already Colab-optimized. No patching needed.
 
 ---
 
-## Why Colab?
+## GPU Comparison
 
-| | GTX 1650 | Colab T4 | Improvement |
-|---|----------|----------|-------------|
-| VRAM | 4 GB | 16 GB | **4×** |
-| Autoencoder batch | 2 | 8 | **4× faster epochs** |
-| VAE batch | 1 + accum | 4 | **4× faster** |
-| base_channels | 16 (37M params) | **32 (149M params)** | **Better model** |
-| Autoencoder time | ~3 hrs | ~2 hrs | 33% less |
-| Free tier limit | — | ~4-6 hrs/day | Manageable |
+| GPU | VRAM | Free? | Batch Size (AE/VAE) | Est. AE Time |
+|-----|------|-------|---------------------|-------------|
+| T4 | 16 GB | ✅ Free | 16 / 8 | ~2 hrs |
+| **L4** | 24 GB | ❌ Pro | **16 / 8** | **~1.2 hrs** |
+| A100 | 40 GB | ❌ Pro+ | 32 / 16 | ~0.8 hrs |
 
 ---
 
-## Step-by-Step Setup
+## Quick Start (3 steps)
 
-### 1. Upload Dataset to Google Drive
+### 1. Upload to Google Drive
 
-Your `data/animal_audio/` folder (3,001 .wav files, ~3GB):
-
-```bash
-# On your local machine, zip and upload:
-tar -czf animal_audio.tar.gz data/animal_audio/
-# Upload animal_audio.tar.gz to https://drive.google.com → MyDrive/
+Upload your dataset to Drive root:
+```
+MyDrive/animal_audio.tar.gz
 ```
 
-Or use the download script directly in Colab (slower but no upload needed).
-
-### 2. Upload Existing Checkpoints (Optional)
-
-If you want to resume training from where you left off:
-
-```bash
-# Upload your existing models:
-# models/best_audio_cnn_train.pth        (1.8 MB - classifier)
-# models/best_autoencoder_train.pth       (596 MB - autoencoder)
-# models/autoencoder_checkpoints/         (epoch checkpoints for resume)
-```
-
-### 3. Push Code to GitHub
-
-Colab needs to clone your repo:
-
-```bash
-cd /Users/thanhbm/Projects/animal_sound_generator
-git add colab_train.ipynb colab_patch_configs.py
-git commit -m "Add Colab training notebook and config patcher"
-git push
-```
-
-### 4. Open Colab Notebook
+### 2. Open Colab notebook
 
 - Go to https://colab.research.google.com
-- File → Upload notebook → select `colab_train.ipynb`
-- **Runtime → Change runtime type → T4 GPU**
-- Run cells in order
+- File → Upload notebook → select `colab/colab_train.ipynb`
+- Runtime → Change runtime type → **L4 GPU** (or T4 if free)
 
-### 5. Or: Use the "Open in Colab" Link
+### 3. Run cells in order
 
-Add a badge to your README:
-
-```markdown
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](
-  https://colab.research.google.com/github/YOUR_USERNAME/animal_sound_generator/blob/main/colab_train.ipynb
-)
-```
-
----
-
-## Training Schedule (Colab T4)
-
-Run one model per Colab session (Colab disconnects after 4-6 hours):
-
-### Session 1: Autoencoder (~2-3 hrs)
-```
-1. Mount Drive, clone repo, pip install
-2. Copy data from Drive
-3. Run colab_patch_configs.py
-4. python src/vae/train_ae.py
-5. Save best_autoencoder_train.pth → Drive
-```
-
-### Session 2: VAE Fine-tune (~2-3 hrs)
-```
-1. Mount Drive, clone repo, pip install
-2. Copy data + best_autoencoder_train.pth from Drive
-3. python src/vae/finetune.py
-4. Save best_vae_finetune_train.pth → Drive
-```
-
-### Session 3: Diffusion (~3 hrs)
-```
-1. Mount Drive, clone repo
-2. Copy data + best_vae_finetune_train.pth from Drive
-3. python src/diffusion/train.py
-4. Save diffusion_unet_train_best.pth → Drive
-```
+| Cell | What | Time |
+|------|------|------|
+| 1 | Clone repo, mount Drive, install deps | 2 min |
+| 2 | Extract data from Drive | 1 min |
+| 3 | Verify GPU | 10 sec |
+| 4 | Train autoencoder | ~1.5 hrs |
+| 5 | Save AE to Drive | 30 sec |
+| 6 | Train VAE (fine-tune) | ~1.5 hrs |
+| 7 | Save VAE to Drive | 30 sec |
 
 ---
 
-## Important: Colab Limitations & Workarounds
+## Current Config (in source files)
 
-| Issue | Solution |
-|-------|----------|
-| **Session times out after 90 min idle** | Click the page occasionally, or use a keep-alive script |
-| **Runtime disconnects after ~6 hrs** | Save checkpoints to Drive EVERY epoch (already done!) |
-| **Drive I/O is slow** | Copy data to `/content/` at start (local SSD), sync back at end |
-| **Free GPU limit** | Use Colab Pro ($10/mo) for priority access + longer sessions |
-| **Runtime resets** | Each session = fresh VM. Always restore from Drive checkpoints |
-| **Pro: A100 GPU** | Colab Pro+ ($50/mo) = sometimes A100 (40GB). For 149M models, T4 is enough |
-
----
-
-## Recovery: Resume After Timeout
-
-Your training scripts already save checkpoints EVERY epoch. When Colab times out:
-
-1. Start a new Colab session
-2. Run cells 1-2b (setup + copy models from Drive)
-3. Run the training cell again — it auto-resumes from the latest checkpoint
-
-The checkpoint resume is built into all training scripts via `load_checkpoint()`.
+| Model | lr | batch | base_ch | params | workers |
+|-------|:--:|:-----:|:-------:|:------:|:-------:|
+| Classifier | 1e-3 | 256 | — | 457K | 4 |
+| Autoencoder | 1e-3 | 16 | 32 | 149M | 4 |
+| VAE finetune | 3e-4 | 8 | 32 | 223M | 4 |
+| Diffusion | — | 16 | — | 18M | 4 |
+| HiFi-GAN | — | 16 | — | 3.3M | 4 |
 
 ---
 
-## Post-Training: Sync Back to Local
+## Download Models After Training
 
-### Option A: Google Drive Desktop (easiest)
-Install Google Drive for desktop → models appear in your local filesystem
+From Google Drive → `MyDrive/animal_sound_generator/models/`:
 
-### Option B: Download from drive.google.com
-Navigate to `MyDrive/animal_sound_generator/models/` → right-click → Download
-
-### Option C: rclone (power users)
-```bash
-rclone copy gdrive:animal_sound_generator/models/ ./models/ -P
+```
+best_autoencoder_train.pth       (149M params, ~600 MB)
+best_vae_finetune_train.pth      (223M params, ~890 MB)
+best_audio_cnn_train.pth         (457K params, ~2 MB)
 ```
 
-### Option D: zip + direct download
-In Colab:
-```python
-!tar -czf models.tar.gz models/*.pth
-from google.colab import files
-files.download('models.tar.gz')
-```
+Copy to your local `models/` folder, update `base_channels=32` in any inference scripts, done.
 
 ---
 
-## What to Update Locally After Training
+## Recovery After Timeout
 
-Once you have the new models, update your local config:
-
-```python
-# In src/generate.py or wherever you load models:
-# Point to the new Colab-trained checkpoints
-VAE_CHECKPOINT = "models/best_vae_finetune_train.pth"          # 223M params (ch=32)
-AE_CHECKPOINT = "models/best_autoencoder_train.pth"            # 149M params (ch=32)
-DIFFUSION_CHECKPOINT = "models/diffusion_unet_train_best.pth"  # 18M params
-HIFIGAN_CHECKPOINT = "models/hifigan_generator_train.pth"     # 3.3M params
-```
-
-Update base_channels in config to match:
-```python
-CONFIG["base_channels"] = 32  # must match the Colab-trained model
-```
-
----
-
-## Cost Comparison
-
-| | GTX 1650 (electricity) | Colab Free | Colab Pro |
-|---|------|-----------|-----------|
-| Cost | ~$0.50/day | **$0** | $10/mo |
-| Training time (full) | ~13 hrs | ~10 hrs | ~8 hrs |
-| VRAM | 4 GB | 16 GB | 16-40 GB |
-| Can multitask? | GPU locked | Browser tab | Browser tab |
-| Uptime limit | Unlimited | ~6 hrs | ~24 hrs |
-| **Recommendation** | - | ✅ **Use this** | Optional upgrade |
+Checkpoints save to Drive every epoch. Restart Colab → run cells 1-2 → training auto-resumes.

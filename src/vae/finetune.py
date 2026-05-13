@@ -41,9 +41,9 @@ CONFIG = {
     "device": "auto",
     "train_fraction": 0.8,     # 80% train (test folded in)
     "val_fraction": 0.2,
-    "lr": 1e-4,                # lower LR — VAE is more sensitive
+    "lr": 3e-4,                # match AE training
     "latent_dim": 2048,
-    "base_channels": 16,       # must match autoencoder (was 32, now 16 → 74M params)
+    "base_channels": 32,       # must match autoencoder
     "embed_dim": 128,          # class embedding for FiLM (was 64)
     "beta": 0.005,             # target KL weight (lower — let MSE compete)
     "free_bits": 0.01,         # prevent dead latent dims (was 0.1 — dominated loss)
@@ -59,14 +59,14 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
+        "batch_size": 4,       # smoke test
         "num_workers": 4,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
-        "gradient_accumulation_steps": 2,  # effective batch = 2
+        "batch_size": 8,       # L4 24GB
+        "gradient_accumulation_steps": 1,
         "num_workers": 4,
     }
 }

@@ -44,16 +44,16 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 64,
+        "batch_size": 128,
         "patience": 3,
-        "num_workers": 8,
+        "num_workers": 4,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 64,
+        "batch_size": 256,
         "patience": 8,
-        "num_workers": 8,
+        "num_workers": 4,
     }
 }
 
