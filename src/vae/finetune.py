@@ -92,8 +92,9 @@ RAMP_EPOCHS = CONFIG["ramp_epochs"]
 BETA_K = CONFIG["beta_k"]
 AE_CHECKPOINT = CONFIG["ae_checkpoint"]
 
-BEST_MODEL_PATH = f"models/best_vae_finetune_{MODE}.pth"
 CHECKPOINT_DIR = f"models/vae_checkpoints/{MODE}"
+RESUME_PATH = os.path.join(CHECKPOINT_DIR, "vae_resume.pth")
+BEST_MODEL_PATH = f"models/best_vae_finetune_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE (Improved V2)")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Latent: {LATENT_DIM}")
@@ -186,29 +187,24 @@ scaler = GradScaler() if use_amp else None
 
 def save_checkpoint(model, optimizer, scheduler, epoch):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, f"vae_{epoch:06d}.pth")
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "epoch": epoch,
-    }, path)
+    }, RESUME_PATH)
 
 
 def load_checkpoint(model, optimizer, scheduler):
-    if not os.path.isdir(CHECKPOINT_DIR):
+    if not os.path.exists(RESUME_PATH):
         return 0
-    files = sorted([f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("vae_")])
-    if not files:
-        return 0
-    path = os.path.join(CHECKPOINT_DIR, files[-1])
-    ckpt = torch.load(path, map_location=device, weights_only=True)
+    ckpt = torch.load(RESUME_PATH, map_location=device, weights_only=True)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing:
         tqdm.write(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
-    print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
+    print(f"   📂 Resumed from {RESUME_PATH} (epoch {ckpt['epoch']})")
     return ckpt["epoch"]
 
 
@@ -389,6 +385,9 @@ def training_loop():
         unfreeze_all(model)
         print(f"\n🔥 All layers unfrozen (resumed after warmup)")
 
+    best_val_mse = float("inf")
+    best_epoch = 0
+
     print(f"\n{'='*60}")
     print(f"🚀 VAE V2 FINE-TUNING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
@@ -448,7 +447,7 @@ def training_loop():
     except KeyboardInterrupt:
         print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 
-    # Save final
+    # Save final model
     torch.save({
         'model_state_dict': model.state_dict(),
         'latent_dim': LATENT_DIM,
