@@ -255,7 +255,7 @@ def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0,
 
 def train_epoch(model, train_loader, optimizer, device, train_tfm,
                 scaler, use_amp, beta, free_bits, classifier, class_loss_weight,
-                grad_accum=1):
+                grad_accum=1, skip_dropout=0.5):
     """Train one epoch. Returns (avg_loss, avg_recon, avg_kl)."""
     model.train()
     running_loss, running_recon, running_kl = 0.0, 0.0, 0.0
