@@ -66,7 +66,7 @@ MAX_SAMPLES = TARGET_SR * MAX_SECONDS  # 110250
 #     Std  (n_fft=1024): 19.8031
 
 class SimpleNormalize(nn.Module):
-    def __init__(self, mean = -18.4903, std = 19.8031):
+    def __init__(self, mean = -30.8645, std = 21.1952):
         super().__init__()
         self.mean = mean
         self.std = std

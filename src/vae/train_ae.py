@@ -44,7 +44,7 @@ CONFIG = {
     "lr": 3e-4,               # lower LR for stability (300M model)
     "weight_decay": 1e-3,
     "latent_dim": 2048,
-    "base_channels": 32,       # 32→64→128→256 = 149M params, fits 4GB VRAM
+    "base_channels": 16,       # 16→32→64→128 = ~37M params
     "optimizer": "AdamW",
     "scheduler": "CosineAnnealingLR",
 
@@ -191,7 +191,6 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed = model(spectrograms)
-                reconstructed = torch.clamp(reconstructed, -10, 10)
                 loss = loss_fn(reconstructed, spectrograms)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -200,7 +199,6 @@ def train_epoch(model, train_loader, loss_fn, optimizer, device, train_tfm,
             scaler.update()
         else:
             reconstructed = model(spectrograms)
-            reconstructed = torch.clamp(reconstructed, -10, 10)
             loss = loss_fn(reconstructed, spectrograms)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

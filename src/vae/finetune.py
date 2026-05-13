@@ -41,13 +41,13 @@ CONFIG = {
     "device": "auto",
     "train_fraction": 0.8,     # 80% train (test folded in)
     "val_fraction": 0.2,
-    "lr": 5e-4,                # lower LR for fine-tuning
+    "lr": 1e-4,                # lower LR — VAE is more sensitive
     "latent_dim": 2048,
-    "base_channels": 32,       # must match autoencoder
+    "base_channels": 16,       # must match autoencoder (was 32, now 16 → 74M params)
     "embed_dim": 128,          # class embedding for FiLM (was 64)
     "beta": 0.01,              # target KL weight
     "free_bits": 0.1,          # prevent dead latent dims
-    "warmup_epochs": 5,        # frozen encoder/decoder, β=0
+    "warmup_epochs": 3,        # frozen encoder/decoder, β=0 (shorter — pretrained AE is good)
     "ramp_epochs": 15,         # β exponential ramp
     "beta_k": 3,               # curve steepness
     "class_loss_weight": 0.5,  # classifier supervision weight
@@ -58,14 +58,15 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 2,       # 4GB VRAM safe
+        "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
         "num_workers": 1,
     },
 
     "train": {
         "num_epochs": 40,
-        "batch_size": 2,       # 4GB VRAM safe
-        "num_workers": 4,
+        "batch_size": 1,       # 1 + grad accum — safer for VAE + classifier on 4GB
+        "gradient_accumulation_steps": 2,  # effective batch = 2
+        "num_workers": 2,
     }
 }
 
@@ -76,6 +77,7 @@ SETTINGS = CONFIG[MODE]
 NUM_EPOCHS = SETTINGS["num_epochs"]
 BATCH_SIZE = SETTINGS["batch_size"]
 NUM_WORKERS = SETTINGS["num_workers"]
+GRAD_ACCUM = SETTINGS.get("gradient_accumulation_steps", 1)
 TRAIN_FRACTION = CONFIG["train_fraction"]
 VAL_FRACTION = CONFIG["val_fraction"]
 LR = CONFIG["lr"]
@@ -98,6 +100,8 @@ print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Latent: {LATE
 print(f"   β: {BETA} | free_bits: {FREE_BITS} | class_loss: {CLASS_LOSS_WEIGHT}")
 print(f"   Warmup: {WARMUP_EPOCHS} epochs frozen → ramp {RAMP_EPOCHS} epochs → full β")
 print(f"   Split: {TRAIN_FRACTION*100:.0f}% train / {VAL_FRACTION*100:.0f}% val")
+print(f"   Checkpoints: {CHECKPOINT_DIR} | Best: {BEST_MODEL_PATH}")
+print(f"   Effective batch: {BATCH_SIZE} × {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM}")
 
 # ==================== DEVICE SETUP ====================
 if CONFIG["device"] == "auto":
@@ -252,42 +256,49 @@ def vae_loss(reconstructed, target, mu, log_var, beta, free_bits=0.0,
 # ==================== TRAINING FUNCTIONS ====================
 
 def train_epoch(model, train_loader, optimizer, device, train_tfm,
-                scaler, use_amp, beta, free_bits, classifier, class_loss_weight):
+                scaler, use_amp, beta, free_bits, classifier, class_loss_weight,
+                grad_accum=1):
     """Train one epoch. Returns (avg_loss, avg_recon, avg_kl)."""
     model.train()
     running_loss, running_recon, running_kl = 0.0, 0.0, 0.0
     nan_count = 0
+    accum_count = 0
 
     pbar = tqdm(train_loader, desc="  Train", leave=False)
 
-    for waveforms, labels in pbar:
+    for batch_idx, (waveforms, labels) in enumerate(pbar):
         waveforms = waveforms.to(device)
         labels = labels.to(device)
         spectrograms = train_tfm(waveforms)
 
-        optimizer.zero_grad(set_to_none=True)
-
         if use_amp:
             with autocast(device_type="cuda"):
                 reconstructed, mu, log_var = model(spectrograms, labels)
-                reconstructed = torch.clamp(reconstructed, -10, 10)
                 loss, recon_val, kl_val, cls_val = vae_loss(
                     reconstructed, spectrograms, mu, log_var, beta, free_bits,
                     classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss / grad_accum).backward()
         else:
             reconstructed, mu, log_var = model(spectrograms, labels)
-            reconstructed = torch.clamp(reconstructed, -10, 10)
             loss, recon_val, kl_val, cls_val = vae_loss(
                 reconstructed, spectrograms, mu, log_var, beta, free_bits,
                 classifier=classifier, labels=labels, class_loss_weight=class_loss_weight)
-            loss.backward()
+            (loss / grad_accum).backward()
+
+        accum_count += 1
+
+        # Step only after accumulating enough batches
+        if accum_count >= grad_accum:
+            if use_amp:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            accum_count = 0
 
         if torch.isnan(loss):
             nan_count += 1
@@ -301,6 +312,18 @@ def train_epoch(model, train_loader, optimizer, device, train_tfm,
             "loss": f"{loss.item():.4f}", "mse": f"{recon_val:.4f}",
             "kl": f"{kl_val:.1f}",
         })
+
+    # Handle leftover accumulated gradients
+    if accum_count > 0:
+        if use_amp:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
     if nan_count > 0:
         tqdm.write(f"⚠️  {nan_count} batches had NaN loss — skipping")
@@ -387,7 +410,8 @@ def training_loop():
             epoch_loss, epoch_recon, epoch_kl = train_epoch(
                 model, train_loader, optimizer, device, train_transform,
                 scaler, use_amp, beta_val, FREE_BITS,
-                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT)
+                classifier=classifier, class_loss_weight=CLASS_LOSS_WEIGHT,
+                grad_accum=GRAD_ACCUM)
 
             _, epoch_val_recon, epoch_val_kl, epoch_val_cls = validate_epoch(
                 model, val_loader, device, eval_transform, beta_val, FREE_BITS,

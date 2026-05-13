@@ -586,10 +586,8 @@ def training_loop():
             # Save best (using EMA weights — these are what you want at inference)
             if val_loss < best_val:
                 best_val = val_loss
-                best_epoch_path = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best_epoch{epoch+1:03d}.pth")
-                torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, best_epoch_path)
                 torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_PATH)
-                print(f"      💾 Best model saved → {best_epoch_path} (val={best_val:.4f})")
+                print(f"      💾 Best model saved (val={best_val:.4f})")
     except KeyboardInterrupt:
         print(f"\n⏸️  Interrupted at epoch {epoch+1}. Checkpoint saved — resume anytime.")
 
