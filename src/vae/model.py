@@ -50,9 +50,15 @@ class FiLMDecoderStage(nn.Module):
         self.proj = nn.Conv2d(out_ch + enc_skip_ch, out_ch, kernel_size=1)
 
         # Self-attention for generation mode (replaces encoder skip connections)
-        # Only used when enc_skip is None
+        # Only used when enc_skip is None. Residual connection preserves conv features.
         from vae.blocks import SelfAttention1D
-        self.gen_attn = SelfAttention1D(out_ch, num_heads=4) if enc_skip_ch > 0 else None
+        if enc_skip_ch > 0:
+            self.gen_attn = SelfAttention1D(out_ch, num_heads=4)
+            # Zero-init projection → residual starts as identity (h = h + 0)
+            nn.init.zeros_(self.gen_attn.proj.weight)
+            nn.init.zeros_(self.gen_attn.proj.bias)
+        else:
+            self.gen_attn = None
 
     def forward(self, h: torch.Tensor, cond: torch.Tensor,
                 enc_skip: torch.Tensor = None) -> torch.Tensor:
@@ -75,8 +81,8 @@ class FiLMDecoderStage(nn.Module):
             h = torch.cat([h, enc_skip], dim=1)
             h = self.proj(h)
         elif self.gen_attn is not None:
-            # Generation mode: self-attention creates spatial structure
-            h = self.gen_attn(h)
+            # Generation mode: residual self-attention adds spatial structure
+            h = h + self.gen_attn(h)
 
         return h
 
@@ -148,6 +154,12 @@ class ImprovedVAE(nn.Module):
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
+
+        # Zero-init gen_attn projections (residual starts as identity)
+        for stage in [self.dec4, self.dec3, self.dec2]:
+            if stage.gen_attn is not None:
+                nn.init.zeros_(stage.gen_attn.proj.weight)
+                nn.init.zeros_(stage.gen_attn.proj.bias)
 
     def encode_to_params(self, x: torch.Tensor):
         """Encode spectrogram → (μ, log_var)."""
