@@ -165,18 +165,27 @@ print(f"✅ Model: {n_params:,} params ({n_params/1e6:.1f}M)")
 
 # ==================== CLASSIFIER ====================
 from model import SimpleAudioCNN, ImprovedAudioCNN
-classifier = ImprovedAudioCNN(num_classes=num_classes)
+
+classifier = None
 if os.path.exists(CLASSIFIER_PATH):
     cls_ckpt = torch.load(CLASSIFIER_PATH, map_location=device, weights_only=True)
-    classifier.load_state_dict(cls_ckpt["model_state_dict"])
-    classifier.to(device)
-    classifier.eval()
-    for p in classifier.parameters():
-        p.requires_grad = False
-    print(f"✅ Classifier loaded (val_acc={cls_ckpt.get('val_accuracy', '?')}%)")
-else:
-    classifier = None
-    print(f"⚠️  No classifier — class loss disabled")
+    # Try both architectures — checkpoint may be old or new format
+    for ClsModel in [ImprovedAudioCNN, SimpleAudioCNN]:
+        try:
+            classifier = ClsModel(num_classes=num_classes)
+            classifier.load_state_dict(cls_ckpt["model_state_dict"], strict=True)
+            classifier.to(device)
+            classifier.eval()
+            for p in classifier.parameters():
+                p.requires_grad = False
+            print(f"✅ Classifier loaded ({ClsModel.__name__}, val_acc={cls_ckpt.get('val_accuracy', '?')}%)")
+            break
+        except RuntimeError:
+            continue
+
+if classifier is None:
+    print(f"⚠️  Classifier architecture mismatch — class_loss disabled")
+    print(f"   Run: python src/train_classifier.py  (takes <1 min on GPU)")
 
 # ==================== TRAINING SETUP ====================
 reconstruction_loss = nn.MSELoss()
