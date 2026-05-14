@@ -174,6 +174,7 @@ class SpectrogramUNet(nn.Module):
 
         # ── Encoder ──────────────────────────────────────
         self.encoder_blocks = nn.ModuleList()
+        self.encoder_attns = nn.ModuleList()   # attention at selected encoder levels
         self.downsamples = nn.ModuleList()
         in_ch = base_ch
 
@@ -184,6 +185,11 @@ class SpectrogramUNet(nn.Module):
                 level.append(ResBlock(in_ch, out_ch, time_out_dim, config.class_emb_dim, config.dropout))
                 in_ch = out_ch
             self.encoder_blocks.append(level)
+            # Attention at this encoder level if configured
+            if i in config.attention_levels:
+                self.encoder_attns.append(SelfAttention2D(out_ch, num_heads=8))
+            else:
+                self.encoder_attns.append(nn.Identity())
             if i < n_levels - 1:
                 self.downsamples.append(Downsample(out_ch))
 
@@ -191,32 +197,31 @@ class SpectrogramUNet(nn.Module):
         self.bottleneck = nn.ModuleList()
         for _ in range(config.res_blocks_per_level):
             self.bottleneck.append(ResBlock(in_ch, in_ch, time_out_dim, config.class_emb_dim, config.dropout))
-
-        # Attention at bottleneck (deepest resolution)
-        self.bottleneck_attn = SelfAttention2D(in_ch, num_heads=4)
+        self.bottleneck_attn = SelfAttention2D(in_ch, num_heads=8)
 
         # ── Decoder ─────────────────────────────────────
         self.decoder_blocks = nn.ModuleList()
+        self.decoder_attns = nn.ModuleList()   # attention at selected decoder levels
         self.upsamples = nn.ModuleList()
 
         ch_list = [base_ch * m for m in ch_mults]  # encoder channel list
         for i in reversed(range(n_levels)):
             out_ch = ch_list[i]
 
-            # Upsample: brings resolution from previous level to current level.
-            # Channel count = in_ch (which holds the channel count flowing in).
             if i < n_levels - 1:
                 self.upsamples.append(Upsample(in_ch))
 
-            # ResBlock list for this level.
-            # First block: concat(skip, upsampled_h) → in_ch + skip_ch → out_ch
-            # Subsequent blocks: out_ch → out_ch
             level = nn.ModuleList()
             skip_ch = ch_list[i]
             for j in range(config.res_blocks_per_level):
                 block_in = (in_ch + skip_ch) if j == 0 else out_ch
                 level.append(ResBlock(block_in, out_ch, time_out_dim, config.class_emb_dim, config.dropout))
             self.decoder_blocks.append(level)
+            # Attention at this decoder level if configured
+            if i in config.attention_levels:
+                self.decoder_attns.append(SelfAttention2D(out_ch, num_heads=8))
+            else:
+                self.decoder_attns.append(nn.Identity())
             in_ch = out_ch
 
         # ── Output ──────────────────────────────────────
@@ -238,6 +243,7 @@ class SpectrogramUNet(nn.Module):
         for i in range(n_levels):
             for block in self.encoder_blocks[i]:
                 h = block(h, t_emb, c_emb)
+            h = self.encoder_attns[i](h)   # attention at this level
             skips.append(h)
             if i < n_levels - 1:
                 h = self.downsamples[i](h)
@@ -248,15 +254,11 @@ class SpectrogramUNet(nn.Module):
         h = self.bottleneck_attn(h)
 
         # ── Decoder ─────────────────────────────────────
-        # Decoder processes from deepest to shallowest.
-        # Level i=0 is deepest (matches encoder level n_levels-1), i=n_levels-1 is shallowest.
-        # skip_idx maps: decoder level 0 → skips[n_levels-1], ..., decoder level n_levels-1 → skips[0]
         for dec_idx in range(n_levels):
             if dec_idx > 0:
                 h = self.upsamples[dec_idx - 1](h)
 
             skip = skips[n_levels - 1 - dec_idx]
-            # Align spatial sizes (odd dimensions may drift by 1 pixel)
             if h.shape[-2:] != skip.shape[-2:]:
                 h = F.interpolate(h, size=skip.shape[-2:], mode='nearest')
 
@@ -264,6 +266,7 @@ class SpectrogramUNet(nn.Module):
 
             for block in self.decoder_blocks[dec_idx]:
                 h = block(h, t_emb, c_emb)
+            h = self.decoder_attns[dec_idx](h)  # attention at this level
 
         # ── Output ──────────────────────────────────────
         return self.output_proj(h)

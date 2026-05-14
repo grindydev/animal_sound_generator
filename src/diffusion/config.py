@@ -24,12 +24,12 @@ class DiffusionConfig:
     cosine_s: float = 0.008              # cosine schedule offset (Improved DDPM)
 
     # ── U-Net ────────────────────────────────────────────
-    base_channels: int = 64               # channels at first level
-    channel_multipliers: tuple = (1, 2, 3, 3)  # [64, 128, 192, 192]
-    res_blocks_per_level: int = 2
-    attention_levels: tuple = (2, 3)      # apply self-attention at levels 2 and 3
-    time_emb_dim: int = 256               # sinusoidal time embedding size
-    class_emb_dim: int = 64               # animal class embedding size
+    base_channels: int = 128              # channels at first level (was 64)
+    channel_multipliers: tuple = (1, 2, 4, 4)  # [128, 256, 512, 512] (was 1,2,3,3)
+    res_blocks_per_level: int = 3         # was 2 — deeper per resolution
+    attention_levels: tuple = (0, 1, 2, 3)  # attention at ALL levels (was 2,3 only)
+    time_emb_dim: int = 512               # sinusoidal time embedding size (was 256)
+    class_emb_dim: int = 256              # animal class embedding size (was 64)
     num_classes: int = 8                  # Dog, Cat, Rooster, Frog, Crow, Insect, Hen, Noise
     dropout: float = 0.1
 

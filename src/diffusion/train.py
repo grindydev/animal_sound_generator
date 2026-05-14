@@ -64,23 +64,23 @@ CONFIG = {
     "save_interval": cfg.save_interval,
     "log_interval": cfg.log_interval,
 
-    # ── VAE Mix-in (teaches diffusion to handle VAE-generated data) ──
-    "vae_checkpoint": "models/best_vae_finetune_train.pth",  # path to trained VAE
-    "vae_mix_ratio": 1.0,    # 100% VAE-generated — train ONLY on what inference sees
-                              # VAE output has low variance (std≈0.33 vs real≈0.70)
-                              # So keep strength ≤ 0.10 at inference for safe SNR > 2
+    # ── Training mode: DDPM on REAL mels (not VAE refinement) ──
+    # vae_mix_ratio=0 → train on real mel spectrograms only
+    # This makes diffusion the PRIMARY generator (not a refiner)
+    "vae_checkpoint": None,         # no VAE needed for DDPM training
+    "vae_mix_ratio": 0.0,           # 0% VAE = 100% real mels
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 4,
-        "num_workers": 1,
+        "batch_size": 8,            # 120M UNet on L4
+        "num_workers": 2,
     },
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 3,           # was 1 — GTX 1650 4GB max
-        "num_workers": 0,
-        "gradient_accumulation_steps": 2,  # effective batch = 3 × 2 = 6
+        "batch_size": 8,            # 120M UNet on L4
+        "num_workers": 4,
+        "gradient_accumulation_steps": 2,  # effective batch = 16
     },
 }
 

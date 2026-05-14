@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
 
 from vae import ImprovedVAE
-from diffusion.inference import refine_spectrogram
+from diffusion.inference import refine_spectrogram, generate_from_noise
 from hifigan.inference import mel_to_waveform
 
 
@@ -50,30 +50,38 @@ def generate_one(
     use_diffusion=True,
     strength=0.6,
     diffusion_steps=50,
-    use_griffin_lim=True,
+    use_griffin_lim=False,
     griffin_lim_iters=5,
+    from_scratch=False,
 ):
     """Generate one animal sound through the full pipeline."""
     label_idx = CLASS_TO_IDX[label]
 
-    # Step 1: VAE generates rough spectrogram
-    vae_mel = vae.sample(label_idx, num_samples=1, device=device, temperature=temperature)
-
-    # Step 1b: Normalize VAE output — rescale to match real spectrogram statistics
-    # (Safety net: if decoder produces wrong distribution, this fixes it for HiFi-GAN)
-    vae_mel = torch.clamp(vae_mel, -4.0, 4.0)  # clip extreme outliers
-    mel_mean = vae_mel.mean()
-    mel_std = vae_mel.std()
-    if mel_std > 0.01:
-        vae_mel = (vae_mel - mel_mean) / mel_std * 0.7  # target std=0.7 (real is ~0.5-1.0)
-
-    # Step 2: Diffusion refinement (optional)
-    if use_diffusion:
-        vae_mel = refine_spectrogram(
-            vae_mel, label_idx=label_idx,
-            strength=strength, num_steps=diffusion_steps,
-            device=device, use_ddim=True,
+    if from_scratch:
+        # Path B: pure diffusion generation from noise (no VAE)
+        vae_mel = generate_from_noise(
+            label_idx=label_idx, num_samples=1,
+            num_steps=diffusion_steps, device=device,
         )
+    else:
+        # Path A: VAE generation + optional diffusion refinement
+        # Step 1: VAE generates rough spectrogram
+        vae_mel = vae.sample(label_idx, num_samples=1, device=device, temperature=temperature)
+
+        # Step 1b: Normalize VAE output
+        vae_mel = torch.clamp(vae_mel, -4.0, 4.0)
+        mel_mean = vae_mel.mean()
+        mel_std = vae_mel.std()
+        if mel_std > 0.01:
+            vae_mel = (vae_mel - mel_mean) / mel_std * 0.7
+
+        # Step 2: Diffusion refinement (optional)
+        if use_diffusion:
+            vae_mel = refine_spectrogram(
+                vae_mel, label_idx=label_idx,
+                strength=strength, num_steps=diffusion_steps,
+                device=device, use_ddim=True,
+            )
 
     # Step 3: HiFi-GAN converts mel → waveform
     waveform = mel_to_waveform(
@@ -98,7 +106,9 @@ def main():
     parser.add_argument("--diffusion-steps", type=int, default=50,
                         help="DDIM sampling steps (fewer=faster, more=sharper)")
     parser.add_argument("--no-diff", action="store_true",
-                        help="Skip diffusion refinement (VAE only)")
+                        help="Skip diffusion (VAE only)")
+    parser.add_argument("--from-scratch", action="store_true",
+                        help="Pure diffusion generation from noise (no VAE needed)")
     parser.add_argument("--griffin-lim", action="store_true",
                         help="Enable Griffin-Lim phase refinement (off by default)")
     parser.add_argument("--output-dir", type=str, default="outputs/generated",
@@ -124,14 +134,18 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ── Load models ─────────────────────────────────────
-    vae = load_vae(device)
+    if args.from_scratch:
+        vae = None  # no VAE needed for pure diffusion generation
+        print("🎲 Pure diffusion generation from noise (no VAE)")
+    else:
+        vae = load_vae(device)
 
     # ── Generate ────────────────────────────────────────
     labels = [args.label] if args.label else CLASSES
 
     for label in labels:
         for i in range(args.count):
-            tag = f"{'diff' if not args.no_diff else 'vae'}"
+            tag = 'scratch' if args.from_scratch else ('diff' if not args.no_diff else 'vae')
             fname = f"{label}_{tag}_s{args.strength}_t{args.temperature}_{timestamp}_{i+1}.wav"
             out_path = os.path.join(args.output_dir, fname)
 
@@ -144,6 +158,7 @@ def main():
                 strength=args.strength,
                 diffusion_steps=args.diffusion_steps,
                 use_griffin_lim=args.griffin_lim,
+                from_scratch=args.from_scratch,
             )
 
             # Normalize to [-1, 1]
