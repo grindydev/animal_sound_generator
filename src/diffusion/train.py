@@ -72,15 +72,15 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 4,            # 50M UNet on L4
+        "batch_size": 8,            # v6: 15M UNet (was 4)
         "num_workers": 2,
     },
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 4,            # 50M UNet on L4
+        "batch_size": 8,            # v6: 15M UNet (was 4)
         "num_workers": 4,
-        "gradient_accumulation_steps": 4,  # effective batch = 16
+        "gradient_accumulation_steps": 4,  # effective batch = 32
     },
 }
 
@@ -356,11 +356,45 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  DATA AUGMENTATION
+# ═══════════════════════════════════════════════════════════════
+
+def spec_augment(mel: torch.Tensor, freq_mask: int = 8, time_mask: int = 50) -> torch.Tensor:
+    """SpecAugment: randomly mask frequency and time bands."""
+    # mel: [B, 1, F, T]
+    B, C, F, T = mel.shape
+    # Frequency masking
+    for _ in range(2):
+        f = np.random.randint(0, freq_mask + 1)
+        if f > 0:
+            f0 = np.random.randint(0, F - f)
+            mel[:, :, f0:f0+f, :] = 0
+    # Time masking
+    for _ in range(2):
+        t = np.random.randint(0, time_mask + 1)
+        if t > 0:
+            t0 = np.random.randint(0, T - t)
+            mel[:, :, :, t0:t0+t] = 0
+    return mel
+
+
+# ═══════════════════════════════════════════════════════════════
 #  TRAIN / VALIDATE
 # ═══════════════════════════════════════════════════════════════
 
+def get_loss_fn():
+    """Return loss function based on config."""
+    if cfg.loss_type == "l1":
+        return F.l1_loss
+    elif cfg.loss_type == "huber":
+        return lambda pred, tgt: F.smooth_l1_loss(pred, tgt, beta=0.1)
+    return F.mse_loss
+
+
 def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
     """Train one epoch with gradient accumulation and optional EMA. Returns average loss."""
+    loss_fn = get_loss_fn()
+    uncond_prob = getattr(cfg, 'uncond_prob', 0.0)
     model.train()
     total_loss = 0.0
     pbar = tqdm(train_loader, desc="  Train", leave=False)
@@ -372,6 +406,14 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         labels = labels.to(device)   # [B]
         B = mel.shape[0]
 
+        # SpecAugment: mask freq/time bands (prevents memorization)
+        if cfg.dropout > 0:
+            mel = spec_augment(mel)
+
+        # Unconditional training: randomly drop labels for CFG
+        if uncond_prob > 0 and np.random.random() < uncond_prob:
+            labels = torch.full_like(labels, cfg.num_classes)
+
         # Sample random timesteps
         t = torch.randint(0, diffusion.timesteps, (B,), device=device)
 
@@ -382,8 +424,8 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         # U-Net predicts noise
         pred_noise = model(x_t, t, labels)
 
-        # Loss: MSE between predicted and actual noise, scaled for accumulation
-        loss = F.mse_loss(pred_noise, noise) / GRADIENT_ACCUMULATION_STEPS
+        # Loss (L1/L2/Huber based on config)
+        loss = loss_fn(pred_noise, noise) / GRADIENT_ACCUMULATION_STEPS
 
         loss.backward()
         accum_count += 1
@@ -421,7 +463,8 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
 
 
 def validate(model, diffusion, val_loader, ema_model=None):
-    """Validate — returns average MSE loss. If ema_model provided, validates with EMA weights."""
+    """Validate — returns average loss using configured loss_fn. Uses EMA weights if provided."""
+    loss_fn = get_loss_fn()
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
     total_loss = 0.0
@@ -436,7 +479,7 @@ def validate(model, diffusion, val_loader, ema_model=None):
             noise = torch.randn_like(mel)
             x_t = diffusion.q_sample(mel, t, noise)
             pred_noise = eval_model(x_t, t, labels)
-            loss = F.mse_loss(pred_noise, noise)
+            loss = loss_fn(pred_noise, noise)
             total_loss += loss.item()
 
     return total_loss / max(len(val_loader), 1)
@@ -460,7 +503,8 @@ def training_loop():
         print(f"   GPU:    {torch.cuda.get_device_name(0)}")
     eff_batch = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Accum: {GRADIENT_ACCUMULATION_STEPS} | Effective: {eff_batch} | Workers: {NUM_WORKERS}")
-    print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M)")
+    print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M) | Loss: {cfg.loss_type}")
+    print(f"   SpecAugment: yes | CFG: uncond_prob={cfg.uncond_prob}, cfg_scale={cfg.cfg_scale}")
     print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
     print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
     print(f"   VAE mix-in ratio: {CONFIG.get('vae_mix_ratio', 0)*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")
@@ -556,7 +600,7 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING — {MODE.upper()} MODE")
+    print(f"🚀 DIFFUSION TRAINING v6 — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")

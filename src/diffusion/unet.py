@@ -170,7 +170,8 @@ class SpectrogramUNet(nn.Module):
 
         # Time + class embeddings
         self.time_embed = SinusoidalTimeEmbedding(config.time_emb_dim)
-        self.class_embed = nn.Embedding(config.num_classes, config.class_emb_dim)
+        self.class_embed = nn.Embedding(config.num_classes + 1, config.class_emb_dim)  # +1 for null (uncond)
+        self.null_class_idx = config.num_classes
 
         # ── Encoder ──────────────────────────────────────
         self.encoder_blocks = nn.ModuleList()
@@ -233,6 +234,8 @@ class SpectrogramUNet(nn.Module):
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         t_emb = self.time_embed(t)
+        # Handle null label (unconditional) — map to null embedding
+        labels = labels.clamp(0, self.null_class_idx)
         c_emb = self.class_embed(labels)
         n_levels = len(self.encoder_blocks)
 

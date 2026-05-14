@@ -54,6 +54,7 @@ def generate_one(
     griffin_lim_iters=5,
     from_scratch=False,
     use_ddpm=False,
+    cfg_scale=2.0,
 ):
     """Generate one animal sound through the full pipeline."""
     label_idx = CLASS_TO_IDX[label]
@@ -64,6 +65,7 @@ def generate_one(
             label_idx=label_idx, num_samples=1,
             num_steps=diffusion_steps, device=device,
             use_ddpm=use_ddpm,
+            cfg_scale=cfg_scale,
         )
     else:
         # Path A: VAE generation + optional diffusion refinement
@@ -113,6 +115,8 @@ def main():
                         help="Pure diffusion generation from noise (no VAE needed)")
     parser.add_argument("--ddpm", action="store_true",
                         help="Use full DDPM sampling (slower, more diverse than DDIM)")
+    parser.add_argument("--cfg-scale", type=float, default=2.0,
+                        help="Classifier-free guidance scale (1.0=no CFG, 2.0=sharper)")
     parser.add_argument("--griffin-lim", action="store_true",
                         help="Enable Griffin-Lim phase refinement (off by default)")
     parser.add_argument("--output-dir", type=str, default="outputs/generated",
@@ -164,6 +168,7 @@ def main():
                 use_griffin_lim=args.griffin_lim,
                 from_scratch=args.from_scratch,
                 use_ddpm=args.ddpm,
+                cfg_scale=args.cfg_scale,
             )
 
             # Normalize to [-1, 1]

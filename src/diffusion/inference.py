@@ -101,6 +101,7 @@ def generate_from_noise(
     device: torch.device = None,
     spec_shape: tuple = (64, 552),
     use_ddpm: bool = False,
+    cfg_scale: float = 2.0,
 ) -> torch.Tensor:
     """
     Generate mel spectrogram from pure Gaussian noise using diffusion.
@@ -112,6 +113,7 @@ def generate_from_noise(
         device:      torch device
         spec_shape:  (n_mels, time_frames) — default (64, 552)
         use_ddpm:    use full DDPM sampling (slower, more diverse)
+        cfg_scale:   classifier-free guidance (>1.0 sharpens output)
     Returns:
         generated mel [num_samples, 1, 64, T]
     """
@@ -122,11 +124,15 @@ def generate_from_noise(
     labels = torch.full((num_samples,), label_idx, device=device, dtype=torch.long)
 
     if use_ddpm:
-        x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
-        generated = diffusion.p_sample_loop(model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]), labels, device, progress=True)
+        generated = diffusion.p_sample_loop(
+            model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]),
+            labels, device, progress=True, cfg_scale=cfg_scale
+        )
     else:
         x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
-        generated = diffusion.ddim_sample(model, x_t, labels, num_steps=num_steps, eta=0.0)
+        generated = diffusion.ddim_sample(
+            model, x_t, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale
+        )
 
     return generated.cpu()
 

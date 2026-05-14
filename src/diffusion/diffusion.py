@@ -35,6 +35,7 @@ class DiffusionProcess(nn.Module):
             config = cfg
         self.config = config
         self.timesteps = config.timesteps
+        self.num_classes = config.num_classes
 
         # Build noise schedule
         if getattr(config, 'use_linear_schedule', False):
@@ -99,20 +100,17 @@ class DiffusionProcess(nn.Module):
     #  Reverse Process: p(x_{t-1} | x_t) — DDPM sampling
     # ═════════════════════════════════════════════════════════
 
-    def p_sample(self, model, x_t: torch.Tensor, t: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def p_sample(self, model, x_t: torch.Tensor, t: torch.Tensor, labels: torch.Tensor,
+                 null_labels=None, cfg_scale=1.0) -> torch.Tensor:
         """
         Single DDPM denoising step: x_t → x_{t-1}.
-
-        Args:
-            model:  U-Net that predicts noise ε_θ(x_t, t, labels)
-            x_t:    noisy spectrogram at timestep t [B, C, H, W]
-            t:      current timestep [B]
-            labels: class labels [B]
-        Returns:
-            x_{t-1} denoised spectrogram [B, C, H, W]
+        Supports classifier-free guidance.
         """
-        # Predict noise
+        # Predict noise (with optional CFG)
         pred_noise = model(x_t, t, labels)
+        if null_labels is not None and cfg_scale != 1.0:
+            pred_uncond = model(x_t, t, null_labels)
+            pred_noise = pred_uncond + cfg_scale * (pred_noise - pred_uncond)
 
         # Simplified posterior mean: (x_t - beta_t/sqrt(1-alpha_cumprod) * pred_noise) / sqrt(alpha_t)
         beta_t = self._get(self.betas, t, x_t)
@@ -137,50 +135,33 @@ class DiffusionProcess(nn.Module):
         labels: torch.Tensor,
         num_steps: int = 50,
         eta: float = 0.0,
+        cfg_scale: float = 1.0,
     ) -> torch.Tensor:
-        """
-        DDIM sampling: denoise in `num_steps` steps instead of full T.
-        eta=0.0 → fully deterministic DDIM
-        eta=1.0 → equivalent to DDPM (stochastic)
-
-        Args:
-            model:     U-Net noise predictor
-            x_t:       starting noisy tensor [B, C, H, W]
-            labels:    class labels [B]
-            num_steps: number of sampling steps (< T)
-            eta:       stochasticity (0.0 = deterministic)
-        Returns:
-            denoised x_0 [B, C, H, W]
-        """
+        """DDIM sampling with optional classifier-free guidance."""
         device = x_t.device
-        # Uniformly spaced timesteps (descending)
+        b = x_t.shape[0]
+        null_labels = torch.full((b,), self.num_classes, device=device, dtype=torch.long) if cfg_scale != 1.0 else None
         times = torch.linspace(self.timesteps - 1, 0, num_steps, device=device).long()
 
         for i in range(len(times) - 1):
-            t = times[i]                    # current timestep
-            t_next = times[i + 1]           # next timestep
+            t = times[i]
+            t_next = times[i + 1]
+            t_batch = torch.full((b,), t, device=device, dtype=torch.long)
 
-            t_batch = torch.full((x_t.shape[0],), t, device=device, dtype=torch.long)
-
-            # Predict noise
+            # Predict noise (with optional CFG)
             pred_noise = model(x_t, t_batch, labels)
+            if null_labels is not None:
+                pred_uncond = model(x_t, t_batch, null_labels)
+                pred_noise = pred_uncond + cfg_scale * (pred_noise - pred_uncond)
 
-            # Predict x_0
             alpha_cumprod_t = self.alphas_cumprod[t]
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_cumprod_t)
             x_0_pred = (x_t - sqrt_one_minus_alpha_t * pred_noise) / torch.sqrt(alpha_cumprod_t)
-
-            # Clamp to valid normalized spectrogram range (real mels: ~[-3, 4])
             x_0_pred = torch.clamp(x_0_pred, -4.0, 4.0)
 
-            # Compute sigma (stochasticity)
             alpha_cumprod_next = self.alphas_cumprod[t_next]
             sigma = eta * torch.sqrt((1.0 - alpha_cumprod_next) / (1.0 - alpha_cumprod_t) * (1.0 - alpha_cumprod_t / alpha_cumprod_next))
-
-            # Direction pointing to x_t
             direction = torch.sqrt(1.0 - alpha_cumprod_next - sigma ** 2) * pred_noise
-
-            # x_{t_next} = sqrt(alpha_next) * x_0_pred + direction + sigma * noise
             noise = torch.randn_like(x_t) if eta > 0 else 0.0
             x_t = torch.sqrt(alpha_cumprod_next) * x_0_pred + direction + sigma * noise
 
@@ -191,21 +172,12 @@ class DiffusionProcess(nn.Module):
     # ═════════════════════════════════════════════════════════
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, labels: torch.Tensor, device, progress: bool = False) -> torch.Tensor:
-        """
-        Full DDPM reverse process: pure noise → clean spectrogram.
-
-        Args:
-            model:    U-Net noise predictor
-            shape:    (B, C, H, W) output shape
-            labels:   class labels [B]
-            device:   torch device
-            progress: show tqdm progress bar
-        Returns:
-            denoised spectrogram [B, C, H, W]
-        """
+    def p_sample_loop(self, model, shape, labels: torch.Tensor, device,
+                      progress: bool = False, cfg_scale: float = 1.0) -> torch.Tensor:
+        """Full DDPM reverse process with optional CFG."""
         b = shape[0]
         x_t = torch.randn(shape, device=device)
+        null_labels = torch.full((b,), self.num_classes, device=device, dtype=torch.long) if cfg_scale != 1.0 else None
 
         timesteps = list(reversed(range(self.timesteps)))
         if progress:
@@ -214,7 +186,7 @@ class DiffusionProcess(nn.Module):
 
         for t_step in timesteps:
             t = torch.full((b,), t_step, device=device, dtype=torch.long)
-            x_t = self.p_sample(model, x_t, t, labels)
+            x_t = self.p_sample(model, x_t, t, labels, null_labels, cfg_scale)
 
         return x_t
 

@@ -24,14 +24,14 @@ class DiffusionConfig:
     use_linear_schedule: bool = True      # linear schedule → more signal at high t (vs cosine)
 
     # ── U-Net ────────────────────────────────────────────
-    base_channels: int = 96               # channels at first level (balanced for L4 24GB)
-    channel_multipliers: tuple = (1, 2, 3, 4)  # [96, 192, 288, 384]
-    res_blocks_per_level: int = 2         # 2 blocks per resolution
-    attention_levels: tuple = (2, 3)      # attention at deepest 2 levels (288ch, 384ch)
+    base_channels: int = 64               # v6: ~18M params (was 96 → 61M overfit)
+    channel_multipliers: tuple = (1, 2, 2, 4)  # [48, 96, 96, 192] (was (1,2,3,4))
+    res_blocks_per_level: int = 1         # 1 block per level (was 2)
+    attention_levels: tuple = (3,)        # attention only at deepest level (was (2,3))
     time_emb_dim: int = 512               # sinusoidal time embedding size
-    class_emb_dim: int = 256              # animal class embedding size (was 64)
+    class_emb_dim: int = 256              # animal class embedding size
     num_classes: int = 8
-    dropout: float = 0.1
+    dropout: float = 0.2                  # v6: more dropout (was 0.1)
 
     # ── Training ──────────────────────────────────────────
     segment_frames: int = 552             # ~5 seconds of mel frames (at hop_length=200)
@@ -44,12 +44,14 @@ class DiffusionConfig:
     num_workers: int = 0
     grad_clip_norm: float = 5.0           # relaxed clipping for diffusion
     ema_decay: float = 0.9999             # EMA decay for smoothed inference weights
-    loss_type: str = "l2"                 # "l2" = MSE | "l1" = MAE | "huber" = smooth L1
+    loss_type: str = "l1"                 # v6: L1 loss → penalizes mean regression less (was "l2")
 
     # ── Inference ────────────────────────────────────────
-    inference_steps: int = 50             # DDIM sampling steps
+    inference_steps: int = 100            # DDIM/DDPM sampling steps (was 50)
     refinement_strength: float = 0.6      # default img2img strength (0.0-1.0)
-    ddim_eta: float = 0.0                # DDIM stochasticity (0.0 = deterministic, 1.0 = DDPM)
+    ddim_eta: float = 0.0                # DDIM stochasticity (0.0 = deterministic)
+    cfg_scale: float = 2.0               # classifier-free guidance scale (1.0 = no CFG)
+    uncond_prob: float = 0.15             # v6: fraction of training batches w/o label (CFG)
 
     # ── Paths ────────────────────────────────────────────
     data_dir: str = "data/animal_audio"
