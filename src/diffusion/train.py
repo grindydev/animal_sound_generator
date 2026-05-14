@@ -72,15 +72,15 @@ CONFIG = {
 
     "test": {
         "num_epochs": 5,
-        "batch_size": 8,            # 120M UNet on L4
+        "batch_size": 4,            # 50M UNet on L4
         "num_workers": 2,
     },
 
     "train": {
         "num_epochs": 50,
-        "batch_size": 8,            # 120M UNet on L4
+        "batch_size": 4,            # 50M UNet on L4
         "num_workers": 4,
-        "gradient_accumulation_steps": 2,  # effective batch = 16
+        "gradient_accumulation_steps": 4,  # effective batch = 16
     },
 }
 

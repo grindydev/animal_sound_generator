@@ -70,15 +70,14 @@ The VAE becomes optional — kept for style transfer experiments, not generation
 
 | Parameter | Old (refinement) | New (generation) | Why |
 |-----------|:---:|:---:|-----|
-| base_channels | 64 | **128** | 2× wider |
-| channel_multipliers | (1,2,3,3) | **(1,2,4,4)** | Deeper bottleneck |
-| res_blocks_per_level | 2 | **3** | More compute per resolution |
-| attention_levels | (2,3) | **(0,1,2,3)** | Attention at ALL levels |
+| base_channels | 64 | **96** | 1.5× wider |
+| channel_multipliers | (1,2,3,3) | **(1,2,3,4)** | Deeper bottleneck |
+| res_blocks_per_level | 2 | 2 | Same |
+| attention_levels | (2,3) | (2,3) | Same — deepest 2 levels |
 | time_emb_dim | 256 | **512** | Better noise prediction |
 | class_emb_dim | 64 | **256** | Stronger conditioning |
-| num_heads | 4 | **8** | More attention heads |
-| **Total params** | **18M** | **~120M** | 6.7× bigger |
-| Training data | VAE mels (blurry) | **Real mels** | Learns true distribution |
+| **Total params** | **18M** | **61M** | 3.4× bigger |
+| Training data | VAE mels | **Real mels** | Learns true distribution |
 
 ### 1.4 Normalization Consistency
 
@@ -119,7 +118,7 @@ Session: Diffusion UNet (~3-4 hours)
 
 Config:
   mode: train
-  batch_size: 8 × grad_accum=2 = effective 16
+  batch_size: 4 × grad_accum=4 = effective 16
   epochs: 50
   lr: 2e-4 (AdamW)
   data: 5171 train / 1292 val (real mel spectrograms)
