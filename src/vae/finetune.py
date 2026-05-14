@@ -359,12 +359,15 @@ def validate_epoch(model, val_loader, device, eval_tfm, beta, free_bits,
 # ==================== TRAINING LOOP ====================
 
 def freeze_except_vae_heads(model):
-    """Freeze encoder + decoder, keep VAE heads + FiLM trainable."""
+    """Freeze encoder + decoder conv layers, keep VAE heads + FiLM + gen_attn trainable."""
     frozen_prefixes = ('enc1', 'enc2', 'enc3', 'enc4', 'attn',
                        'dec4', 'dec3', 'dec2', 'dec1', 'output_conv')
+    # These sub-modules should NOT be frozen even though they're inside decoder stages
+    keep_trainable = ('film', 'gen_attn')
     for name, param in model.named_parameters():
         if any(name.startswith(p) for p in frozen_prefixes):
-            param.requires_grad = False
+            if not any(k in name for k in keep_trainable):
+                param.requires_grad = False
 
 
 def unfreeze_all(model):
