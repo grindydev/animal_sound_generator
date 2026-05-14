@@ -36,10 +36,11 @@ def load_vae(device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state = ckpt["model_state_dict"]
     base_ch = state["enc1.main.0.weight"].shape[0]
-    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=128, base_channels=base_ch).to(device)
+    embed_dim = state["class_embed.weight"].shape[1]  # auto-detect
+    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=embed_dim, base_channels=base_ch).to(device)
     model.load_state_dict(state, strict=False)
     model.eval()
-    print(f"✅ VAE loaded from {ckpt_path} (base_ch={base_ch})")
+    print(f"✅ VAE loaded (base_ch={base_ch}, embed_dim={embed_dim})")
     return model
 
 

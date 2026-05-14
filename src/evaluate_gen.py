@@ -71,10 +71,11 @@ def load_vae(checkpoint_path, num_classes, device):
     state = ckpt["model_state_dict"]
     # Auto-detect base_channels from enc1 weight shape: [base_ch, 1, 3, 3]
     base_ch = state["enc1.main.0.weight"].shape[0]
+    embed_dim = state.get("class_embed.weight", torch.zeros(1)).shape[1] if "class_embed.weight" in state else 256
     model = ImprovedVAE(
         latent_dim=ckpt["latent_dim"],
         num_classes=num_classes,
-        embed_dim=ckpt.get("embed_dim", 128),
+        embed_dim=embed_dim,
         base_channels=base_ch,
     )
     model.load_state_dict(state, strict=False)
