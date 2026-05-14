@@ -52,7 +52,7 @@ CONFIG = {
     "beta_k": 3,               # curve steepness
     "class_loss_weight": 1.0,  # classifier supervision weight (was 0.5 → stronger)
     "classifier_path": "models/best_audio_cnn_train.pth",
-    "skip_dropout": 1.0,       # ALWAYS drop skip connections (force generation-capable decoder)
+    "skip_dropout": 1.0,       # ALWAYS generation mode → gen_attn active (no encoder skips)
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
     "ae_checkpoint": "models/best_autoencoder_train.pth",  # pretrained autoencoder

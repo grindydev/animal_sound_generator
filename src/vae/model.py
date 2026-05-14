@@ -25,11 +25,15 @@ class FiLMDecoderStage(nn.Module):
     """
     One decoder level with FiLM class conditioning.
     
+    Two modes:
+      - Reconstruction (enc_skip present): concat + project (same as before)
+      - Generation (enc_skip=None): self-attention along time axis
+        replaces spatial detail that skips would normally provide.
+    
     Flow:
       h → upsample 2× → conv1 → GN → FiLM(γ,β) → SiLU → conv2 → GN
         → + residual
-        → concat encoder_skip
-        → project
+        → [if skips: concat + project] [if no skips: self-attention]
     """
     def __init__(self, in_ch: int, out_ch: int, enc_skip_ch: int, cond_dim: int):
         super().__init__()
@@ -44,6 +48,11 @@ class FiLMDecoderStage(nn.Module):
 
         self.skip_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
         self.proj = nn.Conv2d(out_ch + enc_skip_ch, out_ch, kernel_size=1)
+
+        # Self-attention for generation mode (replaces encoder skip connections)
+        # Only used when enc_skip is None
+        from vae.blocks import SelfAttention1D
+        self.gen_attn = SelfAttention1D(out_ch, num_heads=4) if enc_skip_ch > 0 else None
 
     def forward(self, h: torch.Tensor, cond: torch.Tensor,
                 enc_skip: torch.Tensor = None) -> torch.Tensor:
@@ -60,10 +69,14 @@ class FiLMDecoderStage(nn.Module):
         h = F.silu(h + residual)
 
         if enc_skip is not None:
+            # Reconstruction mode: concat encoder features
             if h.shape[-2:] != enc_skip.shape[-2:]:
                 enc_skip = F.interpolate(enc_skip, size=h.shape[-2:], mode='nearest')
             h = torch.cat([h, enc_skip], dim=1)
             h = self.proj(h)
+        elif self.gen_attn is not None:
+            # Generation mode: self-attention creates spatial structure
+            h = self.gen_attn(h)
 
         return h
 
