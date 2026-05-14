@@ -5,66 +5,54 @@
 
 ---
 
-## 1. Mel Spectrogram Quality
+## 1. Epoch 6 vs Epoch 36 Comparison
 
-| Class | Mean | Std | Min | Max | Issue |
-|-------|:---:|:---:|:---:|:---:|-------|
-| Dog | +0.72 | **7.19** | -10 | +10 | ⚠️ std=7× too high |
-| Cat | -0.47 | **7.28** | -10 | +10 | ⚠️ |
-| Rooster | +0.15 | **7.17** | -10 | +10 | ⚠️ |
-| Frog | -0.13 | **7.20** | -10 | +10 | ⚠️ |
-| Crow | +0.01 | **7.31** | -10 | +10 | ⚠️ |
-| Insect | +0.20 | **7.07** | -10 | +10 | ⚠️ |
-| Hen | -0.29 | **7.20** | -10 | +10 | ⚠️ |
-| Noise | -1.04 | **7.22** | -10 | +10 | ⚠️ |
+| Metric | Epoch 6 (val=0.60) | Epoch 36 (val=0.09) | Trend |
+|--------|:---:|:---:|:---:|
+| Mel σ | **7.2** | **2.5** | ✅ 3× better |
+| Mel mean | ~0 | ~0.6 | ⚠️ Drifted |
+| Classes with structure | **3/8** | **1/8** | ❌ Getting worse |
+| Audio RMS | 0.6-0.7 | 0.5-0.8 | ≈ Same |
+| Peak at Nyquist | 5/8 classes | **7/8 classes** | ❌ More noise |
 
-**Expected:** mean≈0, std≈1 (normalized dB spectrogram).  
-**Actual:** std≈7.2 for ALL classes. Values clamped at [-10, +10] by DDIM `x_0_pred.clamp(-10, 10)`.
+**Lower val loss ≠ better generation.** The model is overfitting — memorizing training noise patterns that don't generalize to pure noise denoising.
 
-**Root cause:** The DDIM sampling amplifies prediction errors. At high timesteps (t near T), the formula `x_0 = (x_t - sqrt(1-α_t)·pred_noise) / sqrt(α_t)` divides by sqrt(α_t) ≈ 0.02, amplifying any noise prediction error 50×. If the UNet hasn't fully converged, this produces values far outside the training range.
+---
 
-The clamp at [-10, 10] catches the worst but allows values 10× the normal range through.
+## 2. Epoch 36 Per-Class Results
 
-## 2. Audio Quality
+| Class | Mel μ | Mel σ | RMS | Peak Hz | Bass% | Verdict |
+|-------|:-----:|:-----:|:---:|:-------:|:-----:|---------|
+| Dog | +0.52 | 2.68 | 0.54 | 11025 | 18% | ❌ Noise |
+| Cat | +1.00 | 2.67 | 0.84 | 11025 | 7% | ❌ Noise |
+| **Rooster** | +0.65 | 2.45 | 0.55 | **883** | **27%** | ✅ Structure |
+| Frog | +0.79 | 2.07 | 0.65 | 11025 | 16% | ❌ Noise |
+| Crow | +1.12 | 2.37 | 0.78 | 11025 | 14% | ❌ Noise |
+| Insect | +0.24 | 2.39 | 0.77 | 11025 | 9% | ❌ Noise |
+| Hen | +0.10 | 2.48 | 0.50 | 11025 | 20% | ❌ Noise |
+| Noise | +0.62 | 1.97 | 0.70 | 11025 | 12% | ❌ Noise |
 
-| Class | RMS | Peak Freq | Bass | Flatness | Verdict |
-|-------|:---:|:---------:|:----:|:--------:|---------|
-| Dog | 0.68 | 11025 Hz | 21% | 0.21 | ⚠️ Hissy |
-| **Cat** | 0.61 | **43 Hz** | 23% | 0.21 | ✅ Has structure |
-| Rooster | 0.64 | 11025 Hz | 23% | 0.19 | ⚠️ Hissy |
-| **Crow** | 0.63 | **65 Hz** | 24% | 0.17 | ✅ Has structure |
-| **Insect** | 0.63 | **22 Hz** | 22% | 0.18 | ✅ Has structure |
-| Hen | 0.66 | 11025 Hz | 17% | 0.16 | ⚠️ Hissy |
-| Noise | 0.73 | 11025 Hz | 9% | 0.31 | ❌ White noise |
-| Frog | 0.63 | 11025 Hz | 21% | 0.18 | ⚠️ Hissy |
+---
 
-- **3/8 classes** (Cat, Crow, Insect) produce non-white-noise output — the UNet IS learning
-- All outputs are **very loud** (RMS 0.6-0.7 vs real 0.02-0.15) because mel std=7 gets unnormalized to huge dB values
-- All outputs have **bass 17-24%** (white noise would have ~50%) — there IS frequency shaping
-- Noise class is worst (least structured training data)
+## 3. Key Finding: Mel Statistics Improving, Content Degrading
 
-## 3. Class Distinctiveness
+```
+Epoch 6 (high val loss):  mel σ=7.2, 3/8 classes show structure
+Epoch 36 (low val loss): mel σ=2.5, 1/8 classes show structure
+                    Target: mel σ=1.0, 8/8 classes show structure
+```
 
-**All classes produce COMPLETELY different outputs** (cosine similarity ≈ 0 between any two classes). The class embedding IS working — the UNet generates class-specific patterns.
+The model is learning the CORRECT AMPLITUDE (σ improving toward 1.0), but the SPECTRAL CONTENT is degrading. This is a classic **mean-prediction** problem in diffusion — as loss drops, the model starts predicting the expected (average) noise, not the specific noise for each sample. The result: outputs converge to the class average spectrogram, which lacks detail.
 
-## 4. Issues Summary
+---
 
-| Issue | Severity | Cause |
-|-------|:---:|-------|
-| Mel std = 7.2 (should be 1.0) | 🔴 Critical | UNet not converged / DDIM amplifies errors at high t |
-| Values hit clamp at ±10 | 🔴 Critical | Same as above — output too large |
-| Audio too loud (RMS 0.6) | 🟡 Medium | Consequence of mel std issue |
-| 5/8 classes are hissy | 🟡 Medium | Mel with wrong std → HiFi-GAN gets wrong input range |
-| Class conditioning works | 🟢 Good | Off-diagonal cos sim ≈ 0 |
-| 3/8 classes show structure | 🟢 Good | Cat, Crow, Insect have non-Nyquist peaks |
-
-## 5. Possible Fixes (NOT APPLIED)
+## 4. Recommended Fixes (NOT APPLIED)
 
 | Fix | Expected impact |
 |-----|----------------|
-| **Tighten DDIM clamp: [-10,10] → [-4,4]** | Forces output to valid mel range. Quick fix. |
-| **Continue training (50 → 150 epochs)** | UNet learns correct amplitude. Requires more Colab time. |
-| **Reduce learning rate after epoch 50** | Fine-tune the converged model. |
-| **Use EMA weights for inference** | Smooths out noise prediction errors. |
-| **Increase batch size (reduce grad_accum)** | Better gradient estimates. |
-| **Add L1 loss** | Penalizes large deviations more than MSE. |
+| **Tighten DDIM clamp: [-10,10] → [-4,4]** | Forces output to valid range |
+| **Use classifier-free guidance (CFG=1.5)** | Sharpens output by comparing conditioned vs unconditioned predictions |
+| **Increase number of training samples (more data)** | 2700 samples / 61M params = massive overfit risk |
+| **Try checkpoint at epoch ~20-25** | Lower val loss than epoch 6, but still has content diversity |
+| **Reduce model size** | 30M params might be enough for this dataset size |
+| **Data augmentation** | Time shift, pitch shift, SpecAugment |
