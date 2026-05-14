@@ -97,20 +97,21 @@ def get_diffusion_model(device: torch.device = None):
 def generate_from_noise(
     label_idx: int = 0,
     num_samples: int = 1,
-    num_steps: int = 50,
+    num_steps: int = 100,
     device: torch.device = None,
     spec_shape: tuple = (64, 552),
+    use_ddpm: bool = False,
 ) -> torch.Tensor:
     """
     Generate mel spectrogram from pure Gaussian noise using diffusion.
-    No VAE needed — this is the primary generation method.
 
     Args:
         label_idx:   animal class index (0=Dog, 1=Cat, ...)
         num_samples: how many spectrograms to generate
-        num_steps:   DDIM sampling steps (50 recommended)
+        num_steps:   DDIM sampling steps (100 recommended)
         device:      torch device
         spec_shape:  (n_mels, time_frames) — default (64, 552)
+        use_ddpm:    use full DDPM sampling (slower, more diverse)
     Returns:
         generated mel [num_samples, 1, 64, T]
     """
@@ -119,9 +120,13 @@ def generate_from_noise(
         device = next(model.parameters()).device
 
     labels = torch.full((num_samples,), label_idx, device=device, dtype=torch.long)
-    x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
 
-    generated = diffusion.ddim_sample(model, x_t, labels, num_steps=num_steps, eta=0.0)
+    if use_ddpm:
+        x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
+        generated = diffusion.p_sample_loop(model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]), labels, device, progress=True)
+    else:
+        x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
+        generated = diffusion.ddim_sample(model, x_t, labels, num_steps=num_steps, eta=0.0)
 
     return generated.cpu()
 

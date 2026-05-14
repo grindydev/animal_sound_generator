@@ -21,7 +21,7 @@ class DiffusionConfig:
     timesteps: int = 1000                 # total noise steps (train)
     beta_start: float = 0.0001
     beta_end: float = 0.02
-    cosine_s: float = 0.008              # cosine schedule offset (Improved DDPM)
+    use_linear_schedule: bool = True      # linear schedule → more signal at high t (vs cosine)
 
     # ── U-Net ────────────────────────────────────────────
     base_channels: int = 96               # channels at first level (balanced for L4 24GB)

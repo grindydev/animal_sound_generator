@@ -37,7 +37,10 @@ class DiffusionProcess(nn.Module):
         self.timesteps = config.timesteps
 
         # Build noise schedule
-        betas = self._cosine_beta_schedule(config.timesteps, config.cosine_s)
+        if getattr(config, 'use_linear_schedule', False):
+            betas = torch.linspace(config.beta_start, config.beta_end, config.timesteps)
+        else:
+            betas = self._cosine_beta_schedule(config.timesteps, getattr(config, 'cosine_s', 0.008))
         self.register_schedule_buffers(betas)
 
     def register_schedule_buffers(self, betas: torch.Tensor):
@@ -167,8 +170,8 @@ class DiffusionProcess(nn.Module):
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_cumprod_t)
             x_0_pred = (x_t - sqrt_one_minus_alpha_t * pred_noise) / torch.sqrt(alpha_cumprod_t)
 
-            # Clamp to valid normalized spectrogram range (wider, won't corrupt VAE output)
-            x_0_pred = torch.clamp(x_0_pred, -10.0, 10.0)
+            # Clamp to valid normalized spectrogram range (real mels: ~[-3, 4])
+            x_0_pred = torch.clamp(x_0_pred, -4.0, 4.0)
 
             # Compute sigma (stochasticity)
             alpha_cumprod_next = self.alphas_cumprod[t_next]
@@ -272,7 +275,7 @@ class DiffusionProcess(nn.Module):
                 alpha_next = self.alphas_cumprod[t_next]
 
                 x_0_pred = (x_t - torch.sqrt(1.0 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-                x_0_pred = torch.clamp(x_0_pred, -10.0, 10.0)
+                x_0_pred = torch.clamp(x_0_pred, -4.0, 4.0)
 
                 direction = torch.sqrt(1.0 - alpha_next) * pred_noise
                 x_t = torch.sqrt(alpha_next) * x_0_pred + direction
