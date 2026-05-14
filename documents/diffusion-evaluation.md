@@ -5,54 +5,45 @@
 
 ---
 
-## 1. Epoch 6 vs Epoch 36 Comparison
+## 1. Epoch Comparison (v4 vs v5)
 
-| Metric | Epoch 6 (val=0.60) | Epoch 36 (val=0.09) | Trend |
-|--------|:---:|:---:|:---:|
-| Mel σ | **7.2** | **2.5** | ✅ 3× better |
-| Mel mean | ~0 | ~0.6 | ⚠️ Drifted |
-| Classes with structure | **3/8** | **1/8** | ❌ Getting worse |
-| Audio RMS | 0.6-0.7 | 0.5-0.8 | ≈ Same |
-| Peak at Nyquist | 5/8 classes | **7/8 classes** | ❌ More noise |
+| Model | Epoch | Val Loss | Mel σ | Classes OK | Trend |
+|-------|:-----:|:--------:|:-----:|:----------:|-------|
+| v4 | 6 | 0.60 | 7.2 | 3/8 | — |
+| v4 | 36 | 0.09 | 2.5 | 1/8 | ↓ degrading |
+| v5 | 10 | 0.60 | **1.2** | **2/8** | ✅ Best so far |
+| v5 | 25 | 0.19 | 0.8 | 1/8 | ↓ degrading |
 
-**Lower val loss ≠ better generation.** The model is overfitting — memorizing training noise patterns that don't generalize to pure noise denoising.
+**Key finding:** The best generation quality happens at medium val loss (0.60), not low val loss (0.09-0.19). As loss drops, the model converges to predicting the mean noise → flat, uninteresting outputs. This is **diffusion posterior collapse** on a small dataset.
 
----
+## 2. v5 Epoch 25 Results
 
-## 2. Epoch 36 Per-Class Results
+| Class | Mel σ | RMS | Peak Hz | Bass% | Verdict |
+|-------|:-----:|:---:|:-------:|:-----:|---------|
+| Dog | 0.86 | 0.03 | 11025 | 9% | ❌ Noise |
+| Cat | 0.72 | 0.02 | 11025 | 14% | ❌ Noise |
+| Rooster | 0.79 | 0.04 | 11025 | 10% | ❌ Noise |
+| Frog | 0.74 | 0.02 | 11025 | 14% | ❌ Noise |
+| Crow | 0.66 | 0.04 | 11025 | 2% | ❌ Noise |
+| Insect | 0.80 | 0.03 | 11025 | 10% | ❌ Noise |
+| Hen | 0.81 | 0.03 | 11025 | 12% | ❌ Noise |
+| **Noise** | 0.69 | 0.02 | **65** | **19%** | ✅ Structure |
 
-| Class | Mel μ | Mel σ | RMS | Peak Hz | Bass% | Verdict |
-|-------|:-----:|:-----:|:---:|:-------:|:-----:|---------|
-| Dog | +0.52 | 2.68 | 0.54 | 11025 | 18% | ❌ Noise |
-| Cat | +1.00 | 2.67 | 0.84 | 11025 | 7% | ❌ Noise |
-| **Rooster** | +0.65 | 2.45 | 0.55 | **883** | **27%** | ✅ Structure |
-| Frog | +0.79 | 2.07 | 0.65 | 11025 | 16% | ❌ Noise |
-| Crow | +1.12 | 2.37 | 0.78 | 11025 | 14% | ❌ Noise |
-| Insect | +0.24 | 2.39 | 0.77 | 11025 | 9% | ❌ Noise |
-| Hen | +0.10 | 2.48 | 0.50 | 11025 | 20% | ❌ Noise |
-| Noise | +0.62 | 1.97 | 0.70 | 11025 | 12% | ❌ Noise |
+Mel σ is now 0.7-0.9 — below the target of 1.0. The model is producing spectrograms that are too flat and missing high-frequency content. Only the Noise class (which is genuinely flat in real data) survives.
 
----
+## 3. Root Cause: Diffusion Posterior Collapse on Small Data
 
-## 3. Key Finding: Mel Statistics Improving, Content Degrading
+With 2700 samples and 61M params, the UNet has enough capacity to memorize individual noise patterns. The MSE loss for noise prediction is minimized by predicting near-zero noise (the expected value across the dataset). At high val loss (epoch 10, val=0.60), the model still produces diverse outputs. At low val loss (epoch 25, val=0.19), it converges to flat predictions.
 
-```
-Epoch 6 (high val loss):  mel σ=7.2, 3/8 classes show structure
-Epoch 36 (low val loss): mel σ=2.5, 1/8 classes show structure
-                    Target: mel σ=1.0, 8/8 classes show structure
-```
+**The best checkpoint for generation is around epoch 10-15, not epoch 50.**
 
-The model is learning the CORRECT AMPLITUDE (σ improving toward 1.0), but the SPECTRAL CONTENT is degrading. This is a classic **mean-prediction** problem in diffusion — as loss drops, the model starts predicting the expected (average) noise, not the specific noise for each sample. The result: outputs converge to the class average spectrogram, which lacks detail.
+## 4. Fixes
 
----
-
-## 4. Recommended Fixes (NOT APPLIED)
-
-| Fix | Expected impact |
+| Fix | Expected Impact |
 |-----|----------------|
-| **Tighten DDIM clamp: [-10,10] → [-4,4]** | Forces output to valid range |
-| **Use classifier-free guidance (CFG=1.5)** | Sharpens output by comparing conditioned vs unconditioned predictions |
-| **Increase number of training samples (more data)** | 2700 samples / 61M params = massive overfit risk |
-| **Try checkpoint at epoch ~20-25** | Lower val loss than epoch 6, but still has content diversity |
-| **Reduce model size** | 30M params might be enough for this dataset size |
-| **Data augmentation** | Time shift, pitch shift, SpecAugment |
+| **Use epoch ~12 checkpoint** | Likely best quality (val ~0.40) |
+| **Reduce model to 30M params** | Less capacity → forced to generalize |
+| **Add SpecAugment during training** | Prevents memorization |
+| **Use L1 loss instead of MSE** | Penalizes mean regression less |
+| **Classifier-free guidance** | Sharpens output at inference |
+| **Get more data** | More samples → harder to memorize |
