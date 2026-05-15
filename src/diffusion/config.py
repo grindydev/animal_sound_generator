@@ -56,6 +56,11 @@ class DiffusionConfig:
     # ── Frequency-Weighted Loss ──────────────────────────
     freq_weight_max: float = 3.0          # v8: bin 63 weighted 3× more than bin 0
 
+    # ── GAN (Fix C) ─────────────────────────────────────
+    gan_weight: float = 0.1               # λ: GAN loss weight vs L1
+    disc_channels: int = 64               # base channels for discriminator
+    disc_lr: float = 2e-4                 # discriminator learning rate
+
     # ── Inference ────────────────────────────────────────
     inference_steps: int = 100            # DDIM/DDPM sampling steps (was 50)
     refinement_strength: float = 0.6      # default img2img strength (0.0-1.0)

@@ -37,6 +37,7 @@ import sys
 import time
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
@@ -414,6 +415,62 @@ def freq_weighted_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 
 
 # ═══════════════════════════════════════════════════════════════
+#  V8 FIX C: PATCHGAN DISCRIMINATOR
+# ═══════════════════════════════════════════════════════════════
+
+class MelDiscriminator(nn.Module):
+    """
+    PatchGAN discriminator for mel spectrograms.
+    
+    Input:  [B, 1, 64, T]  mel spectrogram
+    Output: [B, 1, H', W']  real/fake per patch (each patch ≈ 32×32 mel bins)
+    
+    Architecture: 5-layer conv net → 2M params.
+    """
+    def __init__(self, base_channels: int = 64):
+        super().__init__()
+        ch = base_channels
+        self.layers = nn.Sequential(
+            # Layer 1: [B, 1, 64, T] → [B, 64, 32, T/2]
+            nn.Conv2d(1, ch, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 2: [B, 64, 32, T/2] → [B, 128, 16, T/4]
+            nn.Conv2d(ch, ch*2, 4, 2, 1),
+            nn.BatchNorm2d(ch*2),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 3: [B, 128, 16, T/4] → [B, 256, 8, T/8]
+            nn.Conv2d(ch*2, ch*4, 4, 2, 1),
+            nn.BatchNorm2d(ch*4),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 4: [B, 256, 8, T/8] → [B, 512, 4, T/16]
+            nn.Conv2d(ch*4, ch*8, 4, 2, 1),
+            nn.BatchNorm2d(ch*8),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 5: [B, 512, 4, T/16] → [B, 1, 2, T/32+]
+            nn.Conv2d(ch*8, 1, (4, 4), (2, 2), (1, 1)),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)  # [B, 1, H', W']
+
+
+def gan_loss_disc(real_pred: torch.Tensor, fake_pred: torch.Tensor) -> torch.Tensor:
+    """Discriminator loss: push real→1, fake→0."""
+    real_loss = F.binary_cross_entropy_with_logits(real_pred, torch.ones_like(real_pred))
+    fake_loss = F.binary_cross_entropy_with_logits(fake_pred, torch.zeros_like(fake_pred))
+    return (real_loss + fake_loss) * 0.5
+
+
+def gan_loss_gen(fake_pred: torch.Tensor) -> torch.Tensor:
+    """Generator loss: push fake→1 (fool discriminator)."""
+    return F.binary_cross_entropy_with_logits(fake_pred, torch.ones_like(fake_pred))
+
+
+# ═══════════════════════════════════════════════════════════════
 #  TRAIN / VALIDATE
 # ═══════════════════════════════════════════════════════════════
 
@@ -426,14 +483,22 @@ def get_loss_fn():
     return F.mse_loss
 
 
-def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
-    """Train one epoch with gradient accumulation and optional EMA. Returns average loss."""
+def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discriminator=None, disc_optimizer=None):
+    """Train one epoch. Returns average loss. Optional GAN discriminator training."""
     loss_fn = get_loss_fn()
     uncond_prob = getattr(cfg, 'uncond_prob', 0.0)
+    use_gan = discriminator is not None and disc_optimizer is not None
+    gan_weight = getattr(cfg, 'gan_weight', 0.1)
     model.train()
+    if discriminator is not None:
+        discriminator.train()
     total_loss = 0.0
+    total_l1 = 0.0
+    total_gan = 0.0
     pbar = tqdm(train_loader, desc="  Train", leave=False)
     optimizer.zero_grad()
+    if disc_optimizer is not None:
+        disc_optimizer.zero_grad()
     accum_count = 0
 
     for mel, labels in pbar:
@@ -459,9 +524,27 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         # V7: x₀-prediction (model predicts clean mel, not noise)
         if getattr(cfg, 'predict_x0', False):
             pred = model(x_t, t, labels)
-            loss = freq_weighted_loss(pred, mel) / GRADIENT_ACCUMULATION_STEPS
+            l1_loss = freq_weighted_loss(pred, mel)
+
+            # V8 Fix C: GAN loss
+            if use_gan:
+                # Discriminator update: real → 1, fake → 0
+                disc_optimizer.zero_grad()
+                real_score = discriminator(mel.detach())
+                fake_score = discriminator(pred.detach())
+                d_loss = gan_loss_disc(real_score, fake_score)
+                d_loss.backward()
+                disc_optimizer.step()
+
+                # Generator GAN loss: fake → 1 (fool discriminator)
+                g_gan = gan_weight * gan_loss_gen(discriminator(pred))
+                loss = (l1_loss + g_gan) / GRADIENT_ACCUMULATION_STEPS
+                total_gan += g_gan.item()
+            else:
+                loss = l1_loss / GRADIENT_ACCUMULATION_STEPS
+
+            total_l1 += l1_loss.item()
         else:
-            # Original ε-prediction
             pred = model(x_t, t, labels)
             loss = loss_fn(pred, noise) / GRADIENT_ACCUMULATION_STEPS
 
@@ -491,13 +574,15 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         optimizer.step()
         optimizer.zero_grad()
 
-        # Update EMA for leftover batches too
         if ema_model is not None:
             with torch.no_grad():
                 for ema_p, model_p in zip(ema_model.parameters(), model.parameters()):
                     ema_p.data.mul_(EMA_DECAY).add_(model_p.data, alpha=1 - EMA_DECAY)
 
-    return total_loss / len(train_loader)
+    avg_loss = total_loss / len(train_loader)
+    if use_gan:
+        return avg_loss, total_l1 / len(train_loader), total_gan / len(train_loader)
+    return avg_loss
 
 
 def validate(model, diffusion, val_loader, ema_model=None):
@@ -632,6 +717,19 @@ def training_loop():
         p.requires_grad_(False)
 
     # ═════════════════════════════════════════════════════════
+    #  V8 FIX C: DISCRIMINATOR (PatchGAN)
+    # ═════════════════════════════════════════════════════════
+    discriminator = None
+    disc_optimizer = None
+    if getattr(cfg, 'gan_weight', 0) > 0:
+        discriminator = MelDiscriminator(base_channels=cfg.disc_channels).to(device)
+        disc_optimizer = torch.optim.AdamW(
+            discriminator.parameters(), lr=cfg.disc_lr, betas=cfg.adam_betas, weight_decay=0.0
+        )
+        n_disc = sum(p.numel() for p in discriminator.parameters())
+        print(f"   🎭 PatchGAN discriminator: {n_disc:,} ({n_disc/1e6:.1f}M) — λ={cfg.gan_weight}")
+
+    # ═════════════════════════════════════════════════════════
     #  TRAIN (no periodic checkpoints — only best model saved)
     # ═════════════════════════════════════════════════════════
     os.makedirs(cfg.model_dir, exist_ok=True)
@@ -654,7 +752,8 @@ def training_loop():
         for epoch in range(start_epoch, NUM_EPOCHS):
             t0 = time.time()
 
-            avg_loss = train_epoch(model, diffusion, train_loader, optimizer, ema_model)
+            result = train_epoch(model, diffusion, train_loader, optimizer, ema_model,
+                                discriminator, disc_optimizer)
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
@@ -662,9 +761,18 @@ def training_loop():
 
             dt = time.time() - t0
             trend = "📉" if val_loss < best_val else "➡️"
-            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
-                  f"({dt:.0f}s) ── "
-                  f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
+
+            # Unpack loss components
+            if isinstance(result, tuple):
+                avg_loss, l1_loss, gan_loss = result
+                print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+                      f"({dt:.0f}s) ── "
+                      f"loss={avg_loss:.4f} (L1={l1_loss:.3f}, G={gan_loss:.4f}) val={val_loss:.4f} {trend} lr={lr:.2e}")
+            else:
+                avg_loss = result
+                print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+                      f"({dt:.0f}s) ── "
+                      f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
 
             # Save best (using EMA weights)
             if val_loss < best_val:
