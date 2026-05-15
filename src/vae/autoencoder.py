@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vae.blocks import ResEncoderBlock
+from .blocks import ResEncoderBlock
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -92,7 +92,7 @@ class ImprovedAutoencoder(nn.Module):
         self.flat_dim = c4 * 4 * 35
 
         # Self-attention
-        from vae.blocks import SelfAttention1D
+        from .blocks import SelfAttention1D
         self.attn = SelfAttention1D(c4, num_heads=4)
 
         self.fc_encode = nn.Linear(self.flat_dim, latent_dim)

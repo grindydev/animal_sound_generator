@@ -29,8 +29,8 @@ sys.path.insert(0, _PROJECT_ROOT)
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
 
 from data_loader import get_dataloaders, get_transformations
-from vae.model import ImprovedVAE
-from vae.autoencoder import ImprovedAutoencoder
+from .model import ImprovedVAE
+from .autoencoder import ImprovedAutoencoder
 
 warnings.filterwarnings("ignore")
 

@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vae.blocks import FiLM
+from .blocks import FiLM
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -51,7 +51,7 @@ class FiLMDecoderStage(nn.Module):
 
         # Self-attention for generation mode (replaces encoder skip connections)
         # Only used when enc_skip is None. Residual connection preserves conv features.
-        from vae.blocks import SelfAttention1D
+        from .blocks import SelfAttention1D
         if enc_skip_ch > 0:
             self.gen_attn = SelfAttention1D(out_ch, num_heads=4)
             # Zero-init projection → residual starts as identity (h = h + 0)
@@ -108,7 +108,7 @@ class ImprovedVAE(nn.Module):
         self.c4 = c4  # store for decode methods
 
         # ── Encoder ──────────────────────────────────────
-        from vae.blocks import ResEncoderBlock, SelfAttention1D
+        from .blocks import ResEncoderBlock, SelfAttention1D
         self.enc1 = ResEncoderBlock(1, c1)
         self.enc2 = ResEncoderBlock(c1, c2)
         self.enc3 = ResEncoderBlock(c2, c3)
