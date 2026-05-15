@@ -521,6 +521,7 @@ def validate(model, diffusion, val_loader, ema_model=None):
                 loss = freq_weighted_loss(pred, mel).item()
             else:
                 loss = loss_fn(pred, noise).item()
+            total_loss += loss
 
     return total_loss / max(len(val_loader), 1)
 
