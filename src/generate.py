@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
 
 from vae import ImprovedVAE
 from diffusion.inference import refine_spectrogram, generate_from_noise
+from diffusion.config import config as cfg
 from hifigan.inference import mel_to_waveform
 
 
@@ -87,12 +88,26 @@ def generate_one(
                 device=device, use_ddim=True,
             )
 
-    # Step 3: HiFi-GAN converts mel → waveform
-    waveform = mel_to_waveform(
-        vae_mel, device=device,
-        use_griffin_lim=use_griffin_lim,
-        griffin_lim_iters=griffin_lim_iters,
-    )
+    # Step 3: Vocoder — Griffin-Lim for diffusion mels
+    if from_scratch:
+        import torchaudio
+        n_fft = 1024
+        n_stft = n_fft // 2 + 1
+        from torchaudio.functional import melscale_fbanks
+        fb = melscale_fbanks(n_stft, 0.0, 22050/2.0, cfg.n_mels, 22050)
+        fb_pinv = torch.linalg.pinv(fb).float()
+        mel_cpu = vae_mel.cpu().squeeze(0).squeeze(0)  # [64, 552]
+        linear_power = torch.clamp(mel_cpu.T.float() @ fb_pinv, min=0).T  # [513, 552]
+        linear_mag = torch.sqrt(linear_power)
+        gl = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=200, win_length=1024, n_iter=64)
+        waveform = gl(linear_mag.unsqueeze(0))  # [1, samples]
+        waveform = waveform.to(device)
+    else:
+        waveform = mel_to_waveform(
+            vae_mel, device=device,
+            use_griffin_lim=use_griffin_lim,
+            griffin_lim_iters=griffin_lim_iters,
+        )
 
     return waveform  # [1, samples]
 
