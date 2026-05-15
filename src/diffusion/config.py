@@ -41,7 +41,7 @@ class DiffusionConfig:
     adam_betas: tuple = (0.9, 0.999)
     adam_weight_decay: float = 1e-4
     num_epochs: int = 50
-    num_workers: int = 0
+    num_workers: int = 4                 # Colab: 4 workers for pipelining
     grad_clip_norm: float = 5.0
     ema_decay: float = 0.9999
     loss_type: str = "l1"

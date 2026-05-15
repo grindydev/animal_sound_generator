@@ -246,11 +246,11 @@ class DiffusionDataset(Dataset):
             )
             wav = crops[0]
 
-        # V7: Audio augmentation (pitch shift + time stretch)
-        wav = augment_audio(wav, cfg.sample_rate)
-
-        # Compute mel on the (possibly augmented) segment
+        # Compute mel
         mel = compute_mel(wav)  # [1, 64, ~segment_frames]
+
+        # V7: Mel-space augmentation (fast — no torchaudio resampling)
+        mel = augment_mel(mel)
 
         # Trim/pad to exact segment_frames (mel is 3D: [1, 64, T] = [ch, freq, time])
         T = mel.shape[-1]
@@ -348,71 +348,41 @@ def spec_augment(mel: torch.Tensor, freq_mask: int = 8, time_mask: int = 50) -> 
 
 
 # ═══════════════════════════════════════════════════════════════
-#  V7: AUDIO AUGMENTATION
+#  V7: MEL-SPACE AUGMENTATION (no torchaudio → fast)
 # ═══════════════════════════════════════════════════════════════
 
-_soxr_cache = {}
-
-def pitch_shift(wav: torch.Tensor, sr: int, semitones: float) -> torch.Tensor:
-    """Pitch shift audio by ±semitones using phase vocoder."""
-    if semitones == 0:
-        return wav
-    try:
-        import torchaudio
-        d = wav.device
-        if d not in _soxr_cache:
-            try:
-                _soxr_cache[d] = torchaudio.transforms.SpeedPerturbation(sr, [1.0])
-            except Exception:
-                return wav  # fallback if not available
-        # Simple: resample to shift pitch
-        factor = 2.0 ** (semitones / 12.0)
-        old_len = wav.shape[-1]
-        new_len = int(old_len / factor)
-        if new_len < 100:
-            return wav
-        resampled = torchaudio.functional.resample(wav, sr, int(sr * factor))
-        if resampled.shape[-1] < old_len:
-            resampled = torch.nn.functional.pad(resampled, (0, old_len - resampled.shape[-1]))
-        else:
-            resampled = resampled[..., :old_len]
-        return resampled
-    except Exception:
-        return wav
-
-
-def time_stretch(wav: torch.Tensor, sr: int, rate: float) -> torch.Tensor:
-    """Time stretch audio by rate (0.8=slower, 1.2=faster)."""
-    if rate == 1.0:
-        return wav
-    try:
-        import torchaudio
-        old_len = wav.shape[-1]
-        new_len = int(old_len * rate)
-        if new_len < 100:
-            return wav
-        stretched = torchaudio.functional.resample(wav, int(sr / rate), sr)
-        if stretched.shape[-1] < old_len:
-            stretched = torch.nn.functional.pad(stretched, (0, old_len - stretched.shape[-1]))
-        else:
-            stretched = stretched[..., :old_len]
-        return stretched
-    except Exception:
-        return wav
-
-
-def augment_audio(wav: torch.Tensor, sr: int = 22050) -> torch.Tensor:
-    """Apply random pitch shift + time stretch augmentation."""
+def augment_mel(mel: torch.Tensor) -> torch.Tensor:
+    """
+    Augment mel spectrogram in mel-space (NO torchaudio needed).
+    Pitch shift → roll mel bins. Time stretch → interpolate time axis.
+    ~100x faster than audio resampling.
+    """
     if not getattr(cfg, 'augment', False):
-        return wav
-    # Random pitch shift
-    shift = np.random.uniform(-cfg.pitch_shift_semitones, cfg.pitch_shift_semitones)
-    wav = pitch_shift(wav, sr, shift)
-    # Random time stretch
-    low, high = cfg.time_stretch_range
-    rate = np.random.uniform(low, high)
-    wav = time_stretch(wav, sr, rate)
-    return wav
+        return mel
+
+    # mel: [1, F, T]
+    n_freq, n_time = mel.shape[-2], mel.shape[-1]
+
+    # 1. Pitch shift: roll mel bins (shifts formants up/down)
+    shift_bins = np.random.randint(-4, 5)  # ±4 mel bins ≈ ±3 semitones at 64 mel
+    if shift_bins != 0:
+        mel = torch.roll(mel, shifts=shift_bins, dims=-2)
+        if shift_bins > 0:
+            mel[..., :shift_bins, :] = 0
+        else:
+            mel[..., shift_bins:, :] = 0
+
+    # 2. Time stretch: interpolate time axis (±20%)
+    rate = np.random.uniform(0.8, 1.2)
+    if abs(rate - 1.0) > 0.01:
+        new_T = max(2, int(n_time * rate))
+        mel = F.interpolate(mel.unsqueeze(0), size=(n_freq, new_T), mode='bilinear', align_corners=False).squeeze(0)
+        if new_T < n_time:
+            mel = torch.nn.functional.pad(mel, (0, n_time - new_T))
+        else:
+            mel = mel[..., :n_time]
+
+    return mel
 
 
 # ═══════════════════════════════════════════════════════════════
