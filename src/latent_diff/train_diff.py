@@ -248,7 +248,6 @@ def train():
                 'unet': ema_model.state_dict(),
                 'val_loss': val_loss,
                 'epoch': epoch,
-                'config': cfg,
             }, os.path.join(cfg.model_dir, "latent_diffusion_best.pth"))
             print(f"   💾 Best model saved (val={val_loss:.4f})")
 

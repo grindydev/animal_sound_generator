@@ -87,7 +87,8 @@ def load_models(device):
         diff_path = os.path.join(cfg.model_dir, "latent_diffusion_best.pth")
 
     if os.path.exists(diff_path):
-        diff_ckpt = torch.load(diff_path, map_location=device, weights_only=True)
+        # LatentDiffConfig is a custom class — need weights_only=False or add_safe_globals
+        diff_ckpt = torch.load(diff_path, map_location=device, weights_only=False)
         unet = LatentUNet(cfg).to(device)
         if 'unet' in diff_ckpt:
             unet.load_state_dict(diff_ckpt['unet'])
