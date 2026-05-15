@@ -129,16 +129,24 @@ class ImprovedAutoencoder(nn.Module):
 
     def encode(self, x: torch.Tensor):
         """Returns (z, [skip0, skip1, skip2, skip3])."""
-        s0 = self.enc1(x)       # [B, 64, 32, 276]
-        s1 = self.enc2(s0)      # [B, 128, 16, 138]
-        s2 = self.enc3(s1)      # [B, 256, 8, 69]
-        s3 = self.enc4(s2)      # [B, 512, 4, 35]
+        s0 = self.enc1(x)       # [B, 32, 32, 276] (base_ch=32)
+        s1 = self.enc2(s0)      # [B, 64, 16, 138]
+        s2 = self.enc3(s1)      # [B, 128, 8, 69]
+        s3 = self.enc4(s2)      # [B, 256, 4, 35]
 
         h = self.attn(s3)
-        h = h.flatten(start_dim=1)  # [B, 71680]
+        h = h.flatten(start_dim=1)  # [B, 35840]
         z = self.fc_encode(h)       # [B, latent_dim]
 
         return z, [s0, s1, s2, s3]
+
+    def encode_spatial(self, x: torch.Tensor):
+        """Returns spatial bottleneck [B, c4, 4, 35] before fc_encode."""
+        s0 = self.enc1(x)
+        s1 = self.enc2(s0)
+        s2 = self.enc3(s1)
+        s3 = self.enc4(s2)
+        return self.attn(s3)  # [B, c4, 4, 35]
 
     def decode(self, z: torch.Tensor, skips: list, target_size: tuple):
         """skips = [s0 (64ch), s1 (128ch), s2 (256ch), s3 (512ch)]"""
