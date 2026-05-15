@@ -54,3 +54,4 @@ models/*
 evaluation_output/
 generated_audio/
 diagnosis/animal_audio.tar.gz
+animal_audio.tar.gz

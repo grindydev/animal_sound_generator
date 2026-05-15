@@ -38,6 +38,7 @@ class DiffusionConfig:
     train_fraction: float = 0.95          # v7: 95% train (was 90%) → more data
     batch_size: int = 8
     learning_rate: float = 2e-4
+    adam_betas: tuple = (0.9, 0.999)
     adam_weight_decay: float = 1e-4
     num_epochs: int = 50
     num_workers: int = 0
