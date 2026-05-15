@@ -42,8 +42,6 @@ NUM_WORKERS = 4 if DEVICE.type == "cuda" else 0
 LR = 1e-3
 SEGMENT_FRAMES = cfg.segment_frames
 
-CHECKPOINT_DIR = "models/latent_decoder_checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(cfg.model_dir, exist_ok=True)
 
 

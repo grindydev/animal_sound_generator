@@ -41,8 +41,6 @@ LR = 2e-4
 SEGMENT_FRAMES = cfg.segment_frames
 EMA_DECAY = 0.9999
 
-CHECKPOINT_DIR = "models/latent_diff_checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(cfg.model_dir, exist_ok=True)
 
 

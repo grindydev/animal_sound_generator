@@ -73,12 +73,11 @@ LABEL_SMOOTHING = CONFIG["label_smoothing"]
 DROPOUT = CONFIG["dropout"]
 
 BEST_MODEL_PATH = f"models/best_audio_cnn_{MODE}.pth"
-CHECKPOINT_DIR = f"models/classifier_checkpoints/{MODE}"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE (ImprovedAudioCNN)")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR}")
 print(f"   Split: {TRAIN_FRACTION*100:.0f}% train / {VAL_FRACTION*100:.0f}% val")
-print(f"   Checkpoints: {CHECKPOINT_DIR} | Best: {BEST_MODEL_PATH}")
+print(f"   Best model: {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
 if CONFIG["device"] == "auto":
@@ -122,34 +121,6 @@ scaler = GradScaler() if use_amp else None
 train_transform, eval_transform = get_transformations()
 train_transform = train_transform.to(device)
 eval_transform = eval_transform.to(device)
-
-
-# ==================== CHECKPOINTING ====================
-
-def save_checkpoint(model, optimizer, scheduler, epoch):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, f"classifier_{epoch:06d}.pth")
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch,
-    }, path)
-
-
-def load_checkpoint(model, optimizer, scheduler):
-    if not os.path.isdir(CHECKPOINT_DIR):
-        return 0
-    files = sorted([f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("classifier_")])
-    if not files:
-        return 0
-    path = os.path.join(CHECKPOINT_DIR, files[-1])
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
-    return ckpt["epoch"]
 
 
 # ==================== TRAINING FUNCTIONS ====================
@@ -218,21 +189,17 @@ def validate_epoch(model, val_loader, loss_fn, device, eval_tfm):
 def training_loop():
     model.to(device)
 
-    # Resume
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    start_epoch = load_checkpoint(model, optimizer, scheduler)
-
     best_val_acc = 0.0
     best_epoch = 0
     patience_counter = 0
 
     print(f"\n{'='*60}")
     print(f"🚀 CLASSIFIER TRAINING — {MODE.upper()} MODE")
-    print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
+    print(f"   Device: {device} | Epochs: {NUM_EPOCHS}")
     print(f"{'='*60}\n")
 
     try:
-        for epoch in range(start_epoch, NUM_EPOCHS):
+        for epoch in range(NUM_EPOCHS):
             t0 = time.time()
 
             epoch_loss = train_epoch(model, train_loader, loss_function, optimizer,
@@ -248,9 +215,6 @@ def training_loop():
             print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
                   f"({dt:.0f}s) ── "
                   f"loss={epoch_loss:.4f} val_acc={val_acc:.1f}% {trend} lr={current_lr:.2e}")
-
-            # Save checkpoint EVERY epoch (safe for Ctrl+C)
-            save_checkpoint(model, optimizer, scheduler, epoch + 1)
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc

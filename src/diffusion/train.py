@@ -96,12 +96,10 @@ BATCH_SIZE = SETTINGS["batch_size"]
 NUM_WORKERS = SETTINGS["num_workers"]
 GRADIENT_ACCUMULATION_STEPS = SETTINGS.get("gradient_accumulation_steps", 1)
 SEGMENT_FRAMES = CONFIG["segment_frames"]
-SAVE_INTERVAL = CONFIG["save_interval"]
 LOG_INTERVAL = CONFIG["log_interval"]
-EMA_DECAY = 0.9999  # Exponential Moving Average decay for model weights
+EMA_DECAY = 0.9999
 
 BEST_MODEL_PATH = f"models/diffusion_unet_{MODE}.pth"
-CHECKPOINT_DIR = os.path.join(cfg.checkpoint_dir, MODE)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -321,38 +319,6 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     mel = (db_tfm(spec) - norm_mean) / norm_std  # [n_mels, time_frames]
     # Return [1, n_mels, time_frames] — DataLoader collates to [B, 1, n_mels, T] for U-Net
     return mel.unsqueeze(0)  # [1, n_mels, time_frames]
-
-
-# ═══════════════════════════════════════════════════════════════
-#  SAVE / LOAD CHECKPOINT
-# ═══════════════════════════════════════════════════════════════
-
-def save_checkpoint(model, optimizer, epoch, checkpoint_dir):
-    """Save model + optimizer state for resume."""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    path = os.path.join(checkpoint_dir, f"unet_{epoch:06d}.pth")
-    torch.save({
-        "unet": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "epoch": epoch,
-        "config": cfg.__dict__,
-    }, path)
-
-
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load latest checkpoint. Returns start_epoch (0 if none found)."""
-    if not os.path.isdir(checkpoint_dir):
-        return 0
-    files = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith("unet_") and f.endswith(".pth")])
-    if not files:
-        return 0
-    latest = files[-1]
-    path = os.path.join(checkpoint_dir, latest)
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["unet"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    print(f"   Resumed from {path} (epoch {ckpt['epoch']})")
-    return ckpt["epoch"]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -590,11 +556,9 @@ def training_loop():
         p.requires_grad_(False)
 
     # ═════════════════════════════════════════════════════════
-    #  RESUME
+    #  TRAIN (no periodic checkpoints — only best model saved)
     # ═════════════════════════════════════════════════════════
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(cfg.model_dir, exist_ok=True)
-    start_epoch = load_checkpoint(model, optimizer, CHECKPOINT_DIR, device)
 
     # ═════════════════════════════════════════════════════════
     #  TRAIN
@@ -606,6 +570,7 @@ def training_loop():
     print(f"{'='*60}\n")
 
     best_val = float("inf")
+    start_epoch = 0
     BEST_PATH = os.path.join(cfg.model_dir, f"diffusion_unet_{MODE}_best.pth")
 
     try:
@@ -624,10 +589,7 @@ def training_loop():
                   f"({dt:.0f}s) ── "
                   f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
 
-            # Save checkpoint EVERY epoch (safe for Ctrl+C resume)
-            save_checkpoint(model, optimizer, epoch + 1, CHECKPOINT_DIR)
-
-            # Save best (using EMA weights — these are what you want at inference)
+            # Save best (using EMA weights)
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({"unet": ema_model.state_dict(), "config": cfg.__dict__}, BEST_PATH)

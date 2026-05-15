@@ -94,8 +94,6 @@ RAMP_EPOCHS = CONFIG["ramp_epochs"]
 BETA_K = CONFIG["beta_k"]
 AE_CHECKPOINT = CONFIG["ae_checkpoint"]
 
-CHECKPOINT_DIR = f"models/vae_checkpoints/{MODE}"
-RESUME_PATH = os.path.join(CHECKPOINT_DIR, "vae_resume.pth")
 BEST_MODEL_PATH = f"models/best_vae_finetune_{MODE}.pth"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE (Improved V2)")
@@ -103,7 +101,7 @@ print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Latent: {LATE
 print(f"   β: {BETA} | free_bits: {FREE_BITS} | class_loss: {CLASS_LOSS_WEIGHT}")
 print(f"   Warmup: {WARMUP_EPOCHS} epochs frozen → ramp {RAMP_EPOCHS} epochs → full β")
 print(f"   Split: {TRAIN_FRACTION*100:.0f}% train / {VAL_FRACTION*100:.0f}% val")
-print(f"   Checkpoints: {CHECKPOINT_DIR} | Best: {BEST_MODEL_PATH}")
+print(f"   Best model: {BEST_MODEL_PATH}")
 print(f"   Effective batch: {BATCH_SIZE} × {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM}")
 
 # ==================== DEVICE SETUP ====================
@@ -194,30 +192,7 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - W
 
 scaler = GradScaler() if use_amp else None
 
-# ==================== CHECKPOINTING ====================
-
-def save_checkpoint(model, optimizer, scheduler, epoch):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch,
-    }, RESUME_PATH)
-
-
-def load_checkpoint(model, optimizer, scheduler):
-    if not os.path.exists(RESUME_PATH):
-        return 0
-    ckpt = torch.load(RESUME_PATH, map_location=device, weights_only=True)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-    if missing:
-        tqdm.write(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    print(f"   📂 Resumed from {RESUME_PATH} (epoch {ckpt['epoch']})")
-    return ckpt["epoch"]
-
+# ==================== TRAINING ====================
 
 train_transform, eval_transform = get_transformations()
 train_transform = train_transform.to(device)
@@ -388,13 +363,10 @@ def training_loop():
     model.to(device)
 
     # Resume
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    start_epoch = load_checkpoint(model, optimizer, scheduler)
-
     # Handle freeze state on resume
-    if start_epoch < WARMUP_EPOCHS:
+    if 0 < WARMUP_EPOCHS:
         freeze_except_vae_heads(model)
-        print(f"\n❄️  Phase A — Warmup: encoder+decoder FROZEN for {WARMUP_EPOCHS-start_epoch} more epochs")
+        print(f"\n❄️  Phase A — Warmup: encoder+decoder FROZEN for {WARMUP_EPOCHS-0} more epochs")
     else:
         unfreeze_all(model)
         print(f"\n🔥 All layers unfrozen (resumed after warmup)")
@@ -404,11 +376,11 @@ def training_loop():
 
     print(f"\n{'='*60}")
     print(f"🚀 VAE V2 FINE-TUNING — {MODE.upper()} MODE")
-    print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
+    print(f"   Device: {device} | Epochs: {NUM_EPOCHS}")
     print(f"{'='*60}\n")
 
     try:
-        for epoch in range(start_epoch, NUM_EPOCHS):
+        for epoch in range(NUM_EPOCHS):
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -453,8 +425,6 @@ def training_loop():
                   f"[{phase}] lr={current_lr:.2e}")
 
             # Save checkpoint EVERY epoch (safe for Ctrl+C)
-            save_checkpoint(model, optimizer, scheduler, epoch + 1)
-
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 

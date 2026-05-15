@@ -78,12 +78,11 @@ WEIGHT_DECAY = CONFIG["weight_decay"]
 LATENT_DIM = CONFIG["latent_dim"]
 
 BEST_MODEL_PATH = f"models/best_autoencoder_{MODE}.pth"
-CHECKPOINT_DIR = f"models/autoencoder_checkpoints/{MODE}"
 
 print(f"🔧 CONFIG → {MODE.upper()} MODE (Improved V2)")
 print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR} | Latent: {LATENT_DIM}")
 print(f"   Split: {TRAIN_FRACTION*100:.0f}% train / {VAL_FRACTION*100:.0f}% val")
-print(f"   Checkpoints: {CHECKPOINT_DIR} | Best: {BEST_MODEL_PATH}")
+print(f"   Best model: {BEST_MODEL_PATH}")
 
 # ==================== DEVICE SETUP ====================
 if CONFIG["device"] == "auto":
@@ -125,39 +124,7 @@ loss_function = nn.MSELoss()
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
-# ==================== CHECKPOINTING ====================
-
-def save_checkpoint(model, optimizer, scheduler, epoch):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, f"ae_{epoch:06d}.pth")
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch,
-    }, path)
-
-
-def load_checkpoint(model, optimizer, scheduler):
-    if not os.path.isdir(CHECKPOINT_DIR):
-        return 0
-    files = sorted([f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("ae_")])
-    if not files:
-        return 0
-    path = os.path.join(CHECKPOINT_DIR, files[-1])
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    # strict=False allows loading checkpoints from older model versions
-    # (new layers like LayerNorm in SelfAttention1D use default init)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-    if missing:
-        print(f"   ⚠️  Missing keys (using default init): {[k for k in missing if 'num_batches_tracked' not in k]}")
-    if unexpected:
-        print(f"   ⚠️  Unexpected keys (ignored): {unexpected}")
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    print(f"   📂 Resumed from {path} (epoch {ckpt['epoch']})")
-    return ckpt["epoch"]
-
+# ==================== DATA ====================
 
 scaler = GradScaler() if use_amp else None
 
@@ -247,9 +214,6 @@ def training_loop():
     model.to(device)
 
     # Resume
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    start_epoch = load_checkpoint(model, optimizer, scheduler)
-
     best_val_loss = float("inf")
     best_model_state = None
     best_epoch = 0
@@ -257,11 +221,11 @@ def training_loop():
 
     print(f"\n{'='*60}")
     print(f"🚀 AUTOENCODER V2 TRAINING — {MODE.upper()} MODE")
-    print(f"   Device: {device} | Epochs: {start_epoch+1}-{NUM_EPOCHS}")
+    print(f"   Device: {device} | Epochs: {NUM_EPOCHS}")
     print(f"{'='*60}\n")
 
     try:
-        for epoch in range(start_epoch, NUM_EPOCHS):
+        for epoch in range(NUM_EPOCHS):
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -286,8 +250,6 @@ def training_loop():
                   f"loss={epoch_loss:.4f} val={epoch_val_loss:.4f} {trend} lr={current_lr:.2e}")
 
             # Save checkpoint EVERY epoch (safe for Ctrl+C)
-            save_checkpoint(model, optimizer, scheduler, epoch + 1)
-
             if epoch_val_loss < best_val_loss:
                 best_val_loss = epoch_val_loss
                 best_epoch = epoch + 1

@@ -38,7 +38,6 @@ from src.hifigan.config import config as cfg
 from src.hifigan.generator import HiFiGANGenerator
 from src.hifigan.discriminator import Discriminator
 from src.hifigan.losses import MelL1Loss, generator_loss, discriminator_loss
-from src.hifigan.utils import save_checkpoint, load_checkpoint
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -95,7 +94,6 @@ NUM_WORKERS = SETTINGS["num_workers"]
 SEGMENT_SIZE = CONFIG["segment_size"]
 
 BEST_MODEL_PATH = f"models/hifigan_generator_{MODE}.pth"
-CHECKPOINT_DIR = os.path.join(cfg.checkpoint_dir, MODE)
 
 # ═══════════════════════════════════════════════════════════════
 #  DEVICE SETUP (matches train_vae.py)
@@ -487,7 +485,6 @@ def training_loop():
         mel_loss_fn = MelL1Loss(cfg.sample_rate, cfg.n_fft, cfg.hop_length, cfg.n_mels,
                                 cfg.f_min, cfg.f_max).to(device)
 
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(cfg.model_dir, exist_ok=True)
         best_val = float("inf")
         BEST_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}_best.pth")
@@ -567,27 +564,18 @@ def training_loop():
         print("   🚨 Training stopped to save time.")
         return None
 
-    # ── Resume ──────────────────────────────────────────
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(cfg.model_dir, exist_ok=True)
-    start_epoch = load_checkpoint(
-        generator, discriminator, opt_g, opt_d,
-        CHECKPOINT_DIR, device,
-    )
-    if start_epoch > 0:
-        print(f"   Resumed from epoch {start_epoch}")
-
     # ── Train ───────────────────────────────────────────
+    os.makedirs(cfg.model_dir, exist_ok=True)
     print(f"\n{'='*60}")
     print(f"🚀 HiFi-GAN TRAINING — {MODE.upper()} MODE")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE}")
-    print(f"   Saving last model → {BEST_MODEL_PATH}")
+    print(f"   Saving best model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
 
     best_val_mel = float("inf")
     BEST_PATH = os.path.join(cfg.model_dir, f"hifigan_generator_{MODE}_best.pth")
 
-    for epoch in range(start_epoch, NUM_EPOCHS):
+    for epoch in range(NUM_EPOCHS):
         t0 = time.time()
 
         avg_g, avg_d, avg_mel = train_epoch(
@@ -609,11 +597,8 @@ def training_loop():
             f"mel={avg_mel:.4f} val={val_mel:.4f} lr={lr:.2e}"
         )
 
-        if epoch % CONFIG["save_interval"] == 0 or epoch == NUM_EPOCHS - 1:
-            save_checkpoint(
-                generator, discriminator, opt_g, opt_d,
-                epoch + 1, CHECKPOINT_DIR,
-            )
+        if epoch == NUM_EPOCHS - 1:
+            pass  # no periodic checkpoints — only best model
 
         if val_mel < best_val_mel:
             best_val_mel = val_mel
