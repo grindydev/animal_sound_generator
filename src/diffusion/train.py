@@ -249,8 +249,9 @@ class DiffusionDataset(Dataset):
         # Compute mel
         mel = compute_mel(wav)  # [1, 64, ~segment_frames]
 
-        # V7: Mel-space augmentation (fast — no torchaudio resampling)
-        mel = augment_mel(mel)
+        # V8: Strong augmentation (freq mask, time mask, noise, gain, dropout)
+        if getattr(cfg, 'augment', False):
+            mel = strong_augment_mel(mel)
 
         # Trim/pad to exact segment_frames (mel is 3D: [1, 64, T] = [ch, freq, time])
         T = mel.shape[-1]
@@ -348,41 +349,68 @@ def spec_augment(mel: torch.Tensor, freq_mask: int = 8, time_mask: int = 50) -> 
 
 
 # ═══════════════════════════════════════════════════════════════
-#  V7: MEL-SPACE AUGMENTATION (no torchaudio → fast)
+#  V8: STRONG AUGMENTATION (freq mask, time mask, noise, gain, dropout)
 # ═══════════════════════════════════════════════════════════════
 
-def augment_mel(mel: torch.Tensor) -> torch.Tensor:
+def strong_augment_mel(mel: torch.Tensor) -> torch.Tensor:
     """
-    Augment mel spectrogram in mel-space (NO torchaudio needed).
-    Pitch shift → roll mel bins. Time stretch → interpolate time axis.
-    ~100x faster than audio resampling.
+    Strong mel augmentation: model never sees same sample twice.
+    - Frequency masking: zero 2-8 consecutive mel bins
+    - Time masking: zero 20-80 consecutive frames
+    - Gaussian noise: σ=0.05 additive noise
+    - Gain jitter: multiply by [0.8, 1.2]
+    - Bin dropout: random 10% of bins zeroed
     """
-    if not getattr(cfg, 'augment', False):
+    if not getattr(cfg, 'strong_augment', False):
         return mel
 
-    # mel: [1, F, T]
+    mel = mel.clone()  # Don't modify original
     n_freq, n_time = mel.shape[-2], mel.shape[-1]
 
-    # 1. Pitch shift: roll mel bins (shifts formants up/down)
-    shift_bins = np.random.randint(-4, 5)  # ±4 mel bins ≈ ±3 semitones at 64 mel
-    if shift_bins != 0:
-        mel = torch.roll(mel, shifts=shift_bins, dims=-2)
-        if shift_bins > 0:
-            mel[..., :shift_bins, :] = 0
-        else:
-            mel[..., shift_bins:, :] = 0
+    # 1. Frequency masking (2-8 consecutive mel bins → zero)
+    if np.random.random() < 0.7:
+        f_mask = np.random.randint(2, 9)
+        f0 = np.random.randint(0, n_freq - f_mask)
+        mel[..., f0:f0+f_mask, :] = 0
 
-    # 2. Time stretch: interpolate time axis (±20%)
-    rate = np.random.uniform(0.8, 1.2)
-    if abs(rate - 1.0) > 0.01:
-        new_T = max(2, int(n_time * rate))
-        mel = F.interpolate(mel.unsqueeze(0), size=(n_freq, new_T), mode='bilinear', align_corners=False).squeeze(0)
-        if new_T < n_time:
-            mel = torch.nn.functional.pad(mel, (0, n_time - new_T))
-        else:
-            mel = mel[..., :n_time]
+    # 2. Time masking (20-80 consecutive frames → zero)
+    if np.random.random() < 0.7:
+        t_mask = np.random.randint(20, 81)
+        t0 = np.random.randint(0, n_time - t_mask)
+        mel[..., :, t0:t0+t_mask] = 0
+
+    # 3. Gaussian noise (σ=0.05)
+    if np.random.random() < 0.5:
+        mel = mel + torch.randn_like(mel) * 0.05
+
+    # 4. Gain jitter
+    gain = np.random.uniform(0.8, 1.2)
+    mel = mel * gain
+
+    # 5. Random bin dropout (10%)
+    if np.random.random() < 0.3:
+        mask_bins = torch.rand(n_freq, device=mel.device) < 0.1
+        mel[..., mask_bins, :] = 0
 
     return mel
+
+
+def freq_weighted_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    L1 loss weighted by frequency — higher frequencies matter 3× more.
+    Forces model to learn harmonics, not just low-frequency average.
+    """
+    weight_max = getattr(cfg, 'freq_weight_max', 1.0)
+    if weight_max <= 1.0:
+        return F.l1_loss(pred, target)
+
+    n_mels = cfg.n_mels
+    weights = torch.linspace(1.0, weight_max, n_mels, device=pred.device)
+    weights = weights.view(1, 1, n_mels, 1)  # [1,1,F,1] for broadcasting
+
+    error = (pred - target).abs()
+    weighted_error = error * weights
+    return weighted_error.mean()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -431,7 +459,7 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         # V7: x₀-prediction (model predicts clean mel, not noise)
         if getattr(cfg, 'predict_x0', False):
             pred = model(x_t, t, labels)
-            loss = loss_fn(pred, mel) / GRADIENT_ACCUMULATION_STEPS
+            loss = freq_weighted_loss(pred, mel) / GRADIENT_ACCUMULATION_STEPS
         else:
             # Original ε-prediction
             pred = model(x_t, t, labels)
@@ -490,10 +518,9 @@ def validate(model, diffusion, val_loader, ema_model=None):
             x_t = diffusion.q_sample(mel, t, noise)
             pred = eval_model(x_t, t, labels)
             if getattr(cfg, 'predict_x0', False):
-                loss = loss_fn(pred, mel)  # x₀ target
+                loss = freq_weighted_loss(pred, mel).item()
             else:
-                loss = loss_fn(pred, noise)  # ε target
-            total_loss += loss.item()
+                loss = loss_fn(pred, noise).item()
 
     return total_loss / max(len(val_loader), 1)
 
@@ -612,7 +639,8 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING v6 — {MODE.upper()} MODE")
+    print(f"🚀 DIFFUSION TRAINING v8 — {MODE.upper()} MODE")
+    print(f"   Prediction: x₀ + freq-weighted loss (×{getattr(cfg,'freq_weight_max',1.0)}) + strong augment")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")

@@ -48,9 +48,13 @@ class DiffusionConfig:
     predict_x0: bool = True               # v7: predict clean mel (NOT noise)
 
     # ── Augmentation ─────────────────────────────────────
-    augment: bool = True                  # enable audio augmentation
-    pitch_shift_semitones: float = 3.0    # ±3 semitones pitch shift
-    time_stretch_range: tuple = (0.8, 1.2)  # 0.8× to 1.2× speed
+    augment: bool = True
+    strong_augment: bool = True           # v8: freq/time masking + noise + gain
+    pitch_shift_bins: int = 4             # ±4 mel bins for pitch augmentation
+    time_stretch_range: tuple = (0.8, 1.2)
+
+    # ── Frequency-Weighted Loss ──────────────────────────
+    freq_weight_max: float = 3.0          # v8: bin 63 weighted 3× more than bin 0
 
     # ── Inference ────────────────────────────────────────
     inference_steps: int = 100            # DDIM/DDPM sampling steps (was 50)
