@@ -58,14 +58,21 @@ def load_encoder():
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
 
-    # Auto-detect base_channels from checkpoint
+    # Auto-detect base_channels from checkpoint state dict
+    state_dict = ckpt.get('model_state_dict', ckpt.get('model', {}))
     if 'config' in ckpt:
         base_ch = ckpt['config'].get('base_channels', 32)
+    elif state_dict:
+        # Probe enc4 channels from fc_encode weight: flat_dim = c4 * 4 * 35, c4 = base_ch * 8
+        fc_w = state_dict.get('fc_encode.weight')
+        flat_dim = fc_w.shape[1] if fc_w is not None else 0
+        c4 = flat_dim // (4 * 35)  # enc4 output channels
+        base_ch = c4 // 8 if c4 > 0 else 32
     else:
-        base_ch = 32  # default
+        base_ch = 32
 
     model = ImprovedAutoencoder(latent_dim=2048, base_channels=base_ch)
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(state_dict)
     model.to(DEVICE)
     model.eval()
 

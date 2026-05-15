@@ -43,9 +43,18 @@ def load_models(device):
         encoder_ckpt = os.path.join(cfg.model_dir, "best_autoencoder_train.pth")
 
     ckpt = torch.load(encoder_ckpt, map_location='cpu', weights_only=True)
-    base_ch = ckpt.get('config', {}).get('base_channels', 32) if 'config' in ckpt else 32
+    state_dict = ckpt.get('model_state_dict', ckpt.get('model', {}))
+    if 'config' in ckpt:
+        base_ch = ckpt['config'].get('base_channels', 32)
+    elif state_dict:
+        fc_w = state_dict.get('fc_encode.weight')
+        flat_dim = fc_w.shape[1] if fc_w is not None else 0
+        c4 = flat_dim // (4 * 35)
+        base_ch = c4 // 8 if c4 > 0 else 32
+    else:
+        base_ch = 32
     encoder = ImprovedAutoencoder(latent_dim=2048, base_channels=base_ch)
-    encoder.load_state_dict(ckpt['model'])
+    encoder.load_state_dict(state_dict)
     encoder.to(device)
     encoder.eval()
     for p in encoder.parameters():
