@@ -212,7 +212,7 @@ class DiffusionDataset(Dataset):
         # Shuffle and split
         np.random.seed(42)
         np.random.shuffle(self.samples)
-        split_idx = int(len(self.samples) * 0.9)
+        split_idx = int(len(self.samples) * getattr(cfg, 'train_fraction', 0.9))
         self.samples = self.samples[:split_idx] if split == "train" else self.samples[split_idx:]
 
     def __len__(self):
@@ -246,7 +246,10 @@ class DiffusionDataset(Dataset):
             )
             wav = crops[0]
 
-        # Compute mel on the smart-cropped segment
+        # V7: Audio augmentation (pitch shift + time stretch)
+        wav = augment_audio(wav, cfg.sample_rate)
+
+        # Compute mel on the (possibly augmented) segment
         mel = compute_mel(wav)  # [1, 64, ~segment_frames]
 
         # Trim/pad to exact segment_frames (mel is 3D: [1, 64, T] = [ch, freq, time])
@@ -345,6 +348,74 @@ def spec_augment(mel: torch.Tensor, freq_mask: int = 8, time_mask: int = 50) -> 
 
 
 # ═══════════════════════════════════════════════════════════════
+#  V7: AUDIO AUGMENTATION
+# ═══════════════════════════════════════════════════════════════
+
+_soxr_cache = {}
+
+def pitch_shift(wav: torch.Tensor, sr: int, semitones: float) -> torch.Tensor:
+    """Pitch shift audio by ±semitones using phase vocoder."""
+    if semitones == 0:
+        return wav
+    try:
+        import torchaudio
+        d = wav.device
+        if d not in _soxr_cache:
+            try:
+                _soxr_cache[d] = torchaudio.transforms.SpeedPerturbation(sr, [1.0])
+            except Exception:
+                return wav  # fallback if not available
+        # Simple: resample to shift pitch
+        factor = 2.0 ** (semitones / 12.0)
+        old_len = wav.shape[-1]
+        new_len = int(old_len / factor)
+        if new_len < 100:
+            return wav
+        resampled = torchaudio.functional.resample(wav, sr, int(sr * factor))
+        if resampled.shape[-1] < old_len:
+            resampled = torch.nn.functional.pad(resampled, (0, old_len - resampled.shape[-1]))
+        else:
+            resampled = resampled[..., :old_len]
+        return resampled
+    except Exception:
+        return wav
+
+
+def time_stretch(wav: torch.Tensor, sr: int, rate: float) -> torch.Tensor:
+    """Time stretch audio by rate (0.8=slower, 1.2=faster)."""
+    if rate == 1.0:
+        return wav
+    try:
+        import torchaudio
+        old_len = wav.shape[-1]
+        new_len = int(old_len * rate)
+        if new_len < 100:
+            return wav
+        stretched = torchaudio.functional.resample(wav, int(sr / rate), sr)
+        if stretched.shape[-1] < old_len:
+            stretched = torch.nn.functional.pad(stretched, (0, old_len - stretched.shape[-1]))
+        else:
+            stretched = stretched[..., :old_len]
+        return stretched
+    except Exception:
+        return wav
+
+
+def augment_audio(wav: torch.Tensor, sr: int = 22050) -> torch.Tensor:
+    """Apply random pitch shift + time stretch augmentation."""
+    if not getattr(cfg, 'augment', False):
+        return wav
+    # Random pitch shift
+    shift = np.random.uniform(-cfg.pitch_shift_semitones, cfg.pitch_shift_semitones)
+    wav = pitch_shift(wav, sr, shift)
+    # Random time stretch
+    low, high = cfg.time_stretch_range
+    rate = np.random.uniform(low, high)
+    wav = time_stretch(wav, sr, rate)
+    return wav
+
+
+# ═══════════════════════════════════════════════════════════════
 #  TRAIN / VALIDATE
 # ═══════════════════════════════════════════════════════════════
 
@@ -387,11 +458,14 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None):
         noise = torch.randn_like(mel)
         x_t = diffusion.q_sample(mel, t, noise)
 
-        # U-Net predicts noise
-        pred_noise = model(x_t, t, labels)
-
-        # Loss (L1/L2/Huber based on config)
-        loss = loss_fn(pred_noise, noise) / GRADIENT_ACCUMULATION_STEPS
+        # V7: x₀-prediction (model predicts clean mel, not noise)
+        if getattr(cfg, 'predict_x0', False):
+            pred = model(x_t, t, labels)
+            loss = loss_fn(pred, mel) / GRADIENT_ACCUMULATION_STEPS
+        else:
+            # Original ε-prediction
+            pred = model(x_t, t, labels)
+            loss = loss_fn(pred, noise) / GRADIENT_ACCUMULATION_STEPS
 
         loss.backward()
         accum_count += 1
@@ -444,8 +518,11 @@ def validate(model, diffusion, val_loader, ema_model=None):
             t = torch.randint(0, diffusion.timesteps, (B,), device=device)
             noise = torch.randn_like(mel)
             x_t = diffusion.q_sample(mel, t, noise)
-            pred_noise = eval_model(x_t, t, labels)
-            loss = loss_fn(pred_noise, noise)
+            pred = eval_model(x_t, t, labels)
+            if getattr(cfg, 'predict_x0', False):
+                loss = loss_fn(pred, mel)  # x₀ target
+            else:
+                loss = loss_fn(pred, noise)  # ε target
             total_loss += loss.item()
 
     return total_loss / max(len(val_loader), 1)
@@ -469,8 +546,9 @@ def training_loop():
         print(f"   GPU:    {torch.cuda.get_device_name(0)}")
     eff_batch = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     print(f"   Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | Accum: {GRADIENT_ACCUMULATION_STEPS} | Effective: {eff_batch} | Workers: {NUM_WORKERS}")
-    print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} params ({n_params/1e6:.1f}M) | Loss: {cfg.loss_type}")
-    print(f"   SpecAugment: yes | CFG: uncond_prob={cfg.uncond_prob}, cfg_scale={cfg.cfg_scale}")
+    print(f"   Timesteps: {cfg.timesteps} | Model: {n_params:,} ({n_params/1e6:.1f}M) | Loss: {cfg.loss_type}")
+    pred_mode = "x₀" if getattr(cfg, 'predict_x0', False) else "ε"
+    print(f"   Prediction: {pred_mode} | Augment: {'yes' if getattr(cfg,'augment',False) else 'no'} | CFG: uncond_prob={cfg.uncond_prob}, scale={cfg.cfg_scale}")
     print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
     print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
     print(f"   VAE mix-in ratio: {CONFIG.get('vae_mix_ratio', 0)*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")

@@ -34,17 +34,22 @@ class DiffusionConfig:
     dropout: float = 0.2                  # v6: more dropout (was 0.1)
 
     # ── Training ──────────────────────────────────────────
-    segment_frames: int = 552             # ~5 seconds of mel frames (at hop_length=200)
+    segment_frames: int = 552             # ~5 seconds of mel frames
+    train_fraction: float = 0.95          # v7: 95% train (was 90%) → more data
     batch_size: int = 8
     learning_rate: float = 2e-4
-    lr_decay: float = 0.999               # per-epoch decay
-    adam_betas: tuple = (0.9, 0.999)
-    adam_weight_decay: float = 1e-4       # AdamW weight decay
+    adam_weight_decay: float = 1e-4
     num_epochs: int = 50
     num_workers: int = 0
-    grad_clip_norm: float = 5.0           # relaxed clipping for diffusion
-    ema_decay: float = 0.9999             # EMA decay for smoothed inference weights
-    loss_type: str = "l1"                 # v6: L1 loss → penalizes mean regression less (was "l2")
+    grad_clip_norm: float = 5.0
+    ema_decay: float = 0.9999
+    loss_type: str = "l1"
+    predict_x0: bool = True               # v7: predict clean mel (NOT noise)
+
+    # ── Augmentation ─────────────────────────────────────
+    augment: bool = True                  # enable audio augmentation
+    pitch_shift_semitones: float = 3.0    # ±3 semitones pitch shift
+    time_stretch_range: tuple = (0.8, 1.2)  # 0.8× to 1.2× speed
 
     # ── Inference ────────────────────────────────────────
     inference_steps: int = 100            # DDIM/DDPM sampling steps (was 50)

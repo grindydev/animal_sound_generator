@@ -168,7 +168,56 @@ class DiffusionProcess(nn.Module):
         return x_t
 
     # ═════════════════════════════════════════════════════════
-    #  Full Denoising Loop (DDPM)
+    #  V7: x₀-Prediction DDIM Sampling
+    # ═════════════════════════════════════════════════════════
+
+    @torch.no_grad()
+    def ddim_sample_x0(
+        self, model, x_t: torch.Tensor, labels: torch.Tensor,
+        num_steps: int = 100, eta: float = 0.0, cfg_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """DDIM sampling for x₀-prediction model."""
+        device = x_t.device
+        b = x_t.shape[0]
+        null_labels = torch.full((b,), self.num_classes, device=device, dtype=torch.long) if cfg_scale != 1.0 else None
+        times = torch.linspace(self.timesteps - 1, 0, num_steps, device=device).long()
+
+        for i in range(len(times) - 1):
+            t = times[i]
+            t_next = times[i + 1]
+            t_batch = torch.full((b,), t, device=device, dtype=torch.long)
+
+            # Model predicts x₀ directly
+            pred_x0 = model(x_t, t_batch, labels)
+            if null_labels is not None:
+                pred_uncond = model(x_t, t_batch, null_labels)
+                pred_x0 = pred_uncond + cfg_scale * (pred_x0 - pred_uncond)
+
+            pred_x0 = torch.clamp(pred_x0, -4.0, 4.0)
+
+            # Recover noise from x₀ prediction
+            alpha_t = self.alphas_cumprod[t]
+            noise_pred = (x_t - torch.sqrt(alpha_t) * pred_x0) / torch.sqrt(1.0 - alpha_t)
+
+            # DDIM step
+            alpha_next = self.alphas_cumprod[t_next]
+            sigma = eta * torch.sqrt((1.0 - alpha_next) / (1.0 - alpha_t) * (1.0 - alpha_t / alpha_next))
+            direction = torch.sqrt(1.0 - alpha_next - sigma ** 2) * noise_pred
+            noise = torch.randn_like(x_t) if eta > 0 else 0.0
+            x_t = torch.sqrt(alpha_next) * pred_x0 + direction + sigma * noise
+
+        return x_t
+
+    @torch.no_grad()
+    def p_sample_loop_x0(self, model, shape, labels: torch.Tensor, device,
+                         progress: bool = False, cfg_scale: float = 1.0) -> torch.Tensor:
+        """Full DDPM reverse process for x₀-prediction model."""
+        # DDPM for x₀: use p_sample but instead of predicting noise,
+        # predict x₀ and recover noise for the step
+        # Simpler: just use ddim_sample_x0 with eta=1.0 (fully stochastic)
+        return self.ddim_sample_x0(model, torch.randn(shape, device=device),
+                                   labels, num_steps=self.timesteps,
+                                   eta=1.0, cfg_scale=cfg_scale)
     # ═════════════════════════════════════════════════════════
 
     @torch.no_grad()

@@ -124,15 +124,26 @@ def generate_from_noise(
     labels = torch.full((num_samples,), label_idx, device=device, dtype=torch.long)
 
     if use_ddpm:
-        generated = diffusion.p_sample_loop(
-            model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]),
-            labels, device, progress=True, cfg_scale=cfg_scale
-        )
+        if getattr(cfg, 'predict_x0', False):
+            generated = diffusion.p_sample_loop_x0(
+                model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]),
+                labels, device, progress=True, cfg_scale=cfg_scale
+            )
+        else:
+            generated = diffusion.p_sample_loop(
+                model, (num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1]),
+                labels, device, progress=True, cfg_scale=cfg_scale
+            )
     else:
         x_t = torch.randn(num_samples, cfg.spec_channels, spec_shape[0], spec_shape[1], device=device)
-        generated = diffusion.ddim_sample(
-            model, x_t, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale
-        )
+        if getattr(cfg, 'predict_x0', False):
+            generated = diffusion.ddim_sample_x0(
+                model, x_t, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale
+            )
+        else:
+            generated = diffusion.ddim_sample(
+                model, x_t, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale
+            )
 
     return generated.cpu()
 

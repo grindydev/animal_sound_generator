@@ -1,88 +1,68 @@
-# Workflow Fix Plan v7 — More Data + x₀-Prediction
+# Workflow Fix Plan v7 — x₀-Prediction Diffusion
 
 > **Date:** May 15, 2026  
-> **Approach:** Industry-standard fixes for small-data diffusion: more data, augmentation, x₀-prediction.
+> **Status:** Implementing.  
+> **Approach:** Industry-standard x₀-prediction. Model predicts clean mel, not noise.  
+> **Why:** ε-prediction (v4-v6) target is random numbers → model learns to predict 0. x₀-prediction target is real spectrograms → model learns structure.
 
 ---
 
-## 1. Three Changes
+## 1. The One Change That Matters
 
-### 1.1 More Data (85% more, zero new files)
+```
+ε-prediction (v4-v6, FAILED):
+  x_t = √ᾱ·x₀ + √(1-ᾱ)·ε    →    model(x_t) → ε̂    →    L(ε̂, ε)
+  Target = random noise. Model learns: predict 0. Output = silence/noise.
 
-Current: 2700 train / 301 val (90/10 split).  
-Fix: 95/5 split → ~2850 train from same files.  
-Plus: all files cropped to multiple segments via smart_crop → ~4500 total.  
-Plus: use ALL samples for training, skip val during early epochs, validate every 5 epochs only.
-
-### 1.2 Heavy Augmentation (10× effective data)
-
-```python
-# Each batch, randomly apply:
-- Pitch shift: ±3 semitones (shifts mel bins up/down)
-- Time stretch: 0.8× to 1.2× (speeds/slows playback)  
-- SpecAugment: mask freq bands, mask time chunks
-- Mixup: blend two samples of different classes (soft labels)
-- Random EQ: boost/cut random frequency bands
+x₀-prediction (v7):
+  x_t = √ᾱ·x₀ + √(1-ᾱ)·ε    →    model(x_t) → x̂₀    →    L(x̂₀, x₀)
+  Target = real spectrogram. Model learns: harmonics, formants, rhythm.
 ```
 
-### 1.3 x₀-Prediction (stronger gradients)
+## 2. Architecture (unchanged)
+
+Same UNet, same diffusion, same HiFi-GAN. Only the training target and inference math change.
+
+## 3. Training
 
 ```python
-# Instead of:
-noise = randn_like(mel)
-x_t = q_sample(mel, t, noise)
-loss = MSE(model(x_t, t, labels), noise)     # target = random noise (structureless)
-
-# Do:
-x_t = q_sample(mel, t)
-pred_x0 = model(x_t, t, labels)
-loss = MSE(pred_x0, mel) * weight(t)          # target = clean mel (has structure)
+# One line changes:
+#   OLD: loss = MSE(pred_noise, noise)
+#   NEW: loss = MSE(pred_x0, mel)
 ```
 
-**Why:** The target is now a real spectrogram with harmonics, formants, and rhythm — not random Gaussian noise. 100× richer learning signal per sample.
+Plus augmentation: pitch shift ±3 semitones, time stretch 0.8-1.2×.
 
-**Inference:**
+## 4. Inference
+
+DDIM adapted for x₀-prediction:
 ```python
-# Standard DDIM with x₀-prediction:
 for t in timesteps:
-    pred_x0 = model(x_t, t, labels)           # predict clean
-    pred_noise = (x_t - sqrt(α) * pred_x0) / sqrt(1-α)  # recover noise
-    x_t = next_step(pred_x0, pred_noise, t)   # DDIM step
+    pred_x0 = model(x_t, t, labels)
+    pred_x0 = clamp(pred_x0, -4, 4)
+    # Recover noise from x₀ prediction
+    noise_pred = (x_t - √ᾱₜ · pred_x0) / √(1-ᾱₜ)
+    # DDIM step using x₀
+    direction = √(1-ᾱₙₑₓₜ) · noise_pred
+    x_t = √ᾱₙₑₓₜ · pred_x0 + direction
 ```
 
-### 1.4 Class-Mean Initialization (reduces task difficulty)
-
-Instead of starting DDIM from pure noise, start from the class mean + 80% noise:
-
-```python
-class_mean = precompute_mean_mel(label)   # average mel for this class
-x_T = class_mean * 0.2 + noise * 0.8      # 20% signal, 80% noise
-# DDIM from here — model only needs to add 20% detail
-```
-
-Precompute class means from all training samples at startup.
-
----
-
-## 2. Implementation
+## 5. Files Changed
 
 | File | Change |
 |------|--------|
-| `src/diffusion/config.py` | Add augment params, train_frac=0.95 |
-| `src/diffusion/train.py` | x₀-prediction loss, augmentation, more data |
+| `src/diffusion/config.py` | Add augment params |
+| `src/diffusion/train.py` | x₀ loss, pitch/time augment, 95/5 split |
 | `src/diffusion/diffusion.py` | x₀-prediction DDIM/DDPM sampling |
-| `src/generate.py` | Class-mean init + x₀ inference |
+| `src/diffusion/inference.py` | x₀ generate_from_noise |
+| `src/generate.py` | --x0 flag, updated pipeline |
+| `colab/colab_train.ipynb` | Updated training cell |
 
-Expected: ~45 min to implement, retrain on Colab L4 (~2 hrs with augmentation).
+## 6. Success Criteria
 
----
-
-## 3. Success Criteria
-
-| Metric | Current | Target |
+| Metric | Current (ε) | Target (x₀) |
 |--------|:---:|:---:|
-| Training samples | 2700 | 4500+ |
-| Effective samples (augment) | 2700 | ~45,000 |
-| Val loss trend | Flat at 1.0 | Decreasing |
+| Val loss decreasing | ❌ Flat at 1.0 | ✅ Decreasing |
 | Generated mel σ | N/A (noise) | 0.8-1.5 |
-| Classes with structure | 0/8 | 3+/8 |
+| Audio peak | 11025 Hz | <5000 Hz |
+| Classes distinct | 0/8 | 3+/8 |
