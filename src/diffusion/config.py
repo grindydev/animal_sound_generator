@@ -40,7 +40,7 @@ class DiffusionConfig:
     learning_rate: float = 2e-4
     adam_betas: tuple = (0.9, 0.999)
     adam_weight_decay: float = 1e-4
-    num_epochs: int = 100                 # v9: 100 epochs for class balance
+    num_epochs: int = 150                 # v10: more epochs, smaller dataset
     num_workers: int = 4
     grad_clip_norm: float = 5.0
     ema_decay: float = 0.9999
@@ -53,9 +53,9 @@ class DiffusionConfig:
 
     # ── Augmentation ─────────────────────────────────────
     augment: bool = True
-    strong_augment: bool = True           # v8: freq/time masking + noise + gain
-    pitch_shift_bins: int = 4             # ±4 mel bins for pitch augmentation
-    time_stretch_range: tuple = (0.8, 1.2)
+    strong_augment: bool = True
+    pitch_shift_bins: int = 4
+    time_stretch_range: tuple = (0.85, 1.15)   # gentler stretch for 5s clean clips
 
     # ── Frequency-Weighted Loss ──────────────────────────
     freq_weight_max: float = 3.0          # v8: bin 63 weighted 3× more than bin 0
@@ -73,7 +73,7 @@ class DiffusionConfig:
     uncond_prob: float = 0.15             # v6: fraction of training batches w/o label (CFG)
 
     # ── Paths ────────────────────────────────────────────
-    data_dir: str = "data/animal_audio"
+    data_dir: str = "data/esc50"
     mel_dir: str = "data/animal_mel"      # precomputed mel cache (optional)
     model_dir: str = "models"
     checkpoint_dir: str = "models/diffusion_checkpoints"
