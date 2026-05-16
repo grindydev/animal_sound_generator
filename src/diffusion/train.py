@@ -78,7 +78,7 @@ CONFIG = {
     },
 
     "train": {
-        "num_epochs": 50,
+        "num_epochs": 150,           # v10: 150 for ESC-50
         "batch_size": 8,            # v6: 15M UNet (was 4)
         "num_workers": 4,
         "gradient_accumulation_steps": 4,  # effective batch = 32
