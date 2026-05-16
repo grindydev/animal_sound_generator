@@ -34,18 +34,22 @@ class DiffusionConfig:
     dropout: float = 0.2                  # v6: more dropout (was 0.1)
 
     # ── Training ──────────────────────────────────────────
-    segment_frames: int = 552             # ~5 seconds of mel frames
-    train_fraction: float = 0.95          # v7: 95% train (was 90%) → more data
+    segment_frames: int = 552
+    train_fraction: float = 0.95
     batch_size: int = 8
     learning_rate: float = 2e-4
     adam_betas: tuple = (0.9, 0.999)
     adam_weight_decay: float = 1e-4
-    num_epochs: int = 50
-    num_workers: int = 4                 # Colab: 4 workers for pipelining
+    num_epochs: int = 100                 # v9: 100 epochs for class balance
+    num_workers: int = 4
     grad_clip_norm: float = 5.0
     ema_decay: float = 0.9999
     loss_type: str = "l1"
-    predict_x0: bool = True               # v7: predict clean mel (NOT noise)
+    predict_x0: bool = True
+
+    # ── V9: Class Balance ────────────────────────────────
+    balance_classes: bool = True           # oversample rare classes each epoch
+    noise_max_samples: int = 200           # cap Noise class at 200 (Option B)
 
     # ── Augmentation ─────────────────────────────────────
     augment: bool = True

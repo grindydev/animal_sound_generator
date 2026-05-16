@@ -1,5 +1,5 @@
 """
-train.py — Phase 7b: Diffusion U-Net Training
+train.py — V9: Diffusion U-Net Training (x₀ + GAN + class-balanced)
 ===============================================
 
 Trains a U-Net diffusion model to denoise spectrograms. The U-Net learns
@@ -282,6 +282,109 @@ class DiffusionDataset(Dataset):
                     mel = vae_gen[:, 0, :, :].cpu()  # [1, 64, segment_frames]
 
         return mel, torch.tensor(label, dtype=torch.long)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  V9: CLASS-BALANCED DATASET (oversample rare classes)
+# ═══════════════════════════════════════════════════════════════
+
+class BalancedDiffusionDataset(Dataset):
+    """
+    Class-balanced dataset: rare classes get equal exposure.
+    
+    Each epoch: every class appears `max_per_class` times.
+    - Dog (750) appears naturally
+    - Frog (61) repeated 12× with different augmentation each pass
+    - Noise capped at 200 (Option B)
+    
+    Effective: ~1,400 samples per epoch (200 × 7 classes).
+    """
+    def __init__(self, data_dir: str, segment_frames: int, split: str = "train"):
+        self.data_dir = data_dir
+        self.segment_frames = segment_frames
+        self.class_samples = {c: [] for c in range(cfg.num_classes)}
+
+        # Collect samples grouped by class
+        all_samples = []
+        for cls_name in os.listdir(data_dir):
+            cls_dir = os.path.join(data_dir, cls_name)
+            if not os.path.isdir(cls_dir) or cls_name not in CLASS_TO_IDX:
+                continue
+            cls_idx = CLASS_TO_IDX[cls_name]
+            for fname in os.listdir(cls_dir):
+                if fname.endswith('.wav'):
+                    all_samples.append((
+                        os.path.abspath(os.path.join(cls_dir, fname)),
+                        cls_idx,
+                    ))
+
+        # Split train/val PER CLASS (preserves rare classes in both)
+        np.random.seed(42)
+        train_samples = {}
+        val_samples = {}
+        for c in range(cfg.num_classes):
+            class_files = [s for s in all_samples if s[1] == c]
+            np.random.shuffle(class_files)
+            split_idx = int(len(class_files) * cfg.train_fraction)
+            if split == "train":
+                self.class_samples[c] = class_files[:split_idx]
+            else:
+                self.class_samples[c] = class_files[split_idx:]
+            
+            # V9 Option B: cap Noise class
+            if c == CLASS_TO_IDX.get('Noise', 7) and cfg.noise_max_samples > 0:
+                self.class_samples[c] = self.class_samples[c][:cfg.noise_max_samples]
+
+        # Max samples in any class → target length per epoch
+        self.max_per_class = max(len(v) for v in self.class_samples.values())
+        self.num_classes = cfg.num_classes
+
+    def __len__(self):
+        return self.max_per_class * self.num_classes
+
+    def _load_mel(self, path, label):
+        """Load audio, compute mel, apply augmentation."""
+        wav, sr = _load_audio(path)
+        if wav is None:
+            return torch.zeros(1, 64, self.segment_frames), torch.tensor(0, dtype=torch.long)
+
+        if sr != cfg.sample_rate:
+            import torchaudio
+            wav = torchaudio.transforms.Resample(sr, cfg.sample_rate)(wav)
+
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+
+        crop_samples = self.segment_frames * cfg.hop_length
+        if wav.shape[-1] <= crop_samples:
+            pad = torch.zeros(1, crop_samples - wav.shape[-1])
+            wav = torch.cat([wav, pad], dim=-1)
+        else:
+            crops = smart_crop(wav, crop_samples=crop_samples, threshold_db=-30.0,
+                               num_crops=1, merge_gap_samples=4410)
+            wav = crops[0]
+
+        mel = compute_mel(wav)
+
+        # Strong augmentation (different each oversample pass)
+        if getattr(cfg, 'augment', False):
+            mel = strong_augment_mel(mel)
+
+        T = mel.shape[-1]
+        if T > self.segment_frames:
+            mel = mel[..., :self.segment_frames]
+        elif T < self.segment_frames:
+            mel = torch.nn.functional.pad(mel, (0, self.segment_frames - T))
+
+        return mel, torch.tensor(label, dtype=torch.long)
+
+    def __getitem__(self, idx):
+        cls = idx % self.num_classes
+        samples = self.class_samples[cls]
+        # Wrap around: rare classes repeat, each pass gets different augmentation
+        s_idx = (idx // self.num_classes) % len(samples)
+        path, label = samples[s_idx]
+        return self._load_mel(path, label)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -661,14 +764,28 @@ def training_loop():
             print(f"⚠️  VAE checkpoint not found at {vae_ckpt_path} — disabling VAE mix-in")
             vae_mix_ratio = 0.0
 
-    train_ds = DiffusionDataset(
-        CONFIG["data_dir"], SEGMENT_FRAMES, split="train",
-        vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
-    )
-    val_ds = DiffusionDataset(
-        CONFIG["data_dir"], SEGMENT_FRAMES, split="val",
-        vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
-    )
+    # V9: class-balanced or standard dataset
+    if getattr(cfg, 'balance_classes', False):
+        balanced = getattr(cfg, 'noise_max_samples', 0) > 0
+        print(f"   ⚖️  Class-balanced sampling: {'Noise capped at '+str(cfg.noise_max_samples) if balanced else 'all classes equal'}")
+        train_ds = BalancedDiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="train")
+        val_ds = BalancedDiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="val")
+        
+        # Show class distribution
+        class_counts = {c: len(train_ds.class_samples[c]) for c in range(cfg.num_classes)}
+        class_names = {i: n for n, i in CLASS_TO_IDX.items()}
+        dist_str = ' | '.join(f"{class_names.get(c,'?'+str(c))}:{n}" for c, n in sorted(class_counts.items()))
+        print(f"   Class distribution: {dist_str}")
+        print(f"   Epoch size: {len(train_ds)} samples ({train_ds.max_per_class} per class)")
+    else:
+        train_ds = DiffusionDataset(
+            CONFIG["data_dir"], SEGMENT_FRAMES, split="train",
+            vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
+        )
+        val_ds = DiffusionDataset(
+            CONFIG["data_dir"], SEGMENT_FRAMES, split="val",
+            vae_model=vae_model_for_dataset, vae_mix_ratio=vae_mix_ratio,
+        )
 
     print(f"\n✅ Data loaded: {len(train_ds)} train / {len(val_ds)} val | VAE mix-in: {vae_mix_ratio*100:.0f}%")
 
@@ -738,8 +855,8 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING v8 — {MODE.upper()} MODE")
-    print(f"   Prediction: x₀ + freq-weighted loss (×{getattr(cfg,'freq_weight_max',1.0)}) + strong augment")
+    print(f"🚀 DIFFUSION TRAINING v9 — {MODE.upper()} MODE")
+    print(f"   Prediction: x₀ + freq-weighted + GAN + class-balanced + 100 epochs")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
