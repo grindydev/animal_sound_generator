@@ -75,15 +75,14 @@ def extract_segments(wav: torch.Tensor, sr: int, min_rms: float = MIN_RMS,
 
 def build_combined_dataset(
     esc50_dir: str = "data/esc50",
-    old_data_dir: str = "data/animal_audio",
+    urbansound_dir: str = None,
     output_dir: str = "data/combined",
-    min_rms: float = MIN_RMS,
     max_noise_files: int = 300,
 ):
-    """Merge ESC-50 and filtered old data into output_dir."""
+    """Merge ESC-50 + UrbanSound8K into output_dir."""
     os.makedirs(output_dir, exist_ok=True)
     counts = {cls: 0 for cls in CLASS_NAMES}
-    from_sources = {cls: {"esc50": 0, "old_crop": 0} for cls in CLASS_NAMES}
+    from_sources = {cls: {"esc50": 0, "urbansound8k": 0} for cls in CLASS_NAMES}
 
     # ═══════════════════════════════════════════════════════
     #  Phase 1: Copy ESC-50 files
@@ -104,88 +103,70 @@ def build_combined_dataset(
         print(f"✅ ESC-50 copied: {sum(from_sources[c]['esc50'] for c in CLASS_NAMES)} files")
 
     # ═══════════════════════════════════════════════════════
-    #  Phase 2: Energy-filter old data
+    #  Phase 2: UrbanSound8K (dog barks, ~1,000 files)
     # ═══════════════════════════════════════════════════════
-    if os.path.exists(old_data_dir) and min_rms > 0:
-        print(f"\n🔍 Scanning old data with min_rms={min_rms}...")
-        total_scanned = 0
-        total_extracted = 0
-
-        for cls_name in CLASS_NAMES:
-            src_dir = os.path.join(old_data_dir, cls_name)
-            if not os.path.isdir(src_dir):
-                continue
-            dst_dir = os.path.join(output_dir, cls_name)
-            os.makedirs(dst_dir, exist_ok=True)
-
-            # Skip Noise from old data (ESC-50 has enough)
-            if cls_name == "Noise":
-                continue
-
-            wav_files = [f for f in os.listdir(src_dir) if f.endswith('.wav')]
-            for fname in sorted(wav_files):
-                path = os.path.join(src_dir, fname)
-                wav, sr = load_audio(path)
-                if wav is None:
-                    continue
-                total_scanned += 1
-
-                segments = extract_segments(wav, sr, min_rms=min_rms)
-                for si, seg in enumerate(segments):
-                    # Cap per-class from old data to avoid imbalance
-                    max_from_old = {
-                        'Dog': 200, 'Cat': 120, 'Rooster': 80, 'Frog': 60,
-                        'Crow': 60, 'Insect': 100, 'Hen': 60, 'Noise': 0,
-                    }
-                    cap = max_from_old.get(cls_name, 100)
-                    if from_sources[cls_name]["old_crop"] >= cap:
-                        break
-
-                    import soundfile as sf
-                    out_name = f"crop_{fname.replace('.wav','')}_{si:02d}.wav"
-                    out_path = os.path.join(dst_dir, out_name)
-                    sf.write(out_path, seg.squeeze().numpy(), SAMPLE_RATE)
-                    counts[cls_name] += 1
-                    from_sources[cls_name]["old_crop"] += 1
-                    total_extracted += 1
-
-            if total_scanned % 100 == 0:
-                print(f"   Scanned {total_scanned} files, extracted {total_extracted} segments...")
-
-        print(f"\n✅ Old data: scanned {total_scanned} files, extracted {total_extracted} clean segments")
+    if urbansound_dir and os.path.exists(urbansound_dir):
+        audio_dir = os.path.join(urbansound_dir, "audio")
+        meta_path = os.path.join(urbansound_dir, "metadata", "UrbanSound8K.csv")
+        if os.path.exists(audio_dir) and os.path.exists(meta_path):
+            import csv
+            file_to_class = {}
+            with open(meta_path, "r") as f:
+                for row in csv.DictReader(f):
+                    file_to_class[row.get("slice_file_name", "")] = int(row.get("classID", -1))
+            
+            US8K_CLASSES = {0:"air_conditioner",1:"car_horn",2:"children_playing",3:"dog_bark",
+                           4:"drilling",5:"engine_idling",6:"gun_shot",7:"jackhammer",8:"siren",9:"street_music"}
+            MAPPING = {"dog_bark": "Dog"}
+            
+            for fold in range(1, 11):
+                fold_dir = os.path.join(audio_dir, f"fold{fold}")
+                if not os.path.isdir(fold_dir): continue
+                for fname in sorted(os.listdir(fold_dir)):
+                    if not fname.endswith(".wav"): continue
+                    us8k_name = US8K_CLASSES.get(file_to_class.get(fname, -1), "")
+                    our_class = MAPPING.get(us8k_name)
+                    if our_class is None: continue
+                    
+                    dst_dir = os.path.join(output_dir, our_class)
+                    os.makedirs(dst_dir, exist_ok=True)
+                    shutil.copy2(os.path.join(fold_dir, fname),
+                                os.path.join(dst_dir, f"us8k_{fname}"))
+                    counts[our_class] += 1
+                    from_sources[our_class]["urbansound8k"] += 1
+            
+            us8k_total = sum(from_sources[c]["urbansound8k"] for c in CLASS_NAMES)
+            print(f"✅ UrbanSound8K imported: {us8k_total} files")
 
     # ═══════════════════════════════════════════════════════
     #  Report
     # ═══════════════════════════════════════════════════════
     print(f"\n📊 Combined dataset → {output_dir}/")
-    print(f"{'Class':10s} {'ESC-50':>7s} {'Old':>7s} {'Total':>7s}")
+    print(f"{'Class':10s} {'ESC-50':>7s} {'US8K':>7s} {'Total':>7s}")
     print("-" * 35)
     for cls_name in CLASS_NAMES:
         esc = from_sources[cls_name]["esc50"]
-        old = from_sources[cls_name]["old_crop"]
+        us8k = from_sources[cls_name]["urbansound8k"]
         tot = counts[cls_name]
-        print(f"{cls_name:10s} {esc:7d} {old:7d} {tot:7d}")
+        print(f"{cls_name:10s} {esc:7d} {us8k:7d} {tot:7d}")
     total = sum(counts.values())
-    print(f"{'TOTAL':10s} {sum(from_sources[c]['esc50'] for c in CLASS_NAMES):7d} "
-          f"{sum(from_sources[c]['old_crop'] for c in CLASS_NAMES):7d} {total:7d}")
+    esc_tot = sum(from_sources[c]["esc50"] for c in CLASS_NAMES)
+    us8k_tot = sum(from_sources[c]["urbansound8k"] for c in CLASS_NAMES)
+    print(f"{'TOTAL':10s} {esc_tot:7d} {us8k_tot:7d} {total:7d}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build combined dataset")
     parser.add_argument("--esc50-dir", default="data/esc50")
-    parser.add_argument("--old-data-dir", default="data/animal_audio")
+    parser.add_argument("--urbansound-dir", default=None,
+                       help="Path to extracted UrbanSound8K directory")
     parser.add_argument("--output-dir", default="data/combined")
-    parser.add_argument("--min-rms", type=float, default=MIN_RMS,
-                       help="Minimum RMS energy for a segment (0.02 = audible)")
-    parser.add_argument("--max-noise", type=int, default=300)
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     build_combined_dataset(
         esc50_dir=args.esc50_dir,
-        old_data_dir=args.old_data_dir,
+        urbansound_dir=args.urbansound_dir,
         output_dir=args.output_dir,
-        min_rms=args.min_rms,
-        max_noise_files=args.max_noise,
     )
 
 

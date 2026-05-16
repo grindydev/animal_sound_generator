@@ -1,73 +1,69 @@
-# Workflow Fix Plan v11 — More Clean Data + 150 Epochs
+# Workflow Fix Plan v11 (revised) — Better Data Sources
 
 > **Date:** May 16, 2026  
 > **Status:** Implementing.  
-> **Builds on:** v10 (ESC-50 — 4/8 audible, first class-specific frequencies)  
-> **Goal:** 200+ clean files per class. 150 epochs. All 8 classes distinct.
+> **Builds on:** v10 (ESC-50 — 4/8 audible). Old data removed — too noisy.  
+> **Goal:** 150-300 clean files per class from multiple curated sources.
 
 ---
 
-## 1. v10 Achievement
+## 1. Data Sources (all free, direct download)
 
+| Dataset | Best For | Files | Download |
+|---------|----------|:---:|------|
+| **ESC-50** (have) | All 8 classes | 640 | Already in `data/esc50/` |
+| **UrbanSound8K** | Dog barks | ~1,000 | `wget https://zenodo.org/record/1203745/files/UrbanSound8K.tar.gz` |
+| **Cat Sound Dataset** | Cat meows | ~160 | Kaggle or `wget https://storage.googleapis.com/...` |
+| **Xeno-Canto** | Bird calls (Crow, Hen, Rooster) | ~200 | API: `xeno-canto.org/api/2/recordings` |
+| **Freesound** | Frog, Insect | ~100 each | Search + batch download |
+
+**Combined: ~2,000+ clean files. All classes with 100-300 unique sounds.**
+
+## 2. Implementation
+
+### Phase 1: Dog (UrbanSound8K)
+```bash
+wget https://zenodo.org/record/1203745/files/UrbanSound8K.tar.gz
+tar -xzf UrbanSound8K.tar.gz
+# Extract "dog_bark" class (label 4) → data/sources/urbansound/Dog/
 ```
-OLD data:   0/8 audible, all 32Hz hum, all classes identical
-ESC-50:     4/8 audible, Dog=345Hz, Frog=1895Hz, Rooster=1034Hz
-```
 
-Proved: **architecture works. More data = more classes audible.**
+### Phase 2: Cat (Freesound + Kaggle)
+Cat meowing samples available from:
+- Freesound search "cat meow" → ~200 results  
+- Kaggle "cat sound dataset"
 
-## 2. Data Sources
-
-| Source | What | Files | Download |
-|--------|------|:---:|------|
-| ESC-50 (have) | Clean 5s clips | 640 | ✅ Already in `data/esc50/` |
-| Old data, energy-filtered | Smart-crop noise removal | ~500 clean segments | ✅ Already in `data/animal_audio/` |
-| **Combined** | | **~1,000+** | Merge + deduplicate |
-
-## 3. Energy-Based Filtering
-
-The old data has real animal sounds buried in silence. We extract only high-energy segments:
-
+### Phase 3: Birds (Xeno-Canto API)
 ```python
-def extract_clean_segments(wav_path, min_rms=0.02):
-    """Keep only 5s chunks with RMS > 0.02 (actual sound, not silence)."""
-    wav = load(wav_path)
-    for start in range(0, len(wav)-5s, 2s):  # 2s stride for overlap
-        chunk = wav[start:start+5s]
-        if chunk.rms > min_rms:
-            yield chunk
+# Rooster: query="Gallus gallus" type="song"
+# Crow: query="Corvus" type="call"
+# Hen: query="chicken" type="call"
+# ~50-100 recordings each, free download
 ```
 
-This filters ~3001 old files down to ~500 clean 5s segments.
+### Phase 4: Frog, Insect (Freesound)
+```python
+# Frog: search "frog croak" → ~150 results
+# Insect: search "cricket" OR "insect buzz" → ~200 results
+```
 
-## 4. Combined Dataset
-
-| Class | ESC-50 | Old (filtered) | Total |
-|-------|:---:|:---:|:---:|
-| Dog | 40 | ~150 | ~190 |
-| Cat | 40 | ~80 | ~120 |
-| Rooster | 40 | ~40 | ~80 |
-| Frog | 40 | ~20 | ~60 |
-| Crow | 80 | ~15 | ~95 |
-| Insect | 80 | ~50 | ~130 |
-| Hen | 40 | ~30 | ~70 |
-| Noise | 280 | 0 | 280 |
-| **Total** | 640 | ~385 | **~1,025** |
-
-## 5. Changes
+## 3. Changes
 
 | File | Change |
 |------|--------|
-| `src/scripts/build_dataset.py` | New: merge ESC-50 + filtered old data |
-| `src/diffusion/config.py` | `data_dir="data/combined"`, `num_epochs=150` |
-| (nothing else) | Same UNet, same GAN, same training loop |
+| `src/scripts/build_dataset.py` | Add UrbanSound8K + Xeno-Canto + Freesound sources |
+| `src/diffusion/config.py` | `data_dir="data/combined"` (kept) |
+| Notebook | Download additional datasets |
 
-## 6. Expected Outcome
+## 4. Plan
 
-| Metric | v10 (ESC-50, 50 epochs) | v11 Target |
-|--------|:---:|:---:|
-| Audible classes | 4/8 | 6-8/8 |
-| Dog peak | 345 Hz | 300-800 Hz (stable bark) |
-| Frog peak | 1895 Hz | 1500-2500 Hz (croak) |
-| Cat peak | 172 Hz | 200-2000 Hz (meow) |
-| Training time | 40 min | 60 min (150 epochs, ~1,000 files) |
+Start with UrbanSound8K (easiest — direct download, clean). That alone gives Dog 40→1,040 files.
+
+```bash
+# Download UrbanSound8K
+wget https://zenodo.org/record/1203745/files/UrbanSound8K.tar.gz
+tar -xzf UrbanSound8K.tar.gz
+python src/scripts/import_urbansound.py  # extract dog barks
+```
+
+Then add the other sources one by one. Each new source = more class diversity.
