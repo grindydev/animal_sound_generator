@@ -85,13 +85,20 @@ class SelfAttention2D(nn.Module):
 #  ResBlock with Time + Class Conditioning (FiLM-style)
 # ═══════════════════════════════════════════════════════════════
 
+def _num_groups(n_channels: int, max_groups: int = 32) -> int:
+    """Find largest divisor of n_channels ≤ max_groups for GroupNorm."""
+    for g in range(min(max_groups, n_channels), 0, -1):
+        if n_channels % g == 0:
+            return g
+    return 1
+
 class ResBlock(nn.Module):
     """Residual block with GroupNorm, SiLU, and FiLM conditioning."""
     def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int, class_emb_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.norm1 = nn.GroupNorm(min(32, in_ch), in_ch)
+        self.norm1 = nn.GroupNorm(_num_groups(in_ch), in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(min(32, out_ch), out_ch)
+        self.norm2 = nn.GroupNorm(_num_groups(out_ch), out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
 
         # FiLM: time/class → scale + shift for each channel
@@ -227,7 +234,7 @@ class SpectrogramUNet(nn.Module):
 
         # ── Output ──────────────────────────────────────
         self.output_proj = nn.Sequential(
-            nn.GroupNorm(min(32, in_ch), in_ch),
+            nn.GroupNorm(_num_groups(in_ch), in_ch),
             nn.SiLU(),
             nn.Conv2d(in_ch, config.spec_channels, kernel_size=3, padding=1),
         )

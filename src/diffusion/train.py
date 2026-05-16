@@ -747,6 +747,16 @@ def train_epoch(
         noise = torch.randn_like(mel)
         x_t = diffusion.q_sample(mel, t, noise)
 
+        # V13: PURE NOISE GENERATION TASK at high timesteps
+        # For t > threshold, replace noisy mel with PURE NOISE.
+        # This removes the input signal shortcut — model MUST use class
+        # conditioning to predict the right mel, not extract it from input.
+        # Without this, the model ignores time/class conditioning entirely
+        # (confirmed: predictions identical for all t and all classes in v12).
+        pure_noise_threshold = getattr(cfg, 'pure_noise_t_threshold', 600)
+        pure_noise_mask = (t > pure_noise_threshold).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        x_t = torch.where(pure_noise_mask.expand_as(x_t), noise, x_t)
+
         # V7/V12: x₀-prediction (model predicts clean mel, not noise)
         if getattr(cfg, 'predict_x0', False):
             pred = model(x_t, t, labels)
@@ -888,6 +898,8 @@ def training_loop():
     print(f"   Prediction: {pred_mode} | Augment: {'yes' if getattr(cfg,'augment',False) else 'no'} | CFG: uncond_prob={cfg.uncond_prob}, scale={cfg.cfg_scale}")
     print(f"   Segment: {SEGMENT_FRAMES} mel frames | EMA: {EMA_DECAY} | AdamW weight_decay: {cfg.adam_weight_decay}")
     print(f"   Scheduler: CosineAnnealingWarmRestarts | Mixed precision: {'yes' if use_amp else 'no'}")
+    print(f"   Schedule: {'linear' if cfg.use_linear_schedule else 'COSINE'} | Pure noise at t>{getattr(cfg, 'pure_noise_t_threshold', 600)}")
+    print(f"   V13 losses: spectral_balance={cfg.spectral_balance_weight}, smooth={cfg.temporal_smooth_weight}, cls={cfg.classifier_guidance_weight}")
     print(f"   VAE mix-in ratio: {CONFIG.get('vae_mix_ratio', 0)*100:.0f}% | VAE ckpt: {CONFIG.get('vae_checkpoint', 'N/A')}")
     print(f"   Best model → {BEST_MODEL_PATH}")
 
@@ -1012,7 +1024,8 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING v12 — {MODE.upper()} MODE")
+    print(f"🚀 DIFFUSION TRAINING v13 — {MODE.upper()} MODE")
+    print(f"   KEY FIX: Pure noise at high t → model MUST use class conditioning")
     print(f"   Prediction: x₀ + spectral balance + temporal smooth + classifier guidance")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")

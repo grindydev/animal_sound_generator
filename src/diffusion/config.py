@@ -21,17 +21,18 @@ class DiffusionConfig:
     timesteps: int = 1000                 # total noise steps (train)
     beta_start: float = 0.0001
     beta_end: float = 0.02
-    use_linear_schedule: bool = True      # linear schedule → more signal at high t (vs cosine)
+    use_linear_schedule: bool = False     # v13: cosine schedule (was True — linear kills conditioning)
+    cosine_s: float = 0.008              # v13: cosine schedule smoothing parameter
 
     # ── U-Net ────────────────────────────────────────────
-    base_channels: int = 32               # v12: ~4M params (was 64 → 18M overfit)
-    channel_multipliers: tuple = (1, 1, 2, 2)  # [32, 32, 64, 64] (was (1,2,2,4))
+    base_channels: int = 24               # v13: ~1.5M params (was 32 → 3.1M, still collapsed)
+    channel_multipliers: tuple = (1, 1, 2, 2)  # [24, 24, 48, 48]
     res_blocks_per_level: int = 1         # 1 block per level
     attention_levels: tuple = (3,)        # attention only at deepest level
     time_emb_dim: int = 256               # v12: reduced (was 512)
     class_emb_dim: int = 128              # v12: reduced (was 256)
     num_classes: int = 7                  # v12: removed Noise class (was 8)
-    dropout: float = 0.3                  # v12: more dropout (was 0.2)
+    dropout: float = 0.4                  # v13: more dropout (was 0.3)
 
     # ── Training ──────────────────────────────────────────
     segment_frames: int = 552
@@ -69,8 +70,12 @@ class DiffusionConfig:
     inference_steps: int = 200            # v12: more steps for stability (was 100)
     refinement_strength: float = 0.4      # v12: gentler refinement (was 0.6)
     ddim_eta: float = 0.0                # DDIM stochasticity (0.0 = deterministic)
-    cfg_scale: float = 1.5               # v12: reduced CFG (was 2.0, causing artifacts)
-    uncond_prob: float = 0.1             # v12: reduced uncond (was 0.15)
+    cfg_scale: float = 2.5               # v13: stronger CFG (was 1.5)
+    uncond_prob: float = 0.2             # v13: more uncond for better CFG (was 0.1)
+
+    # ── V13: Pure Noise Generation Training ─────────────
+    pure_noise_t_threshold: int = 600     # above this t, replace noisy mel with pure noise
+                                          # Forces model to use class conditioning, not input signal
 
     # ── V12: Spectral Balance + Smoothness + Classifier Guidance ─
     spectral_balance_weight: float = 10.0  # weight for spectral band ratio loss
@@ -82,8 +87,6 @@ class DiffusionConfig:
     target_mel_mean: float = 0.0           # target mean for generated mels
     target_mel_std: float = 0.5            # target std for generated mels
     mel_clip_range: float = 2.0            # clamp generated mels to [-2, 2]
-
-    # ── Paths ────────────────────────────────────────────
 
     # ── Paths ────────────────────────────────────────────
     data_dir: str = "data/esc50"
