@@ -73,7 +73,7 @@ class DiffusionConfig:
     uncond_prob: float = 0.15             # v6: fraction of training batches w/o label (CFG)
 
     # ── Paths ────────────────────────────────────────────
-    data_dir: str = "data/esc50"
+    data_dir: str = "data/combined"
     mel_dir: str = "data/animal_mel"      # precomputed mel cache (optional)
     model_dir: str = "models"
     checkpoint_dir: str = "models/diffusion_checkpoints"

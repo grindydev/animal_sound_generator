@@ -855,8 +855,8 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING v9 — {MODE.upper()} MODE")
-    print(f"   Prediction: x₀ + freq-weighted + GAN + class-balanced + 100 epochs")
+    print(f"🚀 DIFFUSION TRAINING v11 — {MODE.upper()} MODE")
+    print(f"   Prediction: x₀ + GAN + class-balanced + ESC-50 + filtered old data + 150 epochs")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
