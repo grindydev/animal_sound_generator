@@ -24,14 +24,14 @@ class DiffusionConfig:
     use_linear_schedule: bool = True      # linear schedule → more signal at high t (vs cosine)
 
     # ── U-Net ────────────────────────────────────────────
-    base_channels: int = 64               # v6: ~18M params (was 96 → 61M overfit)
-    channel_multipliers: tuple = (1, 2, 2, 4)  # [48, 96, 96, 192] (was (1,2,3,4))
-    res_blocks_per_level: int = 1         # 1 block per level (was 2)
-    attention_levels: tuple = (3,)        # attention only at deepest level (was (2,3))
-    time_emb_dim: int = 512               # sinusoidal time embedding size
-    class_emb_dim: int = 256              # animal class embedding size
-    num_classes: int = 8
-    dropout: float = 0.2                  # v6: more dropout (was 0.1)
+    base_channels: int = 32               # v12: ~4M params (was 64 → 18M overfit)
+    channel_multipliers: tuple = (1, 1, 2, 2)  # [32, 32, 64, 64] (was (1,2,2,4))
+    res_blocks_per_level: int = 1         # 1 block per level
+    attention_levels: tuple = (3,)        # attention only at deepest level
+    time_emb_dim: int = 256               # v12: reduced (was 512)
+    class_emb_dim: int = 128              # v12: reduced (was 256)
+    num_classes: int = 7                  # v12: removed Noise class (was 8)
+    dropout: float = 0.3                  # v12: more dropout (was 0.2)
 
     # ── Training ──────────────────────────────────────────
     segment_frames: int = 552
@@ -66,11 +66,24 @@ class DiffusionConfig:
     disc_lr: float = 2e-4                 # discriminator learning rate
 
     # ── Inference ────────────────────────────────────────
-    inference_steps: int = 100            # DDIM/DDPM sampling steps (was 50)
-    refinement_strength: float = 0.6      # default img2img strength (0.0-1.0)
+    inference_steps: int = 200            # v12: more steps for stability (was 100)
+    refinement_strength: float = 0.4      # v12: gentler refinement (was 0.6)
     ddim_eta: float = 0.0                # DDIM stochasticity (0.0 = deterministic)
-    cfg_scale: float = 2.0               # classifier-free guidance scale (1.0 = no CFG)
-    uncond_prob: float = 0.15             # v6: fraction of training batches w/o label (CFG)
+    cfg_scale: float = 1.5               # v12: reduced CFG (was 2.0, causing artifacts)
+    uncond_prob: float = 0.1             # v12: reduced uncond (was 0.15)
+
+    # ── V12: Spectral Balance + Smoothness + Classifier Guidance ─
+    spectral_balance_weight: float = 10.0  # weight for spectral band ratio loss
+    temporal_smooth_weight: float = 5.0    # weight for frame-to-frame smoothness
+    classifier_guidance_weight: float = 0.3  # weight for classifier perceptual loss
+    classifier_ckpt: str = "models/best_audio_cnn_train.pth"  # frozen classifier path
+
+    # ── V12: Post-Generation Stats Matching ─
+    target_mel_mean: float = 0.0           # target mean for generated mels
+    target_mel_std: float = 0.5            # target std for generated mels
+    mel_clip_range: float = 2.0            # clamp generated mels to [-2, 2]
+
+    # ── Paths ────────────────────────────────────────────
 
     # ── Paths ────────────────────────────────────────────
     data_dir: str = "data/esc50"

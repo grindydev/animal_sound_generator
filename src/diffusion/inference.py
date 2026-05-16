@@ -1,21 +1,23 @@
 """
-inference.py — Diffusion Refinement Inference (Phase 7b).
+inference.py — V12: Diffusion Generation & Refinement Inference.
 
-Provides the high-level API for refining VAE-generated spectrograms:
+Provides the high-level API for generating spectrograms from noise
+and refining VAE-generated spectrograms:
 
-  1. Load the diffusion U-Net (cached)
-  2. refine_spectrogram(): VAE output → diffusion sharpen → sharp mel
-  3. generate_refined(): full pipeline: VAE → Diffusion → HiFi-GAN → audio
+  1. generate_from_noise(): pure noise → DDIM 200 steps → sharp mel
+  2. match_spectral_stats(): fix mel statistics before HiFi-GAN (V12)
+  3. refine_spectrogram(): VAE output → diffusion sharpen → sharp mel
+  4. generate_refined(): full pipeline: VAE → Diffusion → HiFi-GAN → audio
 
 Usage:
-    from src.diffusion.inference import refine_spectrogram, generate_refined
+    from src.diffusion.inference import generate_from_noise, match_spectral_stats
 
-    # Option A: Just refine a spectrogram
-    sharp_mel = refine_spectrogram(vae_mel, label_idx=0, strength=0.6)
+    # Option A: Generate from scratch
+    mel = generate_from_noise(label_idx=0, num_steps=200)
+    audio = mel_to_waveform(mel)  # then convert to audio
 
-    # Option B: Full pipeline (VAE generate + refine + convert to audio)
-    audio = generate_refined(vae_model, label="Dog", device='cpu',
-                             use_diffusion=True, strength=0.6)
+    # Option B: Refine a VAE spectrogram
+    sharp_mel = refine_spectrogram(vae_mel, label_idx=0, strength=0.4)
 """
 import os
 import sys
@@ -36,8 +38,8 @@ _unet: SpectrogramUNet = None
 _diffusion: DiffusionProcess = None
 _loaded_device: torch.device = None
 
-# Class name → index mapping (8 animal classes)
-CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen', 'Noise']
+# Class name → index mapping (7 animal classes — Noise removed in v12)
+CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen']
 CLASS_TO_IDX = {cls: idx for idx, cls in enumerate(CLASSES)}
 IDX_TO_CLASS = {idx: cls for idx, cls in enumerate(CLASSES)}
 
@@ -146,6 +148,41 @@ def generate_from_noise(
             )
 
     return generated.cpu()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  V12: Spectral Stats Matching (prevents crackle/electric sound)
+# ═══════════════════════════════════════════════════════════════
+
+def match_spectral_stats(mel: torch.Tensor) -> torch.Tensor:
+    """
+    Rescale generated mel spectrogram to match real data statistics.
+
+    Problem: Generated mels have wildly different statistics than real mels.
+      Real:     mean≈0.0, std≈0.5  (normalized)
+      Generated: mean≈-1.5, std≈1.4  (erratic, extreme outliers)
+
+    HiFi-GAN was trained on real data statistics. Feeding it wrong-stats
+    mels produces electric/crackle artifacts.
+
+    Args:
+        mel: generated mel spectrogram [B, C, F, T]
+    Returns:
+        rescaled mel with proper statistics, clipped to [-2, 2]
+    """
+    target_mean = getattr(cfg, 'target_mel_mean', 0.0)
+    target_std = getattr(cfg, 'target_mel_std', 0.5)
+    clip_range = getattr(cfg, 'mel_clip_range', 2.0)
+
+    # Per-sample normalization
+    mel_mean = mel.mean(dim=(1, 2, 3), keepdim=True)
+    mel_std = mel.std(dim=(1, 2, 3), keepdim=True)
+
+    # Rescale
+    mel = (mel - mel_mean) / (mel_std + 1e-8) * target_std + target_mean
+
+    # Clip extreme outliers
+    return torch.clamp(mel, -clip_range, clip_range)
 
 
 # ═══════════════════════════════════════════════════════════════

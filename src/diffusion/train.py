@@ -1,22 +1,23 @@
 """
-train.py — V9: Diffusion U-Net Training (x₀ + GAN + class-balanced)
+train.py — V12: Diffusion U-Net Training (x₀ + spectral balance + smoothness + classifier guidance)
 ===============================================
 
-Trains a U-Net diffusion model to denoise spectrograms. The U-Net learns
-to predict noise at various timesteps, enabling img2img refinement of
-VAE-generated spectrograms at inference time.
+Trains a U-Net diffusion model to predict clean spectrograms (x₀) from
+noisy inputs. Three new losses prevent the "electric" sound:
+  1. Spectral balance loss — forces realistic frequency distribution
+  2. Temporal smoothness loss — kills frame-to-frame jitter
+  3. Classifier guidance loss — ensures animal-like structure
 
-TRAINING APPROACH (Standard DDPM on real spectrograms):
+TRAINING APPROACH:
   1. Load real audio → compute mel spectrogram → x_0 (clean)
   2. Pick random timestep t → add noise → x_t
-  3. U-Net(x_t, t, class_label) → predicted noise
-  4. Loss = MSE(predicted_noise, actual_noise)
+  3. U-Net(x_t, t, class_label) → predicted x₀
+  4. Loss = L1(pred, real) + spectral_balance + temporal_smooth + classifier_guidance
 
-INFERENCE (img2img refinement):
-  1. VAE generates blurry spectrogram → x_vae
-  2. Add noise at t = strength * T → x_t
-  3. Denoise N steps → sharp spectrogram
-  4. HiFi-GAN converts → crisp audio
+INFERENCE (from-noise generation):
+  1. Pure noise → DDIM 200 steps → sharp mel spectrogram
+  2. Match spectral stats → proper HiFi-GAN input
+  3. HiFi-GAN converts → audio
 
 FRAMEWORK (matches src/hifigan/train.py):
   - CONFIG dict at top → mode/test/train settings
@@ -27,7 +28,7 @@ FRAMEWORK (matches src/hifigan/train.py):
 
 MODES:
   "test"  — 5 epochs, batch=4  → quick dev smoke test
-  "train" — 50 epochs, batch=8 → full training
+  "train" — 150 epochs, batch=16 → full training
 
 Run:
     python src/diffusion/train.py
@@ -79,9 +80,9 @@ CONFIG = {
 
     "train": {
         "num_epochs": 150,           # v10: 150 for ESC-50
-        "batch_size": 16,           # use more GPU (L4 has 24GB)
-        "num_workers": 2,
-        "gradient_accumulation_steps": 2,  # effective batch = 32
+        "batch_size": 8,            # v6: 15M UNet (was 4)
+        "num_workers": 4,
+        "gradient_accumulation_steps": 4,  # effective batch = 32
     },
 }
 
@@ -159,7 +160,7 @@ def _load_audio(path: str):
 #  CLASS MAPPING
 # ═══════════════════════════════════════════════════════════════
 
-CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen', 'Noise']
+CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen']
 CLASS_TO_IDX = {cls: idx for idx, cls in enumerate(CLASSES)}
 
 
@@ -291,13 +292,11 @@ class DiffusionDataset(Dataset):
 class BalancedDiffusionDataset(Dataset):
     """
     Class-balanced dataset: rare classes get equal exposure.
-    
+    V12: 7 animal classes only (Noise removed).
+
     Each epoch: every class appears `max_per_class` times.
-    - Dog (750) appears naturally
-    - Frog (61) repeated 12× with different augmentation each pass
-    - Noise capped at 200 (Option B)
-    
-    Effective: ~1,400 samples per epoch (200 × 7 classes).
+    - Dog (40 ESC-50) → repeated with augmentation
+    - Frog (40 ESC-50) → same exposure as Dog
     """
     def __init__(self, data_dir: str, segment_frames: int, split: str = "train"):
         self.data_dir = data_dir
@@ -330,10 +329,6 @@ class BalancedDiffusionDataset(Dataset):
                 self.class_samples[c] = class_files[:split_idx]
             else:
                 self.class_samples[c] = class_files[split_idx:]
-            
-            # V9 Option B: cap Noise class
-            if c == CLASS_TO_IDX.get('Noise', 7) and cfg.noise_max_samples > 0:
-                self.class_samples[c] = self.class_samples[c][:cfg.noise_max_samples]
 
         # Max samples in any class → target length per epoch
         self.max_per_class = max(len(v) for v in self.class_samples.values())
@@ -385,58 +380,6 @@ class BalancedDiffusionDataset(Dataset):
         s_idx = (idx // self.num_classes) % len(samples)
         path, label = samples[s_idx]
         return self._load_mel(path, label)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PRE-COMPUTED DATASET (fast Colab training)
-# ═══════════════════════════════════════════════════════════════
-
-class PrecomputedBalancedDataset(Dataset):
-    """
-    Like BalancedDiffusionDataset but preloads all mels into RAM.
-    Cuts data loading from 200ms/batch → 1ms/batch. 47s/epoch → 8s/epoch.
-    """
-    def __init__(self, data_dir: str, segment_frames: int, split: str = "train"):
-        # Build class-balanced index
-        base_ds = BalancedDiffusionDataset(data_dir, segment_frames, split)
-        self.num_classes = base_ds.num_classes
-        self.max_per_class = base_ds.max_per_class
-        self.class_samples = base_ds.class_samples
-        self.segment_frames = segment_frames
-        
-        # Precompute all mels
-        print("   ⚡ Precomputing mel dataset...", end=" ", flush=True)
-        self.mels = {}  # (path, label) → mel tensor
-        total = sum(len(v) for v in self.class_samples.values())
-        for samples in self.class_samples.values():
-            for path, label in samples:
-                if (path, label) not in self.mels:
-                    self.mels[(path, label)] = base_ds._load_mel(path, label)[0]  # just mel
-        print(f"{len(self.mels)} mels cached ({len(self.mels) * 64 * 552 * 4 / 1024 / 1024:.0f} MB)")
-
-    def __len__(self):
-        return self.max_per_class * self.num_classes
-
-    def __getitem__(self, idx):
-        cls = idx % self.num_classes
-        samples = self.class_samples[cls]
-        s_idx = (idx // self.num_classes) % len(samples)
-        path, label = samples[s_idx]
-        
-        mel = self.mels[(path, label)].clone()  # [1, 64, T]
-        
-        # Apply strong augmentation (different each oversample pass)
-        if getattr(cfg, 'augment', False):
-            mel = strong_augment_mel(mel)
-        
-        # Trim/pad
-        T = mel.shape[-1]
-        if T > self.segment_frames:
-            mel = mel[..., :self.segment_frames]
-        elif T < self.segment_frames:
-            mel = F.pad(mel, (0, self.segment_frames - T))
-        
-        return mel, torch.tensor(label, dtype=torch.long)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -570,6 +513,126 @@ def freq_weighted_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 
 
 # ═══════════════════════════════════════════════════════════════
+#  V12: SPECTRAL BALANCE LOSS (kills the hum)
+# ═══════════════════════════════════════════════════════════════
+
+def spectral_balance_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Penalize unrealistic frequency distribution.
+    Split mel into bands, compare energy ratios, punish deviation.
+    Real animal sounds have broadband energy; generated ones cram
+    everything into low bins → hum → electric buzz.
+
+    Args:
+        pred:   predicted x₀ [B, 1, F, T]
+        target: real mel     [B, 1, F, T]
+    Returns:
+        scalar loss
+    """
+    n_mels = pred.shape[-2]
+    # 4 bands: low, mid-low, mid-high, high
+    boundaries = [n_mels // 4, n_mels // 2, 3 * n_mels // 4]
+
+    pred_energies = []
+    real_energies = []
+    start = 0
+    for b in boundaries + [n_mels]:
+        pred_energies.append(pred[..., start:b, :].abs().mean(dim=(2, 3)))  # [B]
+        real_energies.append(target[..., start:b, :].abs().mean(dim=(2, 3)))
+        start = b
+
+    pred_ratios = torch.stack(pred_energies, dim=1)  # [B, 4]
+    real_ratios = torch.stack(real_energies, dim=1)  # [B, 4]
+
+    # Normalize to ratios (invariant to overall volume)
+    pred_ratios = pred_ratios / (pred_ratios.sum(dim=1, keepdim=True) + 1e-8)
+    real_ratios = real_ratios / (real_ratios.sum(dim=1, keepdim=True) + 1e-8)
+
+    weight = getattr(cfg, 'spectral_balance_weight', 10.0)
+    return F.mse_loss(pred_ratios, real_ratios) * weight
+
+
+# ═══════════════════════════════════════════════════════════════
+#  V12: TEMPORAL SMOOTHNESS LOSS (kills the buzz)
+# ═══════════════════════════════════════════════════════════════
+
+def temporal_smoothness_loss(pred: torch.Tensor) -> torch.Tensor:
+    """
+    Penalize erratic frame-to-frame energy changes.
+    Real animal sounds have smooth temporal envelopes (attack→sustain→decay).
+    Erratic jumps → buzzing / electric sound.
+
+    Args:
+        pred: predicted x₀ [B, 1, F, T]
+    Returns:
+        scalar loss
+    """
+    # Frame energy: [B, T]
+    frame_energy = pred.abs().mean(dim=2).squeeze(1)
+
+    # First difference (frame-to-frame change): [B, T-1]
+    diff = frame_energy[..., 1:] - frame_energy[..., :-1]
+
+    weight = getattr(cfg, 'temporal_smooth_weight', 5.0)
+    return (diff ** 2).mean() * weight
+
+
+# ═══════════════════════════════════════════════════════════════
+#  V12: CLASSIFIER GUIDANCE LOSS (ensures animal-like structure)
+# ═══════════════════════════════════════════════════════════════
+
+def load_classifier_for_guidance(device: torch.device):
+    """
+    Load frozen ImprovedAudioCNN for perceptual loss.
+    The classifier was trained on 8 classes (including Noise).
+    We use only the first 7 logits (animal classes).
+    """
+    ckpt_path = getattr(cfg, 'classifier_ckpt', 'models/best_audio_cnn_train.pth')
+    if not os.path.exists(ckpt_path):
+        print(f"   ⚠️  Classifier checkpoint not found at {ckpt_path} — guidance disabled")
+        return None
+
+    # Import from project root
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from model import ImprovedAudioCNN
+
+    # Load checkpoint to discover num_classes
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    num_classes = ckpt.get('num_classes', 8)
+
+    model = ImprovedAudioCNN(num_classes=num_classes, dropout=0.3)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    print(f"   🎯 Classifier loaded from {ckpt_path} ({num_classes} classes, frozen)")
+    return model
+
+
+def classifier_guidance_loss(
+    pred: torch.Tensor, labels: torch.Tensor, classifier: nn.Module
+) -> torch.Tensor:
+    """
+    Force predicted x₀ to be classified as the correct animal class.
+    Uses the first 7 logits from an 8-class classifier (ignores Noise).
+
+    Args:
+        pred:       predicted x₀ [B, 1, F, T]
+        labels:     target class indices [B] (0-6)
+        classifier: frozen ImprovedAudioCNN (8-class)
+    Returns:
+        scalar loss
+    """
+    logits = classifier(pred)  # [B, 8]
+    # Use only first 7 logits (animal classes, ignore Noise class)
+    logits = logits[:, :7]  # [B, 7]
+    weight = getattr(cfg, 'classifier_guidance_weight', 0.3)
+    return F.cross_entropy(logits, labels) * weight
+
+
+# ═══════════════════════════════════════════════════════════════
 #  V8 FIX C: PATCHGAN DISCRIMINATOR
 # ═══════════════════════════════════════════════════════════════
 
@@ -638,11 +701,16 @@ def get_loss_fn():
     return F.mse_loss
 
 
-def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discriminator=None, disc_optimizer=None):
-    """Train one epoch. Returns average loss. Optional GAN discriminator training."""
+def train_epoch(
+    model, diffusion, train_loader, optimizer, ema_model=None,
+    discriminator=None, disc_optimizer=None, classifier=None,
+):
+    """Train one epoch. Returns average loss + component breakdown.
+    V12: adds spectral_balance, temporal_smooth, classifier_guidance losses."""
     loss_fn = get_loss_fn()
     uncond_prob = getattr(cfg, 'uncond_prob', 0.0)
     use_gan = discriminator is not None and disc_optimizer is not None
+    use_cls = classifier is not None
     gan_weight = getattr(cfg, 'gan_weight', 0.1)
     model.train()
     if discriminator is not None:
@@ -650,6 +718,9 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discr
     total_loss = 0.0
     total_l1 = 0.0
     total_gan = 0.0
+    total_balance = 0.0
+    total_smooth = 0.0
+    total_cls = 0.0
     pbar = tqdm(train_loader, desc="  Train", leave=False)
     optimizer.zero_grad()
     if disc_optimizer is not None:
@@ -676,10 +747,29 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discr
         noise = torch.randn_like(mel)
         x_t = diffusion.q_sample(mel, t, noise)
 
-        # V7: x₀-prediction (model predicts clean mel, not noise)
+        # V7/V12: x₀-prediction (model predicts clean mel, not noise)
         if getattr(cfg, 'predict_x0', False):
             pred = model(x_t, t, labels)
             l1_loss = freq_weighted_loss(pred, mel)
+
+            # V12: Spectral balance loss
+            balance_loss = spectral_balance_loss(pred, mel)
+            total_balance += balance_loss.item()
+
+            # V12: Temporal smoothness loss
+            smooth_loss = temporal_smoothness_loss(pred)
+            total_smooth += smooth_loss.item()
+
+            # V12: Classifier guidance loss (skip if unconditional)
+            cls_loss = torch.tensor(0.0, device=device)
+            if use_cls:
+                # Skip classifier guidance for unconditional samples
+                cond_mask = labels < cfg.num_classes
+                if cond_mask.any():
+                    cls_loss = classifier_guidance_loss(
+                        pred[cond_mask], labels[cond_mask], classifier
+                    )
+                total_cls += cls_loss.item()
 
             # V8 Fix C: GAN loss
             if use_gan:
@@ -693,10 +783,12 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discr
 
                 # Generator GAN loss: fake → 1 (fool discriminator)
                 g_gan = gan_weight * gan_loss_gen(discriminator(pred))
-                loss = (l1_loss + g_gan) / GRADIENT_ACCUMULATION_STEPS
+                total_loss_batch = l1_loss + balance_loss + smooth_loss + cls_loss + g_gan
+                loss = total_loss_batch / GRADIENT_ACCUMULATION_STEPS
                 total_gan += g_gan.item()
             else:
-                loss = l1_loss / GRADIENT_ACCUMULATION_STEPS
+                total_loss_batch = l1_loss + balance_loss + smooth_loss + cls_loss
+                loss = total_loss_batch / GRADIENT_ACCUMULATION_STEPS
 
             total_l1 += l1_loss.item()
         else:
@@ -734,10 +826,17 @@ def train_epoch(model, diffusion, train_loader, optimizer, ema_model=None, discr
                 for ema_p, model_p in zip(ema_model.parameters(), model.parameters()):
                     ema_p.data.mul_(EMA_DECAY).add_(model_p.data, alpha=1 - EMA_DECAY)
 
-    avg_loss = total_loss / len(train_loader)
+    n_batches = len(train_loader)
+    components = {
+        "l1": total_l1 / n_batches,
+        "balance": total_balance / n_batches,
+        "smooth": total_smooth / n_batches,
+        "cls": total_cls / n_batches,
+        "gan": total_gan / n_batches if use_gan else 0.0,
+    }
     if use_gan:
-        return avg_loss, total_l1 / len(train_loader), total_gan / len(train_loader)
-    return avg_loss
+        return total_loss / n_batches, components
+    return total_loss / n_batches, components
 
 
 def validate(model, diffusion, val_loader, ema_model=None):
@@ -816,12 +915,11 @@ def training_loop():
             print(f"⚠️  VAE checkpoint not found at {vae_ckpt_path} — disabling VAE mix-in")
             vae_mix_ratio = 0.0
 
-    # V9: class-balanced or standard dataset
+    # V12: V9 class-balanced or standard dataset
     if getattr(cfg, 'balance_classes', False):
-        balanced = getattr(cfg, 'noise_max_samples', 0) > 0
-        print(f"   ⚖️  Class-balanced sampling: {'Noise capped at '+str(cfg.noise_max_samples) if balanced else 'all classes equal'}")
-        train_ds = PrecomputedBalancedDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="train")
-        val_ds = PrecomputedBalancedDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="val")
+        print(f"   ⚖️  Class-balanced sampling (7 animal classes, Noise removed)")
+        train_ds = BalancedDiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="train")
+        val_ds = BalancedDiffusionDataset(CONFIG["data_dir"], SEGMENT_FRAMES, split="val")
         
         # Show class distribution
         class_counts = {c: len(train_ds.class_samples[c]) for c in range(cfg.num_classes)}
@@ -886,6 +984,13 @@ def training_loop():
         p.requires_grad_(False)
 
     # ═════════════════════════════════════════════════════════
+    #  V12: CLASSIFIER GUIDANCE (frozen perceptual loss)
+    # ═════════════════════════════════════════════════════════
+    classifier = None
+    if getattr(cfg, 'classifier_guidance_weight', 0) > 0:
+        classifier = load_classifier_for_guidance(device)
+
+    # ═════════════════════════════════════════════════════════
     #  V8 FIX C: DISCRIMINATOR (PatchGAN)
     # ═════════════════════════════════════════════════════════
     discriminator = None
@@ -907,8 +1012,8 @@ def training_loop():
     #  TRAIN
     # ═════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"🚀 DIFFUSION TRAINING v11 — {MODE.upper()} MODE")
-    print(f"   Prediction: x₀ + GAN + class-balanced + ESC-50 + filtered old data + 150 epochs")
+    print(f"🚀 DIFFUSION TRAINING v12 — {MODE.upper()} MODE")
+    print(f"   Prediction: x₀ + spectral balance + temporal smooth + classifier guidance")
     print(f"   Device: {device} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
     print(f"   Saving last model → {BEST_MODEL_PATH}")
     print(f"{'='*60}\n")
@@ -921,8 +1026,10 @@ def training_loop():
         for epoch in range(start_epoch, NUM_EPOCHS):
             t0 = time.time()
 
-            result = train_epoch(model, diffusion, train_loader, optimizer, ema_model,
-                                discriminator, disc_optimizer)
+            result, comps = train_epoch(
+                model, diffusion, train_loader, optimizer, ema_model,
+                discriminator, disc_optimizer, classifier,
+            )
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
@@ -931,17 +1038,13 @@ def training_loop():
             dt = time.time() - t0
             trend = "📉" if val_loss < best_val else "➡️"
 
-            # Unpack loss components
-            if isinstance(result, tuple):
-                avg_loss, l1_loss, gan_loss = result
-                print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
-                      f"({dt:.0f}s) ── "
-                      f"loss={avg_loss:.4f} (L1={l1_loss:.3f}, G={gan_loss:.4f}) val={val_loss:.4f} {trend} lr={lr:.2e}")
-            else:
-                avg_loss = result
-                print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
-                      f"({dt:.0f}s) ── "
-                      f"loss={avg_loss:.4f} val={val_loss:.4f} {trend} lr={lr:.2e}")
+            avg_loss = result
+            print(f"── Epoch {epoch+1:3d}/{NUM_EPOCHS} "
+                  f"({dt:.0f}s) ── "
+                  f"loss={avg_loss:.4f} "
+                  f"(L1={comps['l1']:.3f}, Bal={comps['balance']:.4f}, "
+                  f"S={comps['smooth']:.4f}, C={comps['cls']:.4f}) "
+                  f"val={val_loss:.4f} {trend} lr={lr:.2e}")
 
             # Save best (using EMA weights)
             if val_loss < best_val:
