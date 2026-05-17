@@ -94,7 +94,10 @@ def load_models(device):
     diffusion = DiffusionProcess(cfg).to(device)
     diffusion.num_classes = cfg.num_classes
 
-    return encoder, expander, decoder, unet, diffusion, bottleneck_ch
+    latent_mean = diff_ckpt.get('latent_mean', 0.0)
+    latent_std = diff_ckpt.get('latent_std', 1.0)
+
+    return encoder, expander, decoder, unet, diffusion, bottleneck_ch, latent_mean, latent_std
 
 
 @torch.no_grad()
@@ -104,13 +107,16 @@ def generate_one(label: str, num_steps=100, cfg_scale=2.0, device=None):
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
 
-    encoder, expander, decoder, unet, diffusion, _ = load_models(device)
+    encoder, expander, decoder, unet, diffusion, _, latent_mean, latent_std = load_models(device)
     label_idx = CLASSES.index(label)
 
-    # DDIM sample: noise → latent
+    # DDIM x₀-prediction: noise → clean normalized latent
     noise = torch.randn(1, cfg.latent_channels, cfg.latent_height, cfg.latent_width, device=device)
     labels = torch.tensor([label_idx], device=device, dtype=torch.long)
-    latent = diffusion.ddim_sample(unet, noise, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale)
+    latent = diffusion.ddim_sample_x0(unet, noise, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale)
+
+    # Denormalize latent
+    latent = latent * latent_std + latent_mean
 
     # Decode: latent → mel
     features = expander(latent)

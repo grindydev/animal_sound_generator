@@ -1,6 +1,9 @@
 """
 train_diff.py — Phase 2: Train Tiny Diffusion UNet on Compressed Latents.
 
+V15 FIX: Normalize latents (mean=0, std=1) so x₀-prediction works.
+Previous: noise prediction → model predicted zero (loss barely below 0.80).
+
 Encodes all real mels → spatial latents [B, 16, 4, 35] → train UNet to denoise.
 
 Usage:
@@ -75,7 +78,6 @@ def load_encoder_and_reducer():
 
     bottleneck_ch = encoder.c4
 
-    # Load trained reducer if available, else create new
     reducer_path = os.path.join(cfg.model_dir, "latent_decoder_best.pth")
     reducer = ChannelReducer(in_ch=bottleneck_ch, out_ch=cfg.latent_channels).to(DEVICE)
 
@@ -100,7 +102,7 @@ def load_encoder_and_reducer():
 def train():
     print(f"\n🔧 Latent Diffusion Training — Phase 2")
     print(f"   Device: {DEVICE} | Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} (eff: {BATCH_SIZE*GRAD_ACCUM})")
-    print(f"   LR: {LR} | AMP: {use_amp} | Loss: {cfg.loss_type}")
+    print(f"   LR: {LR} | AMP: {use_amp} | x₀-prediction (normalized)")
 
     encoder, reducer, bottleneck_ch = load_encoder_and_reducer()
 
@@ -110,7 +112,7 @@ def train():
     diffusion = DiffusionProcess.__new__(DiffusionProcess)
     DiffusionProcess.__init__(diffusion, cfg)
     diffusion.to(DEVICE)
-    diffusion.num_classes = cfg.num_classes  # needed for CFG
+    diffusion.num_classes = cfg.num_classes
     print(f"   UNet params: {n_params:,} ({n_params/1e6:.1f}M)")
 
     # EMA model
@@ -119,11 +121,9 @@ def train():
     for p in ema_model.parameters():
         p.requires_grad_(False)
 
-    # Optimizer + scheduler
+    # Optimizer (no warm restarts — simple cosine)
     optimizer = torch.optim.AdamW(unet.parameters(), lr=LR, weight_decay=cfg.adam_weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=NUM_EPOCHS // 4, T_mult=2, eta_min=1e-6
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     # Data
     train_ds = DiffusionDataset(cfg.data_dir, SEGMENT_FRAMES, split="train")
@@ -135,11 +135,26 @@ def train():
                              pin_memory=pin_mem)
     print(f"   Data: {len(train_ds)} train / {len(val_ds)} val")
 
-    # Loss function
+    # Encode training data to compute normalization stats
+    print("   Computing latent stats...")
+    all_latents = []
+    with torch.no_grad():
+        for mel_batch, _ in tqdm(train_loader, desc="   Encoding", leave=False):
+            features = encoder.encode_spatial(mel_batch.to(DEVICE))
+            latent = reducer(features)
+            all_latents.append(latent.cpu())
+    all_latents = torch.cat(all_latents)
+    latent_mean = all_latents.mean()
+    latent_std = all_latents.std()
+    print(f"   Latent stats: mean={latent_mean:.4f}, std={latent_std:.4f}")
+    # Free memory
+    del all_latents
+
+    # Loss: L1 on x₀ prediction
     loss_fn = F.l1_loss if cfg.loss_type == 'l1' else F.mse_loss
 
     best_val = float('inf')
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     for epoch in range(NUM_EPOCHS):
         t0 = time.time()
@@ -156,10 +171,11 @@ def train():
             labels = labels.to(DEVICE)
             B = mel_batch.shape[0]
 
-            # Encode to latent
+            # Encode to latent + normalize
             with torch.no_grad():
                 features = encoder.encode_spatial(mel_batch)
-                latent = reducer(features)  # [B, 16, 4, 35]
+                latent = reducer(features)
+                latent = (latent - latent_mean) / (latent_std + 1e-8)
 
             # Unconditional training (CFG)
             if cfg.uncond_prob > 0 and np.random.random() < cfg.uncond_prob:
@@ -170,14 +186,14 @@ def train():
             noise = torch.randn_like(latent)
             x_t = diffusion.q_sample(latent, t, noise)
 
-            # Predict noise
+            # Predict CLEAN latent (x₀-prediction)
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     pred = unet(x_t, t, labels)
-                    loss = loss_fn(pred, noise) / GRAD_ACCUM
+                    loss = loss_fn(pred, latent) / GRAD_ACCUM
             else:
                 pred = unet(x_t, t, labels)
-                loss = loss_fn(pred, noise) / GRAD_ACCUM
+                loss = loss_fn(pred, latent) / GRAD_ACCUM
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -199,7 +215,7 @@ def train():
                 optimizer.zero_grad()
                 accum_count = 0
 
-                # EMA update
+                # EMA
                 with torch.no_grad():
                     for ema_p, p in zip(ema_model.parameters(), unet.parameters()):
                         ema_p.data.mul_(EMA_DECAY).add_(p.data, alpha=1 - EMA_DECAY)
@@ -231,13 +247,14 @@ def train():
 
                 features = encoder.encode_spatial(mel_batch)
                 latent = reducer(features)
+                latent = (latent - latent_mean) / (latent_std + 1e-8)
 
                 t = torch.randint(0, cfg.timesteps, (B,), device=DEVICE)
                 noise = torch.randn_like(latent)
                 x_t = diffusion.q_sample(latent, t, noise)
 
                 pred = ema_model(x_t, t, labels)
-                val_loss += loss_fn(pred, noise).item()
+                val_loss += loss_fn(pred, latent).item()
 
         val_loss /= max(len(val_loader), 1)
 
@@ -248,6 +265,8 @@ def train():
                 'unet': ema_model.state_dict(),
                 'val_loss': val_loss,
                 'epoch': epoch,
+                'latent_mean': latent_mean,
+                'latent_std': latent_std,
             }, os.path.join(cfg.model_dir, "latent_diffusion_best.pth"))
             print(f"   💾 Best model saved (val={val_loss:.4f})")
 

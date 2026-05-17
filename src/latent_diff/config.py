@@ -49,7 +49,8 @@ class LatentDiffConfig:
     beta_start: float = 0.0001
     beta_end: float = 0.02
     use_linear_schedule: bool = True
-    loss_type: str = "l1"                           # L1 more robust than L2
+    loss_type: str = "l1"                           # L1 loss
+    normalize_latent: bool = True                  # normalize latents to mean=0,std=1 for x0-prediction
     inference_steps: int = 100
     cfg_scale: float = 2.0
 
