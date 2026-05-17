@@ -34,8 +34,8 @@ class LatentDiffConfig:
     segment_frames: int = 552
 
     # ── Diffusion UNet (tiny) ────────────────────────────
-    unet_base_channels: int = 64
-    unet_channel_multipliers: tuple = (1, 2, 2)        # 3 levels
+    unet_base_channels: int = 32
+    unet_channel_multipliers: tuple = (1, 1, 1)        # 3 levels: 32→32→32
     unet_res_blocks: int = 1
     unet_attention_levels: tuple = (2,)                # bottleneck only
     time_emb_dim: int = 256
@@ -49,8 +49,7 @@ class LatentDiffConfig:
     beta_start: float = 0.0001
     beta_end: float = 0.02
     use_linear_schedule: bool = True
-    loss_type: str = "l2"
-    predict_x0: bool = True                    # x₀-prediction (easier than noise)
+    loss_type: str = "l1"                           # L1 more robust than L2
     inference_steps: int = 100
     cfg_scale: float = 2.0
 

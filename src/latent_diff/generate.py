@@ -107,10 +107,10 @@ def generate_one(label: str, num_steps=100, cfg_scale=2.0, device=None):
     encoder, expander, decoder, unet, diffusion, _ = load_models(device)
     label_idx = CLASSES.index(label)
 
-    # DDIM x₀-prediction: noise → clean latent
+    # DDIM sample: noise → latent
     noise = torch.randn(1, cfg.latent_channels, cfg.latent_height, cfg.latent_width, device=device)
     labels = torch.tensor([label_idx], device=device, dtype=torch.long)
-    latent = diffusion.ddim_sample_x0(unet, noise, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale)
+    latent = diffusion.ddim_sample(unet, noise, labels, num_steps=num_steps, eta=0.0, cfg_scale=cfg_scale)
 
     # Decode: latent → mel
     features = expander(latent)
