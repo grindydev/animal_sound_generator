@@ -34,8 +34,8 @@ class LatentDiffConfig:
     segment_frames: int = 552
 
     # ── Diffusion UNet (tiny) ────────────────────────────
-    unet_base_channels: int = 32
-    unet_channel_multipliers: tuple = (1, 1, 1)        # 3 levels: 32→32→32
+    unet_base_channels: int = 64                    # more capacity for larger dataset
+    unet_channel_multipliers: tuple = (1, 2, 2)     # 3 levels
     unet_res_blocks: int = 1
     unet_attention_levels: tuple = (2,)                # bottleneck only
     time_emb_dim: int = 256
@@ -61,7 +61,7 @@ class LatentDiffConfig:
     ema_decay: float = 0.9999
 
     # ── Paths ────────────────────────────────────────────
-    data_dir: str = "data/esc50"
+    data_dir: str = "data/animal1000"              # larger dataset (1000+/class)
     model_dir: str = "models"
     decoder_ckpt: str = "models/latent_decoder_best.pth"
     diffusion_ckpt: str = "models/latent_diffusion_best.pth"
