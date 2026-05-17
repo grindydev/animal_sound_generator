@@ -36,10 +36,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else
 use_amp = (DEVICE.type == "cuda")
 
 MODE = "train"
-NUM_EPOCHS = 30
+NUM_EPOCHS = 50
 BATCH_SIZE = 16
 NUM_WORKERS = 4 if DEVICE.type == "cuda" else 0
-LR = 1e-3
+LR = 5e-4  # lower LR for longer training
 SEGMENT_FRAMES = cfg.segment_frames
 
 os.makedirs(cfg.model_dir, exist_ok=True)
