@@ -50,6 +50,7 @@ class LatentDiffConfig:
     beta_end: float = 0.02
     use_linear_schedule: bool = True
     loss_type: str = "l2"
+    predict_x0: bool = True                    # x₀-prediction (easier than noise)
     inference_steps: int = 100
     cfg_scale: float = 2.0
 

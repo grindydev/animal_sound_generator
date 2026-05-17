@@ -170,14 +170,14 @@ def train():
             noise = torch.randn_like(latent)
             x_t = diffusion.q_sample(latent, t, noise)
 
-            # Predict noise
+            # Predict clean latent (x₀-prediction, easier to learn than noise)
             if use_amp:
                 with torch.cuda.amp.autocast():
                     pred = unet(x_t, t, labels)
-                    loss = loss_fn(pred, noise) / GRAD_ACCUM
+                    loss = loss_fn(pred, latent) / GRAD_ACCUM
             else:
                 pred = unet(x_t, t, labels)
-                loss = loss_fn(pred, noise) / GRAD_ACCUM
+                loss = loss_fn(pred, latent) / GRAD_ACCUM
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -237,7 +237,7 @@ def train():
                 x_t = diffusion.q_sample(latent, t, noise)
 
                 pred = ema_model(x_t, t, labels)
-                val_loss += loss_fn(pred, noise).item()
+                val_loss += loss_fn(pred, latent).item()
 
         val_loss /= max(len(val_loader), 1)
 
