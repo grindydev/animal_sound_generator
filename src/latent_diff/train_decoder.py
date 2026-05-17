@@ -148,12 +148,12 @@ def train():
                     latent = reducer(features)
                     expanded = expander(latent)
                     output = decoder(expanded, target_size=(64, SEGMENT_FRAMES))
-                    loss = F.mse_loss(output, mel)
+                    loss = F.l1_loss(output, mel)
             else:
                 latent = reducer(features)
                 expanded = expander(latent)
                 output = decoder(expanded, target_size=(64, SEGMENT_FRAMES))
-                loss = F.mse_loss(output, mel)
+                loss = F.l1_loss(output, mel)
 
             optimizer.zero_grad()
             if use_amp:
@@ -182,7 +182,7 @@ def train():
                 latent = reducer(features)
                 expanded = expander(latent)
                 output = decoder(expanded, target_size=(64, SEGMENT_FRAMES))
-                val_loss += F.mse_loss(output, mel).item()
+                val_loss += F.l1_loss(output, mel).item()
 
         val_loss /= max(len(val_loader), 1)
         scheduler.step()

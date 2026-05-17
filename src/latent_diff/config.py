@@ -34,10 +34,11 @@ class LatentDiffConfig:
     segment_frames: int = 552
 
     # ── Diffusion UNet (tiny) ────────────────────────────
-    unet_base_channels: int = 64                    # more capacity for larger dataset
-    unet_channel_multipliers: tuple = (1, 2, 2)     # 3 levels
+    unet_base_channels: int = 16                    # tiny UNet for small dataset
+    unet_channel_multipliers: tuple = (1, 1)        # 2 levels: 16→16
     unet_res_blocks: int = 1
-    unet_attention_levels: tuple = (2,)                # bottleneck only
+    unet_attention_levels: tuple = (1,)             # attention at deepest level (index 1)
+    time_emb_dim: int = 128                        # smaller time embedding
     time_emb_dim: int = 256
     class_emb_dim: int = 128
     num_classes: int = 7
