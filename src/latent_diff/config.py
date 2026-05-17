@@ -40,7 +40,7 @@ class LatentDiffConfig:
     unet_attention_levels: tuple = (2,)                # bottleneck only
     time_emb_dim: int = 256
     class_emb_dim: int = 128
-    num_classes: int = 8
+    num_classes: int = 7
     dropout: float = 0.1
     uncond_prob: float = 0.1                           # 10% unconditional for CFG
 
@@ -60,7 +60,7 @@ class LatentDiffConfig:
     ema_decay: float = 0.9999
 
     # ── Paths ────────────────────────────────────────────
-    data_dir: str = "data/animal_audio"
+    data_dir: str = "data/esc50"
     model_dir: str = "models"
     decoder_ckpt: str = "models/latent_decoder_best.pth"
     diffusion_ckpt: str = "models/latent_diffusion_best.pth"

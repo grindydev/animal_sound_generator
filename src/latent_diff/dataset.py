@@ -65,7 +65,7 @@ def compute_mel(audio: torch.Tensor) -> torch.Tensor:
     return mel
 
 
-CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen', 'Noise']
+CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen']
 
 
 class LatentDataset(Dataset):
