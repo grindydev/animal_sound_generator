@@ -1,201 +1,176 @@
 """
-generate.py — Full Pipeline: VAE → Diffusion → HiFi-GAN → Audio
-=================================================================
+generate.py — V14: Animal Sound Generation
 
-Generate animal sounds using all three trained models.
+Two modes:
+  1. v14_latent: VAE + Latent Diffusion (true generation from noise) — INDUSTRY STANDARD
+  2. retrieval:   Real mel → perturb → Griffin-Lim (quick workaround)
 
 Usage:
-    python src/generate.py                          # generate all 8 animals
-    python src/generate.py --label Dog              # generate one specific animal
-    python src/generate.py --label Cat --count 5    # generate 5 cat sounds
-    python src/generate.py --label Dog --no-diff    # skip diffusion (VAE only)
-    python src/generate.py --label Dog --strength 0.8  # stronger refinement
+    # After Colab training:
+    python src/generate.py --label Dog --v14-latent
+
+    # Quick retrieval (no training needed):
+    python src/generate.py --label Dog --retrieval
 """
-import os
-import sys
-import argparse
-import torch
+import os, sys, argparse, torch, torchaudio, random
 import soundfile as sf
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
 
-from vae import ImprovedVAE
-from diffusion.inference import refine_spectrogram, generate_from_noise
-from diffusion.config import config as cfg
-from hifigan.inference import mel_to_waveform
-
-
-CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen', 'Noise']
+CLASSES = ['Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen']
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
-
-def load_vae(device):
-    """Load the finetuned VAE model. Auto-detects base_channels."""
-    ckpt_path = "models/best_vae_finetune_train.pth"
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    state = ckpt["model_state_dict"]
-    base_ch = state["enc1.main.0.weight"].shape[0]
-    embed_dim = state["class_embed.weight"].shape[1]  # auto-detect
-    model = ImprovedVAE(latent_dim=2048, num_classes=8, embed_dim=embed_dim, base_channels=base_ch).to(device)
-    model.load_state_dict(state, strict=False)
-    model.eval()
-    print(f"✅ VAE loaded (base_ch={base_ch}, embed_dim={embed_dim})")
-    return model
+_mel_index_cache = {}
 
 
-def generate_one(
-    vae, label, device,
-    temperature=0.7,
-    use_diffusion=True,
-    strength=0.6,
-    diffusion_steps=50,
-    use_griffin_lim=False,
-    griffin_lim_iters=5,
-    from_scratch=False,
-    use_ddpm=False,
-    cfg_scale=2.0,
-):
-    """Generate one animal sound through the full pipeline."""
+# ═══════════════════════════════════════════════════════════════
+#  MODE 1: V14 LATENT DIFFUSION (industry standard)
+# ═══════════════════════════════════════════════════════════════
+
+def generate_v14_latent(label, device, num_samples=1, cfg_scale=2.0, num_steps=50):
+    """True generation: noise → latent diffusion → VAE decode → Griffin-Lim → audio."""
+    from src.v14_vae import V14VAE
+    from src.v14_ldm import LatentDiffusionModel, LatentDiffusion
+    from torchaudio.transforms import InverseMelScale, GriffinLim
+
+    # Load models
+    vae = V14VAE(latent_dim=256, num_classes=7, class_emb_dim=32).to(device)
+    vae.load_state_dict(torch.load('models/v14_vae.pth', map_location=device, weights_only=True))
+    vae.eval()
+
+    ldm = LatentDiffusionModel(
+        latent_dim=256, class_emb_dim=32, time_emb_dim=64,
+        hidden_dim=512, num_blocks=4, num_classes=7,
+    ).to(device)
+    ldm.load_state_dict(torch.load('models/v14_ldm.pth', map_location=device, weights_only=True))
+    ldm.eval()
+
+    diffusion = LatentDiffusion(timesteps=1000).to(device)
+
+    inv_mel = InverseMelScale(n_stft=513, n_mels=64, sample_rate=22050, f_min=0, f_max=11025)
+    gl = GriffinLim(n_fft=1024, hop_length=200, win_length=1024, n_iter=64, power=1)
+
     label_idx = CLASS_TO_IDX[label]
+    labels = torch.full((num_samples,), label_idx, device=device, dtype=torch.long)
 
-    if from_scratch:
-        # Path B: pure diffusion generation from noise (no VAE)
-        vae_mel = generate_from_noise(
-            label_idx=label_idx, num_samples=1,
-            num_steps=diffusion_steps, device=device,
-            use_ddpm=use_ddpm,
-            cfg_scale=cfg_scale,
+    with torch.no_grad():
+        z_0 = diffusion.ddim_sample(
+            ldm, (num_samples, 256), labels,
+            num_steps=num_steps, cfg_scale=cfg_scale, device=device,
         )
+        mel = vae.decode(z_0, labels)
+        mel_db = mel * 19.8031 - 18.4903
+        mel_power = 10 ** (mel_db.clamp(-80, 0) / 10.0)
+        # InverseMelScale + Griffin-Lim on CPU (MPS doesn't support linalg.lstsq)
+        mel_cpu = mel_power.squeeze(1).cpu()
+        lin_spec = inv_mel(mel_cpu)
+        audio = gl(torch.sqrt(lin_spec.clamp(min=0)))
+
+    # Normalize
+    peak = audio.abs().max()
+    if peak > 0:
+        audio = audio / peak * 0.95
+    return audio
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MODE 2: RETRIEVAL (quick workaround, no training needed)
+# ═══════════════════════════════════════════════════════════════
+
+def load_mel_index(cls_name):
+    if cls_name in _mel_index_cache:
+        return _mel_index_cache[cls_name]
+    path = f"data/mel_index/{cls_name}.pt"
+    if not os.path.exists(path):
+        return None
+    mels = torch.load(path, weights_only=True)
+    _mel_index_cache[cls_name] = mels
+    return mels
+
+
+def generate_retrieval(label, device, variation=0.3):
+    from torchaudio.transforms import InverseMelScale, GriffinLim
+    mels = load_mel_index(label)
+    if mels is None or len(mels) == 0:
+        return None
+
+    if variation > 0.1 and len(mels) >= 2:
+        idx1, idx2 = random.sample(range(len(mels)), 2)
+        mel = (random.uniform(0.3, 0.7) * mels[idx1] +
+               (1 - random.uniform(0.3, 0.7)) * mels[idx2])
     else:
-        # Path A: VAE generation + optional diffusion refinement
-        # Step 1: VAE generates rough spectrogram
-        vae_mel = vae.sample(label_idx, num_samples=1, device=device, temperature=temperature)
+        mel = mels[random.randint(0, len(mels) - 1)].clone()
+    if variation > 0:
+        mel = mel + torch.randn_like(mel) * variation * 0.1
+    mel = torch.clamp(mel, -3.0, 3.0)
 
-        # Step 1b: Normalize VAE output
-        vae_mel = torch.clamp(vae_mel, -4.0, 4.0)
-        mel_mean = vae_mel.mean()
-        mel_std = vae_mel.std()
-        if mel_std > 0.01:
-            vae_mel = (vae_mel - mel_mean) / mel_std * 0.7
+    inv_mel = InverseMelScale(n_stft=513, n_mels=64, sample_rate=22050, f_min=0, f_max=11025)
+    gl = GriffinLim(n_fft=1024, hop_length=200, win_length=1024, n_iter=64, power=1)
 
-        # Step 2: Diffusion refinement (optional)
-        if use_diffusion:
-            vae_mel = refine_spectrogram(
-                vae_mel, label_idx=label_idx,
-                strength=strength, num_steps=diffusion_steps,
-                device=device, use_ddim=True,
-            )
+    mel_db = mel * 19.8031 - 18.4903
+    mel_power = 10 ** (mel_db.clamp(-80, 0) / 10.0)
+    mel_cpu = mel_power.cpu()
+    lin_spec = inv_mel(mel_cpu)
+    audio = gl(torch.sqrt(lin_spec.clamp(min=0)).unsqueeze(0))
 
-    # Step 3: Vocoder — Griffin-Lim for diffusion mels
-    if from_scratch:
-        import torchaudio
-        n_fft = 1024
-        n_stft = n_fft // 2 + 1
-        from torchaudio.functional import melscale_fbanks
-        fb = melscale_fbanks(n_stft, 0.0, 22050/2.0, cfg.n_mels, 22050)
-        fb_pinv = torch.linalg.pinv(fb).float()
-        mel_cpu = vae_mel.cpu().squeeze(0).squeeze(0)  # [64, 552]
-        linear_power = torch.clamp(mel_cpu.T.float() @ fb_pinv, min=0).T  # [513, 552]
-        linear_mag = torch.sqrt(linear_power)
-        gl = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=200, win_length=1024, n_iter=64)
-        waveform = gl(linear_mag.unsqueeze(0))  # [1, samples]
-        waveform = waveform.to(device)
-    else:
-        waveform = mel_to_waveform(
-            vae_mel, device=device,
-            use_griffin_lim=use_griffin_lim,
-            griffin_lim_iters=griffin_lim_iters,
-        )
+    peak = audio.abs().max()
+    if peak > 0:
+        audio = audio / peak * 0.95
+    return audio
 
-    return waveform  # [1, samples]
 
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate animal sounds")
-    parser.add_argument("--label", type=str, default=None,
-                        help=f"Animal class: {', '.join(CLASSES)} (default: all)")
-    parser.add_argument("--count", type=int, default=1,
-                        help="Number of sounds per class")
-    parser.add_argument("--temperature", type=float, default=0.5,
-                        help="VAE temperature (0.3=consistent, 0.5=normal, 1.0=wild)")
-    parser.add_argument("--strength", type=float, default=0.6,
-                        help="Diffusion refinement strength (0.0=none, 1.0=full)")
-    parser.add_argument("--diffusion-steps", type=int, default=100,
-                        help="DDIM/DDPM sampling steps (100 recommended)")
-    parser.add_argument("--no-diff", action="store_true",
-                        help="Skip diffusion (VAE only)")
-    parser.add_argument("--from-scratch", action="store_true",
-                        help="Pure diffusion generation from noise (no VAE needed)")
-    parser.add_argument("--ddpm", action="store_true",
-                        help="Use full DDPM sampling (slower, more diverse than DDIM)")
-    parser.add_argument("--cfg-scale", type=float, default=2.0,
-                        help="Classifier-free guidance scale (1.0=no CFG, 2.0=sharper)")
-    parser.add_argument("--griffin-lim", action="store_true",
-                        help="Enable Griffin-Lim phase refinement (off by default)")
-    parser.add_argument("--output-dir", type=str, default="outputs/generated",
-                        help="Directory to save audio files")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device: auto, cuda, mps, cpu")
+    parser = argparse.ArgumentParser(description="V14 Animal Sound Generator")
+    parser.add_argument("--label", type=str, default=None, help=f"Class: {', '.join(CLASSES)}")
+    parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--v14-latent", action="store_true", help="V14 Latent Diffusion (industry standard)")
+    parser.add_argument("--retrieval", action="store_true", help="Retrieval-based (quick, no training needed)")
+    parser.add_argument("--variation", type=float, default=0.3, help="Retrieval variation amount")
+    parser.add_argument("--cfg-scale", type=float, default=2.0, help="CFG scale for latent diffusion")
+    parser.add_argument("--output-dir", type=str, default="outputs/generated")
+    parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
-    # ── Device ──────────────────────────────────────────
     if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+        device = ("cuda" if torch.cuda.is_available() else
+                  "mps" if torch.backends.mps.is_available() else "cpu")
     else:
-        device = torch.device(args.device)
+        device = args.device
+    device = torch.device(device)
     print(f"🚀 Device: {device}")
 
-    # ── Output dir ──────────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # ── Load models ─────────────────────────────────────
-    if args.from_scratch:
-        vae = None  # no VAE needed for pure diffusion generation
-        print("🎲 Pure diffusion generation from noise (no VAE)")
-    else:
-        vae = load_vae(device)
-
-    # ── Generate ────────────────────────────────────────
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     labels = [args.label] if args.label else CLASSES
 
     for label in labels:
         for i in range(args.count):
-            tag = 'scratch' if args.from_scratch else ('diff' if not args.no_diff else 'vae')
-            fname = f"{label}_{tag}_s{args.strength}_t{args.temperature}_{timestamp}_{i+1}.wav"
+            if args.v14_latent:
+                wav = generate_v14_latent(label, device, cfg_scale=args.cfg_scale)
+                tag = "v14"
+            elif args.retrieval:
+                wav = generate_retrieval(label, device, args.variation)
+                tag = f"ret_v{args.variation}"
+            else:
+                print("Specify --v14-latent or --retrieval")
+                return
+
+            if wav is None:
+                print(f"  {label}: ❌ Failed"); continue
+
+            fname = f"{label}_{tag}_{ts}_{i+1}.wav"
             out_path = os.path.join(args.output_dir, fname)
+            sf.write(out_path, wav.squeeze().cpu().numpy(), 22050)
+            dur = wav.shape[-1] / 22050
+            rms = (wav**2).mean().sqrt()
+            print(f"  {label}: ✅ {dur:.1f}s RMS={rms:.3f} → {out_path}")
 
-            print(f"🎵 Generating {label} ({i+1}/{args.count})...", end=" ", flush=True)
-
-            waveform = generate_one(
-                vae, label, device,
-                temperature=args.temperature,
-                use_diffusion=not args.no_diff,
-                strength=args.strength,
-                diffusion_steps=args.diffusion_steps,
-                use_griffin_lim=args.griffin_lim,
-                from_scratch=args.from_scratch,
-                use_ddpm=args.ddpm,
-                cfg_scale=args.cfg_scale,
-            )
-
-            # Normalize to [-1, 1]
-            peak = waveform.abs().max()
-            if peak > 0:
-                waveform = waveform / peak * 0.95
-
-            sf.write(out_path, waveform.squeeze().cpu().numpy(), 22050)
-            dur = waveform.shape[-1] / 22050
-            print(f"✅ {dur:.1f}s → {out_path}")
-
-    print(f"\n🎉 Done! Files saved to: {args.output_dir}/")
+    print(f"\n🎉 Done! {args.output_dir}/")
 
 
 if __name__ == "__main__":
