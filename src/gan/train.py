@@ -158,8 +158,9 @@ def train():
     train_set = MelDataset(cfg.data_dir, 'train', cfg.train_split)
     val_set = MelDataset(cfg.data_dir, 'val', cfg.train_split)
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=4 if device.type == 'cuda' else 0,
-                              pin_memory=(device.type == 'cuda'), drop_last=True)
+                              num_workers=8 if device.type == 'cuda' else 0,
+                              pin_memory=(device.type == 'cuda'), drop_last=True,
+                              prefetch_factor=4)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=0, drop_last=True)
 
@@ -331,9 +332,14 @@ def train():
               f"G={train_g_loss:.4f} D={train_d_loss:.4f} "
               f"val_acc={val_acc*100:.1f}% {marker} lr={lr:.2e}{status}")
 
-        # Generate samples periodically
-        if (epoch + 1) % 25 == 0:
+        # Generate samples periodically (every 10 epochs)
+        if (epoch + 1) % 10 == 0:
+            # Save periodic checkpoint (resume-safe)
+            torch.save(G.state_dict(), f"models/gan_generator_e{epoch+1}.pth")
             generate_samples(G, device, epoch + 1)
+            # Clean old checkpoints (keep last 3)
+            for old in sorted([f for f in os.listdir('models') if f.startswith('gan_generator_e')])[:-3]:
+                os.remove(f'models/{old}')
 
     print(f"\n✅ Training complete. Best val_acc: {best_val*100:.1f}%")
 

@@ -33,7 +33,7 @@ class GANConfig:
     segment_seconds: float = 5.0
 
     # ── Training ──
-    batch_size: int = 16
+    batch_size: int = 32          # L4: 22GB VRAM, 4.2 used → room for 32
     epochs: int = 300
     g_lr: float = 2e-4
     d_lr: float = 2e-4
