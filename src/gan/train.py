@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -214,7 +215,7 @@ def train():
         G.train()
         D.train()
 
-        for real_mel, real_labels in train_loader:
+        for real_mel, real_labels in tqdm(train_loader, desc=f"  Epoch {epoch+1}/{cfg.epochs}", leave=False):
             real_mel = real_mel.to(device)
             real_labels = real_labels.to(device)
             B = real_mel.shape[0]
@@ -296,7 +297,7 @@ def train():
         val_cls_acc = 0.0
         n_val = 0
         with torch.no_grad():
-            for val_mel, val_labels in val_loader:
+            for val_mel, val_labels in tqdm(val_loader, desc=f"  Val", leave=False):
                 val_mel = val_mel.to(device)
                 val_labels = val_labels.to(device)
                 Bv = val_mel.shape[0]
