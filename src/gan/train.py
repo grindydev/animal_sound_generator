@@ -149,6 +149,12 @@ def g_hinge_loss(fake_logits):
 # ════════════════════════════════════════════════════════════════════
 
 def train():
+    # Seed for reproducibility
+    torch.manual_seed(42)
+    random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"🚀 GAN Training — v16")
@@ -252,10 +258,13 @@ def train():
 
             if scaler_d:
                 scaler_d.scale(d_loss).backward()
+                scaler_d.unscale_(d_opt)
+                torch.nn.utils.clip_grad_norm_(D.parameters(), cfg.grad_clip)
                 scaler_d.step(d_opt)
                 scaler_d.update()
             else:
                 d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(D.parameters(), cfg.grad_clip)
                 d_opt.step()
 
             d_loss_sum += d_loss.item()
@@ -280,10 +289,13 @@ def train():
 
             if scaler_g:
                 scaler_g.scale(g_loss).backward()
+                scaler_g.unscale_(g_opt)
+                torch.nn.utils.clip_grad_norm_(G.parameters(), cfg.grad_clip)
                 scaler_g.step(g_opt)
                 scaler_g.update()
             else:
                 g_loss.backward()
+                torch.nn.utils.clip_grad_norm_(G.parameters(), cfg.grad_clip)
                 g_opt.step()
 
             g_loss_sum += g_loss.item()

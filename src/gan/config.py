@@ -39,9 +39,10 @@ class GANConfig:
     d_lr: float = 2e-4
     beta1: float = 0.0           # Adam β₁ = 0 for GAN stability
     beta2: float = 0.99
-    r1_gamma: float = 10.0       # R1 gradient penalty strength
+    r1_gamma: float = 1.0        # R1 penalty (10 too high → gradient spikes)
     r1_every: int = 16           # apply R1 every N steps (saves memory)
     lr_decay_epochs: tuple = (100, 200)  # halve LR at these epochs
+    grad_clip: float = 5.0        # clip G gradients for stability
 
     # ── Loss weights ──
     g_adv_weight: float = 1.0
