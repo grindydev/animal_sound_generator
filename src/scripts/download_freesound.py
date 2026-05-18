@@ -89,7 +89,7 @@ def download_preview(sound, out_path, timeout=10):
 def scrape_mode():
     """Download sounds via HTML scraping (no API key)."""
     print("🔍 Freesound Scrape Mode")
-    PER_CLASS_TIMEOUT = 120
+    PER_CLASS_TIMEOUT = 180
 
     for cls_name, queries in QUERIES.items():
         cls_start = time.time()
