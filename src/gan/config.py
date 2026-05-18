@@ -33,7 +33,7 @@ class GANConfig:
     segment_seconds: float = 5.0
 
     # ── Training ──
-    batch_size: int = 32          # L4: 22GB VRAM, 4.2 used → room for 32
+    batch_size: int = 16          # 32 caused plateau — GANs need smaller batches for stability
     epochs: int = 300
     g_lr: float = 2e-4
     d_lr: float = 2e-4
@@ -41,6 +41,7 @@ class GANConfig:
     beta2: float = 0.99
     r1_gamma: float = 10.0       # R1 gradient penalty strength
     r1_every: int = 16           # apply R1 every N steps (saves memory)
+    lr_decay_epochs: tuple = (100, 200)  # halve LR at these epochs
 
     # ── Loss weights ──
     g_adv_weight: float = 1.0

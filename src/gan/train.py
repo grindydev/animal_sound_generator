@@ -340,6 +340,13 @@ def train():
             for old in sorted([f for f in os.listdir('models') if f.startswith('gan_generator_e')])[:-3]:
                 os.remove(f'models/{old}')
 
+        # LR decay at milestone epochs
+        if (epoch + 1) in cfg.lr_decay_epochs:
+            for opt in [g_opt, d_opt]:
+                for pg in opt.param_groups:
+                    pg['lr'] *= 0.5
+            print(f"   🔻 LR halved to {g_opt.param_groups[0]['lr']:.2e}")
+
     print(f"\n✅ Training complete. Best val_acc: {best_val*100:.1f}%")
 
 
