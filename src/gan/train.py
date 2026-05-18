@@ -309,11 +309,9 @@ def train():
                 val_mel = val_mel.to(DEVICE)
                 val_labels = val_labels.to(DEVICE)
                 Bv = val_mel.shape[0]
-                z = torch.randn(Bv, cfg.latent_dim, device=DEVICE)
-                fake_mel = G_ema(z, val_labels)
-                fake_mel = pad_mel(fake_mel)
-                _, fake_cls = D(fake_mel)
-                val_acc += (fake_cls.argmax(1) == val_labels).float().sum().item()
+                val_mel = pad_mel(val_mel)
+                _, val_cls = D(val_mel)
+                val_acc += (val_cls.argmax(1) == val_labels).float().sum().item()
                 n_val += Bv
 
         val_acc = val_acc / n_val if n_val > 0 else 0.0
@@ -371,9 +369,9 @@ def generate_samples(generator, device, epoch):
             z = torch.randn(cfg.num_samples, cfg.latent_dim, device=device)
             labels = torch.full((cfg.num_samples,), cls_idx, device=device, dtype=torch.long)
             mels = generator(z, labels)
-            audio = mel_to_audio(mels[0:1])
+            audio = mel_to_audio(mels[0:1]).squeeze()  # → [T]
             torchaudio.save(f"outputs/gan_v16_e{epoch}_{cls_name}.wav",
-                            audio.squeeze(0).cpu(), cfg.sample_rate)
+                            audio.cpu(), cfg.sample_rate)
     print(f"   🎵 Saved samples to outputs/")
 
 

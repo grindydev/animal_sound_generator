@@ -40,7 +40,7 @@ class GANConfig:
     beta1: float = 0.0           # Adam β₁ = 0 for GAN stability
     beta2: float = 0.99
     adam_weight_decay: float = 1e-4
-    ema_decay: float = 0.9999     # EMA for generator
+    ema_decay: float = 0.999      # EMA for generator (faster catch-up)
     r1_gamma: float = 1.0        # R1 penalty
     r1_every: int = 16           # apply R1 every N steps
     grad_clip: float = 5.0        # clip gradients
