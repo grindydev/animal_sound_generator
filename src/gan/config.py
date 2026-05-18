@@ -15,6 +15,7 @@ class GANConfig:
     gen_max_ch: int = 256
     disc_base_ch: int = 48
     disc_max_ch: int = 384
+    disc_scales: int = 3         # multi-scale D (1x, 0.5x, 0.25x)
 
     # ── Mel dimensions ──
     mel_height: int = 64
