@@ -61,6 +61,7 @@ def mel_to_audio(mel, bin_mean=None, bin_std=None, n_iter=64):
         mel_db = (mel - 1.0) * 40.0  # fallback: old [-1,1] mapping
 
     mel_db = mel_db.clamp(-80, 0)
+    mel_power = 10 ** (mel_db / 10.0)
 
     # Inverse mel scale
     inv_mel = InverseMelScale(
