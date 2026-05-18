@@ -114,7 +114,7 @@ def generate():
                 rms = (audio ** 2).mean().sqrt().item()
 
                 out_path = os.path.join(args.output_dir, f"gan_v16_{cls_name}_{i+1:02d}.wav")
-                torchaudio.save(out_path, audio.squeeze(0).cpu(), cfg.sample_rate)
+                torchaudio.save(out_path, audio.squeeze().cpu(), cfg.sample_rate)
                 print(f"   ✅ {out_path} (RMS: {rms:.4f})")
 
     print(f"\n✨ Done! Listen: {args.output_dir}/")
