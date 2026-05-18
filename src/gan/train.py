@@ -179,8 +179,20 @@ def train():
     d_opt = torch.optim.Adam(D.parameters(), lr=cfg.d_lr, betas=(cfg.beta1, cfg.beta2))
 
     # AMP
-    scaler_g = torch.cuda.amp.GradScaler('cuda') if cfg.use_amp and device.type == 'cuda' else None
-    scaler_d = torch.cuda.amp.GradScaler('cuda') if cfg.use_amp and device.type == 'cuda' else None
+    if cfg.use_amp and device.type == 'cuda':
+        # Support both old (torch.cuda.amp) and new (torch.amp) APIs
+        try:
+            scaler_g = torch.amp.GradScaler('cuda')
+            scaler_d = torch.amp.GradScaler('cuda')
+            autocast_fn = lambda: torch.amp.autocast('cuda')
+        except (TypeError, AttributeError):
+            scaler_g = torch.cuda.amp.GradScaler()
+            scaler_d = torch.cuda.amp.GradScaler()
+            autocast_fn = torch.cuda.amp.autocast
+    else:
+        scaler_g = None
+        scaler_d = None
+        autocast_fn = torch.enable_grad
 
     # For G class loss
     ce_loss = nn.CrossEntropyLoss()
@@ -215,7 +227,7 @@ def train():
 
             d_opt.zero_grad()
 
-            with torch.cuda.amp.autocast('cuda') if scaler_d else torch.enable_grad():
+            with autocast_fn():
                 # Real
                 real_adv, real_cls = D(real_mel)
                 d_real_cls_loss = ce_loss(real_cls, real_labels)
@@ -253,7 +265,7 @@ def train():
 
             g_opt.zero_grad()
 
-            with torch.cuda.amp.autocast('cuda') if scaler_g else torch.enable_grad():
+            with autocast_fn():
                 z = torch.randn(B, cfg.latent_dim, device=device)
                 fake_mel = G(z, real_labels)
                 fake_mel = pad_mel(fake_mel)
