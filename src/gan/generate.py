@@ -27,35 +27,40 @@ def load_generator(device):
     G = Generator(cfg).to(device)
     state = torch.load(cfg.generator_path, map_location=device, weights_only=True)
     # Support both dict save and raw state_dict
+    bin_mean = None
+    bin_std = None
     if 'generator' in state:
         G.load_state_dict(state['generator'])
         val_acc = state.get('val_acc', None)
+        bin_mean = state.get('bin_mean', None)
+        bin_std = state.get('bin_std', None)
         if val_acc is not None:
             print(f"   val_acc at save: {val_acc*100:.1f}%")
     else:
         G.load_state_dict(state)
     G.eval()
-    g_params = sum(p.numel() for p in G.parameters())
-    print(f"✅ Generator loaded: {g_params:,} params ({g_params/1e6:.1f}M)")
-    return G
+    return G, bin_mean, bin_std
 
 
-def mel_to_audio(mel, n_iter=64):
-    """Convert normalized mel [-1,1] to audio via Griffin-Lim.
+def mel_to_audio(mel, bin_mean=None, bin_std=None, n_iter=64):
+    """Convert per-bin z-score mel to audio via Griffin-Lim.
 
     Args:
-        mel: [B, 1, H, W] in [-1, 1] (from GAN output)
+        mel: [B, 1, H, W] — per-bin z-score normalized
+        bin_mean, bin_std: per-bin stats for denormalization
         n_iter: Griffin-Lim iterations
-    Returns:
-        audio: [B, 1, T]
     """
     device = mel.device
 
-    # Denormalize: [-1,1] → [-80,0] dB
-    mel_db = (mel - 1.0) * 40.0
+    # Denormalize: z-score → dB
+    if bin_mean is not None and bin_std is not None:
+        bin_mean = bin_mean.to(device)
+        bin_std = bin_std.to(device)
+        mel_db = mel * bin_std + bin_mean  # [B, 1, H, W]
+    else:
+        mel_db = (mel - 1.0) * 40.0  # fallback: old [-1,1] mapping
 
-    # dB → power
-    mel_power = 10 ** (mel_db.clamp(-80, 0) / 10.0)
+    mel_db = mel_db.clamp(-80, 0)
 
     # Inverse mel scale
     inv_mel = InverseMelScale(
@@ -92,7 +97,9 @@ def generate():
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps' if torch.backends.mps.is_available() else 'cpu')
 
-    G = load_generator(device)
+    G, bin_mean, bin_std = load_generator(device)
+    g_params = sum(p.numel() for p in G.parameters())
+    print(f"✅ Generator loaded: {g_params:,} params ({g_params/1e6:.1f}M)")
     os.makedirs(args.output_dir, exist_ok=True)
 
     classes_to_generate = [args.label] if args.label else cfg.CLASSES
@@ -110,7 +117,7 @@ def generate():
                 z = torch.randn(1, cfg.latent_dim, device=device)
                 labels = torch.tensor([cls_idx], device=device, dtype=torch.long)
                 mel = G(z, labels)
-                audio = mel_to_audio(mel)
+                audio = mel_to_audio(mel, bin_mean, bin_std)
                 rms = (audio ** 2).mean().sqrt().item()
 
                 out_path = os.path.join(args.output_dir, f"gan_v16_{cls_name}_{i+1:02d}.wav")

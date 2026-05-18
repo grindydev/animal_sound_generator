@@ -48,7 +48,7 @@ os.makedirs(cfg.model_dir, exist_ok=True)
 
 class MelDataset(torch.utils.data.Dataset):
 
-    def __init__(self, data_dir, split='train', train_split=0.95):
+    def __init__(self, data_dir, split='train', train_split=0.95, bin_mean=None, bin_std=None):
         self.mel_transform = MelSpectrogram(
             sample_rate=cfg.sample_rate, n_fft=cfg.n_fft,
             hop_length=cfg.hop_length, n_mels=cfg.n_mels,
@@ -56,6 +56,8 @@ class MelDataset(torch.utils.data.Dataset):
         )
         self.db_transform = AmplitudeToDB(top_db=80)
         self.use_augment = (split == 'train')
+        self.bin_mean = bin_mean
+        self.bin_std = bin_std
 
         self.samples = []
         for cls_name, cls_idx in cfg.class_to_idx.items():
@@ -89,8 +91,13 @@ class MelDataset(torch.utils.data.Dataset):
 
         spec = self.mel_transform(wav)
         mel = self.db_transform(spec)
-        mel = mel / 40.0 + 1.0  # [-80,0] → [-1,1]
-        mel = mel.clamp(-1, 1)
+
+        # Per-bin z-score normalization (kills the 38dB gap)
+        if self.bin_mean is not None and self.bin_std is not None:
+            mel = (mel - self.bin_mean) / self.bin_std.clamp(min=0.1)
+        else:
+            mel = mel / 40.0 + 1.0  # fallback: old [-1,1] mapping
+            mel = mel.clamp(-1, 1)
 
         if self.use_augment and random.random() < cfg.aug_prob:
             mel = self._augment(mel)
@@ -149,8 +156,24 @@ def train():
     print(f"   G LR: {cfg.g_lr} | D LR: {cfg.d_lr} | AMP: {use_amp} | Hinge + R1(γ={cfg.r1_gamma})")
 
     # ── Data ──
-    train_ds = MelDataset(cfg.data_dir, 'train', cfg.train_split)
-    val_ds = MelDataset(cfg.data_dir, 'val', cfg.train_split)
+    # Compute per-bin stats first (fixes 38dB initialization gap)
+    print("   Computing per-bin mel stats...")
+    temp_ds = MelDataset(cfg.data_dir, 'train', cfg.train_split, bin_mean=None, bin_std=None)
+    temp_loader = DataLoader(temp_ds, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+                              pin_memory=pin_mem, drop_last=True)
+    all_mels = []
+    with torch.no_grad():
+        for mel_batch, _ in tqdm(temp_loader, desc="   Stats", leave=False):
+            all_mels.append(mel_batch)
+    all_mels = torch.cat(all_mels, dim=0)  # [N, 1, 64, T]
+    bin_mean = all_mels.mean(dim=(0, 3), keepdim=True)  # [1, 1, 64, 1]
+    bin_std = all_mels.std(dim=(0, 3), keepdim=True)    # [1, 1, 64, 1]
+    print(f"   Bin means: [{bin_mean.min():.3f}, {bin_mean.max():.3f}]")
+    print(f"   Bin stds:  [{bin_std.min():.3f}, {bin_std.max():.3f}]")
+    del all_mels, temp_ds, temp_loader
+
+    train_ds = MelDataset(cfg.data_dir, 'train', cfg.train_split, bin_mean=bin_mean, bin_std=bin_std)
+    val_ds = MelDataset(cfg.data_dir, 'val', cfg.train_split, bin_mean=bin_mean, bin_std=bin_std)
     pin_mem = NUM_WORKERS > 0 and DEVICE.type == "cuda"
     train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
                                pin_memory=pin_mem, drop_last=True, prefetch_factor=4)
@@ -332,6 +355,8 @@ def train():
                 'epoch': epoch,
                 'g_params': sum(p.numel() for p in G.parameters()),
                 'd_params': sum(p.numel() for p in D.parameters()),
+                'bin_mean': bin_mean.cpu(),
+                'bin_std': bin_std.cpu(),
             }, os.path.join(cfg.model_dir, "gan_generator_best.pth"))
             print(f"   💾 Best model saved (val_acc={val_acc*100:.1f}%)")
 
@@ -369,7 +394,7 @@ def generate_samples(generator, device, epoch):
             z = torch.randn(cfg.num_samples, cfg.latent_dim, device=device)
             labels = torch.full((cfg.num_samples,), cls_idx, device=device, dtype=torch.long)
             mels = generator(z, labels)
-            audio = mel_to_audio(mels[0:1]).squeeze()  # → [T]
+            audio = mel_to_audio(mels[0:1], bin_mean, bin_std).squeeze()
             torchaudio.save(f"outputs/gan_v16_e{epoch}_{cls_name}.wav",
                             audio.cpu(), cfg.sample_rate)
     print(f"   🎵 Saved samples to outputs/")
