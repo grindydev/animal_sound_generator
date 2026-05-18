@@ -381,7 +381,7 @@ def train():
                 'discriminator': D.state_dict(),
                 'epoch': epoch,
             }, os.path.join(cfg.model_dir, f"gan_e{epoch+1:03d}.pth"))
-            generate_samples(G_ema, DEVICE, epoch + 1)
+            generate_samples(G_ema, DEVICE, epoch + 1, bin_mean, bin_std)
 
     print(f"\n✅ GAN training complete. Best val_acc: {best_val*100:.1f}%")
 
@@ -390,7 +390,7 @@ def train():
 #  GENERATION
 # ═══════════════════════════════════════════════════════════
 
-def generate_samples(generator, device, epoch):
+def generate_samples(generator, device, epoch, bin_mean, bin_std):
     from src.gan.generate import mel_to_audio
     generator.eval()
     with torch.no_grad():
