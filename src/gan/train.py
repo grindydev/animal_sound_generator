@@ -95,6 +95,7 @@ class MelDataset(torch.utils.data.Dataset):
         # Per-bin z-score normalization on dB values (kills the 38dB gap)
         if self.bin_mean is not None and self.bin_std is not None:
             mel = (mel_db - self.bin_mean) / self.bin_std.clamp(min=1.0)
+            mel = mel.squeeze(1)  # [1,1,64,T] → [1,64,T] — keep 3D for DataLoader
         else:
             mel = mel_db / 40.0 + 1.0  # fallback for computing stats
 
@@ -169,6 +170,7 @@ def train():
     all_mels = torch.cat(all_mels, dim=0)  # [N, 1, 64, T]
     # Stats on raw dB: un-fallback the [-1,1] normalization
     all_mels_db = (all_mels - 1.0) * 40.0  # [-1,1] → dB [-80, 0]
+    # Per-bin stats with channel dim for easy broadcasting: [1, 1, 64, 1]
     bin_mean = all_mels_db.mean(dim=(0, 3), keepdim=True)  # [1, 1, 64, 1]
     bin_std = all_mels_db.std(dim=(0, 3), keepdim=True)
     print(f"   Bin dB means: [{bin_mean.min():.0f}, {bin_mean.max():.0f}] dB")
