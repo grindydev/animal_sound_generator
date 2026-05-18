@@ -90,14 +90,13 @@ class MelDataset(torch.utils.data.Dataset):
             wav = wav[:, start:start + target_len]
 
         spec = self.mel_transform(wav)
-        mel = self.db_transform(spec)
+        mel_db = self.db_transform(spec)  # dB: [-80, 0]
 
-        # Per-bin z-score normalization (kills the 38dB gap)
+        # Per-bin z-score normalization on dB values (kills the 38dB gap)
         if self.bin_mean is not None and self.bin_std is not None:
-            mel = (mel - self.bin_mean) / self.bin_std.clamp(min=0.1)
+            mel = (mel_db - self.bin_mean) / self.bin_std.clamp(min=1.0)
         else:
-            mel = mel / 40.0 + 1.0  # fallback: old [-1,1] mapping
-            mel = mel.clamp(-1, 1)
+            mel = mel_db / 40.0 + 1.0  # fallback for computing stats
 
         if self.use_augment and random.random() < cfg.aug_prob:
             mel = self._augment(mel)
@@ -156,7 +155,9 @@ def train():
     print(f"   G LR: {cfg.g_lr} | D LR: {cfg.d_lr} | AMP: {use_amp} | Hinge + R1(γ={cfg.r1_gamma})")
 
     # ── Data ──
-    # Compute per-bin stats first (fixes 38dB initialization gap)
+    pin_mem = NUM_WORKERS > 0 and DEVICE.type == "cuda"
+
+    # Compute per-bin stats on RAW dB data (fixes 38dB initialization gap)
     print("   Computing per-bin mel stats...")
     temp_ds = MelDataset(cfg.data_dir, 'train', cfg.train_split, bin_mean=None, bin_std=None)
     temp_loader = DataLoader(temp_ds, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
@@ -166,15 +167,16 @@ def train():
         for mel_batch, _ in tqdm(temp_loader, desc="   Stats", leave=False):
             all_mels.append(mel_batch)
     all_mels = torch.cat(all_mels, dim=0)  # [N, 1, 64, T]
-    bin_mean = all_mels.mean(dim=(0, 3), keepdim=True)  # [1, 1, 64, 1]
-    bin_std = all_mels.std(dim=(0, 3), keepdim=True)    # [1, 1, 64, 1]
-    print(f"   Bin means: [{bin_mean.min():.3f}, {bin_mean.max():.3f}]")
-    print(f"   Bin stds:  [{bin_std.min():.3f}, {bin_std.max():.3f}]")
-    del all_mels, temp_ds, temp_loader
+    # Stats on raw dB: un-fallback the [-1,1] normalization
+    all_mels_db = (all_mels - 1.0) * 40.0  # [-1,1] → dB [-80, 0]
+    bin_mean = all_mels_db.mean(dim=(0, 3), keepdim=True)  # [1, 1, 64, 1]
+    bin_std = all_mels_db.std(dim=(0, 3), keepdim=True)
+    print(f"   Bin dB means: [{bin_mean.min():.0f}, {bin_mean.max():.0f}] dB")
+    print(f"   Bin dB stds:  [{bin_std.min():.0f}, {bin_std.max():.0f}] dB")
+    del all_mels, all_mels_db, temp_ds, temp_loader
 
     train_ds = MelDataset(cfg.data_dir, 'train', cfg.train_split, bin_mean=bin_mean, bin_std=bin_std)
     val_ds = MelDataset(cfg.data_dir, 'val', cfg.train_split, bin_mean=bin_mean, bin_std=bin_std)
-    pin_mem = NUM_WORKERS > 0 and DEVICE.type == "cuda"
     train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
                                pin_memory=pin_mem, drop_last=True, prefetch_factor=4)
     val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
