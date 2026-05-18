@@ -1,51 +1,95 @@
 """
-build_dataset_v17.py — Download Kaggle animal sounds + Freesound for missing classes
+build_dataset_v17.py — Download from 2 Kaggle datasets + merge ESC-50 → 6 classes
 
-Kaggle dataset: https://www.kaggle.com/datasets/caoofficial/animal-sounds
-  - Cat: 200 files (16kHz, high quality)
-  - Dog: 200 files (16kHz, high quality)  
-  - Frog: 35 files (varies, decent)
-  - Chicken: 30 files → Hen (varies, decent)
-  - Bird: 200 files → skip (1-2s chirps, not crow/rooster)
+Sources:
+  Kaggle 1: caoofficial/animal-sounds        (75-200 files/class)
+  Kaggle 2: rushibalajiputthewad/...          (50 files/class)
+  ESC-50:    existing local files              (40-80 files/class, merged)
+  UrbanSound8K: existing local Dog files       (1040 files)
+  Freesound: scrape for remaining              (optional)
 
-Combined with our existing UrbanSound8K dogs (1040), we get:
-  Dog: 1240 | Cat: 240 | Frog: 75 | Hen: 70
-
-Then downloads missing classes from Freesound.
+Target: 500 real unique files per class
 
 Usage:
-  python src/scripts/build_dataset_v17.py              # Kaggle + Freesound scrape
-  python src/scripts/build_dataset_v17.py --freesound-api KEY  # Kaggle + Freesound API
+  python src/scripts/build_dataset_v17.py
+  python src/scripts/build_dataset_v17.py --freesound-api KEY
 """
 import os, sys, shutil, argparse, subprocess
 
 DATA_DIR = "data/animal1000"
-KAGGLE_DATASET = "caoofficial/animal-sounds"
+TARGET_REAL = 500
 
-CLASS_MAP = {
-    "Cat": "Cat",
-    "Dog": "Dog",
-    "Frog": "Frog",
-    "Bird": "Bird",
-    "Chicken": "Chicken",
-    "Cow": "Cow",
-}
+KAGGLE_DATASETS = [
+    {
+        "name": "caoofficial/animal-sounds",
+        "subdir": "Animal-SDataset",
+        "map": {"Cat": "Cat", "Dog": "Dog", "Frog": "Frog",
+                "Bird": "Bird", "Chicken": "Chicken", "Cow": "Cow"},
+    },
+    {
+        "name": "rushibalajiputthewad/sound-classification-of-animal-voice",
+        "subdir": "Animal-Soundprepros",
+        "map": {"Cat": "Cat", "Dog": "Dog", "Frog": "Frog",
+                "Chicken": "Chicken", "Cow": "Cow"},
+    },
+]
 
-# Merge old ESC-50 classes into new Kaggle classes
+# Merge old ESC-50 classes into new classes
 MERGE_CLASSES = {
-    "Crow": "Bird",      # ESC-50 Crow → Bird
-    "Insect": "Cow",     # ESC-50 Insect → Cow  
-    "Hen": "Chicken",    # ESC-50 Hen → Chicken
-    "Rooster": "Chicken", # ESC-50 Rooster → Chicken
+    "Crow": "Bird",
+    "Insect": "Cow",
+    "Hen": "Chicken",
+    "Rooster": "Chicken",
 }
 
-# Classes still needed after Kaggle
-TARGET_REAL = 200  # target real files per class
+# For Freesound download
+FREESOUND_QUERIES = {
+    "Cat":     ["cat meow", "cat meowing", "kitten meow", "cat purr"],
+    "Dog":     ["dog bark", "dog barking", "dog growl", "puppy bark"],
+    "Bird":    ["bird chirp", "bird singing", "bird call", "bird sound"],
+    "Chicken": ["chicken cluck", "hen clucking", "rooster crow", "rooster crowing"],
+    "Cow":     ["cow moo", "cow mooing", "cattle sound"],
+    "Frog":    ["frog croak", "frog sound", "toad croak", "frog call"],
+}
+
+
+def download_kaggle():
+    """Download both Kaggle datasets and copy relevant classes."""
+    try:
+        import kagglehub
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kagglehub"], check=True)
+        import kagglehub
+
+    for ds in KAGGLE_DATASETS:
+        print(f"\n📦 Kaggle: {ds['name']}...")
+        path = kagglehub.dataset_download(ds["name"])
+        src_dir = os.path.join(path, ds["subdir"])
+        print(f"   Source: {src_dir}")
+
+        for kaggle_cls, our_cls in ds["map"].items():
+            src = os.path.join(src_dir, kaggle_cls)
+            if not os.path.isdir(src):
+                continue
+
+            dst = os.path.join(DATA_DIR, our_cls)
+            os.makedirs(dst, exist_ok=True)
+
+            copied = 0
+            for fname in sorted(os.listdir(src)):
+                if fname.startswith("."):
+                    continue
+                dst_file = os.path.join(dst, f"kaggle2_{fname}" if "rushibala" in ds["name"] else f"kaggle_{fname}")
+                if not os.path.exists(dst_file):
+                    shutil.copy2(os.path.join(src, fname), dst_file)
+                    copied += 1
+
+            print(f"   {our_cls:10s}: +{copied}")
 
 
 def merge_old_classes():
     """Move ESC-50 files from old class folders into new merged folders."""
-    print("\n🔄 Merging old classes...")
+    print("\n🔄 Merging ESC-50 classes...")
     for old_cls, new_cls in MERGE_CLASSES.items():
         old_dir = os.path.join(DATA_DIR, old_cls)
         if not os.path.isdir(old_dir):
@@ -64,125 +108,90 @@ def merge_old_classes():
                 moved += 1
 
         print(f"   {old_cls} → {new_cls}: {moved} files")
-
-        # Remove empty old directory
         remaining = [f for f in os.listdir(old_dir) if f.endswith(".wav")]
         if not remaining:
             shutil.rmtree(old_dir, ignore_errors=True)
 
 
-def download_kaggle():
-    """Download Kaggle dataset and copy relevant classes."""
-    print("📦 Downloading Kaggle dataset...")
-    try:
-        import kagglehub
-        path = kagglehub.dataset_download(KAGGLE_DATASET)
-    except ImportError:
-        print("   Installing kagglehub...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kagglehub"], check=True)
-        import kagglehub
-        path = kagglehub.dataset_download(KAGGLE_DATASET)
-
-    src_dir = os.path.join(path, "Animal-SDataset")
-    print(f"   Source: {src_dir}\n")
-
-    for kaggle_cls, our_cls in CLASS_MAP.items():
-        src = os.path.join(src_dir, kaggle_cls)
-        if not os.path.isdir(src):
-            print(f"   ⚠️  {kaggle_cls} not found in dataset")
+def clean_augmented():
+    """Remove all augmented (pitch-shifted) files."""
+    print("\n🧹 Cleaning augmented files...")
+    for cls_name in os.listdir(DATA_DIR):
+        cls_dir = os.path.join(DATA_DIR, cls_name)
+        if not os.path.isdir(cls_dir):
             continue
-
-        dst = os.path.join(DATA_DIR, our_cls)
-        os.makedirs(dst, exist_ok=True)
-
-        # Count existing real files (not augmented)
-        existing = len([f for f in os.listdir(dst)
-                       if f.endswith(".wav") and not f.startswith("aug_")])
-
-        copied = 0
-        for fname in sorted(os.listdir(src)):
-            if fname.startswith("."):
-                continue
-            src_file = os.path.join(src, fname)
-            dst_file = os.path.join(dst, f"kaggle_{fname}")
-
-            if os.path.exists(dst_file):
-                continue
-
-            shutil.copy2(src_file, dst_file)
-            copied += 1
-
-        # Remove augmented files
-        aug_removed = 0
-        for f in os.listdir(dst):
+        removed = 0
+        for f in os.listdir(cls_dir):
             if f.startswith("aug_"):
-                os.remove(os.path.join(dst, f))
-                aug_removed += 1
-
-        total_real = len([f for f in os.listdir(dst)
-                         if f.endswith(".wav") and not f.startswith("aug_")])
-        print(f"   {our_cls:8s}: +{copied} real, -{aug_removed} aug → {total_real} total real")
+                os.remove(os.path.join(cls_dir, f))
+                removed += 1
+        if removed:
+            print(f"   {cls_name}: -{removed} augmented")
 
 
 def print_summary():
     """Show final dataset state."""
-    print("\n" + "=" * 50)
-    print("DATASET SUMMARY")
-    print("=" * 50)
+    print("\n" + "=" * 55)
+    print(f"{'DATASET SUMMARY':^55}")
+    print("=" * 55)
+    print(f"{'Class':12s} {'Real':>6s}  {'Needed':>6s}  Bar")
+    print("-" * 55)
     total = 0
+    rows = []
     for cls_name in sorted(os.listdir(DATA_DIR)):
         cls_dir = os.path.join(DATA_DIR, cls_name)
         if not os.path.isdir(cls_dir):
             continue
-        all_wavs = [f for f in os.listdir(cls_dir) if f.endswith(".wav")]
-        real = [f for f in all_wavs if not f.startswith("aug_")]
-        print(f"  {cls_name:10s}: {len(all_wavs):4d} total = {len(real):4d} real + {len(all_wavs)-len(real)} aug")
-        total += len(real)
-    print(f"  {'TOTAL':10s}: {total} real files")
+        real = len([f for f in os.listdir(cls_dir)
+                    if f.endswith(".wav") and not f.startswith("aug_")])
+        needed = max(0, TARGET_REAL - real)
+        bar = "█" * (real // 20) if real > 0 else ""
+        rows.append((cls_name, real, needed, bar))
+        total += real
+
+    for cls_name, real, needed, bar in sorted(rows, key=lambda x: -x[1]):
+        flag = " ✅" if needed == 0 else f" +{needed}"
+        print(f"  {cls_name:10s} {real:5d}  {flag:>8s}  {bar}")
+
+    print("-" * 55)
+    print(f"  {'TOTAL':10s} {total:5d}")
+    print(f"  {'Target':10s} {TARGET_REAL * len(rows):5d}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build v17 dataset (Kaggle + Freesound)")
-    parser.add_argument("--freesound-api", type=str, metavar="API_KEY",
-                        help="Freesound API key for full quality (skip for scrape)")
-    parser.add_argument("--target", type=int, default=200, help="Target real files per class")
+    parser = argparse.ArgumentParser(description="Build v17 dataset from Kaggle + ESC-50")
+    parser.add_argument("--target", type=int, default=500, help="Target real files per class")
     args = parser.parse_args()
 
     global TARGET_REAL
     TARGET_REAL = args.target
 
-    # Step 1: Download from Kaggle
-    print("=" * 50)
-    print("STEP 1: Kaggle Dataset + Merge old classes")
-    print("=" * 50)
+    print("=" * 55)
+    print("BUILDING v17 DATASET")
+    print("=" * 55)
+    print(f"Target: {TARGET_REAL} real files/class")
+
     download_kaggle()
     merge_old_classes()
+    clean_augmented()
     print_summary()
 
-    # Step 2: Remaining classes need Freesound?
-    print("\n" + "=" * 50)
-    print("STEP 2: Remaining classes")
-    print("=" * 50)
-    any_needed = False
-    for cls_name in ['Dog', 'Cat', 'Chicken', 'Frog', 'Bird', 'Cow']:
+    # Check if Freesound needed
+    needed_classes = []
+    for cls_name in sorted(os.listdir(DATA_DIR)):
         cls_dir = os.path.join(DATA_DIR, cls_name)
-        if os.path.isdir(cls_dir):
-            real = len([f for f in os.listdir(cls_dir)
-                       if f.endswith(".wav") and not f.startswith("aug_")])
-        else:
-            real = 0
-        needed = max(0, TARGET_REAL - real)
-        flag = " ✅" if needed == 0 else f" → need {needed} more"
-        print(f"  {cls_name:10s}: {real} real{flag}")
-        if needed > 0:
-            any_needed = True
+        if not os.path.isdir(cls_dir):
+            continue
+        real = len([f for f in os.listdir(cls_dir)
+                    if f.endswith(".wav") and not f.startswith("aug_")])
+        if real < TARGET_REAL:
+            needed_classes.append(cls_name)
 
-    if any_needed:
-        print(f"\nRun: python src/scripts/download_freesound.py --no-api --n {TARGET_REAL}")
-        if args.freesound_api:
-            print(f"Or:  python src/scripts/download_freesound.py --api {args.freesound_api} --n {TARGET_REAL}")
+    if needed_classes:
+        print(f"\n⚠️  {len(needed_classes)} classes below target: {', '.join(needed_classes)}")
+        print(f"Run: python src/scripts/download_freesound.py --no-api --n {TARGET_REAL}")
     else:
-        print("\n✅ All classes have ≥{TARGET_REAL} real files!")
+        print(f"\n✅ All classes have ≥{TARGET_REAL} real files!")
 
 
 if __name__ == "__main__":
