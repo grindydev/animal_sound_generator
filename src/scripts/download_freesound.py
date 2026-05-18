@@ -2,15 +2,15 @@
 download_freesound.py — Download animal sounds from Freesound.org
 
 Two modes:
-  1. --no-api    : Scrape search results (155 per query, OGG preview ~16kbps)
-  2. --api TOKEN : Use Freesound API v2 (full quality WAV, up to 150/query)
+  1. --no-api          : Scrape search results (no key, MP3 preview ~64kbps)
+  2. --api API_KEY     : Use Freesound API v2 (full quality WAV)
 
-Freesound API key: sign up at https://freesound.org/apiv2/apply/
+Get API key: https://freesound.org/apiv2/apply/ → copy key from your applications page
 
 Usage:
-  python src/scripts/download_freesound.py --no-api              # scrape mode
-  python src/scripts/download_freesound.py --api YOUR_TOKEN      # API mode
-  python src/scripts/download_freesound.py --api YOUR_TOKEN --n 200  # 200 per class
+  python src/scripts/download_freesound.py --no-api
+  python src/scripts/download_freesound.py --api YOUR_API_KEY
+  python src/scripts/download_freesound.py --api YOUR_API_KEY --n 200
 """
 import os, sys, time, json, argparse, re
 import urllib.request
@@ -173,9 +173,9 @@ def scrape_mode():
 #  MODE 2: API (full quality)
 # ═══════════════════════════════════════════════════════════
 
-def api_search(query, token, page=1, page_size=50):
+def api_search(query, api_key, page=1, page_size=50):
     """Search Freesound API v2."""
-    url = f"{API_SEARCH}?query={urllib.parse.quote(query)}&page={page}&page_size={page_size}&fields=id,name,previews,download,type&token={token}"
+    url = f"{API_SEARCH}?query={urllib.parse.quote(query)}&page={page}&page_size={page_size}&fields=id,name,previews,download,type&token={api_key}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
@@ -190,7 +190,7 @@ def api_download(url, out_path):
         f.write(data)
 
 
-def api_mode(token):
+def api_mode(api_key):
     """Download full-quality sounds via API."""
     print("🔑 Freesound API Mode\n")
 
@@ -216,7 +216,7 @@ def api_mode(token):
 
             try:
                 for page in range(1, 5):
-                    data = api_search(query, token, page=page, page_size=50)
+                    data = api_search(query, api_key, page=page, page_size=50)
                     results = data.get("results", [])
                     if not results:
                         break
@@ -250,10 +250,11 @@ def api_mode(token):
 
             except urllib.error.HTTPError as e:
                 if e.code == 401:
-                    print(f"    ❌ Invalid API token. Get one at https://freesound.org/apiv2/apply/")
+                    print(f"    ❌ Invalid API key. Get one at https://freesound.org/apiv2/apply/")
                     return
                 print(f"    ❌ API error: {e}")
                 break
+            time.sleep(1)  # rate limit between pages
 
         print(f"  ✅ {cls_name}: {downloaded} files")
 
@@ -266,7 +267,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download animal sounds from Freesound")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--no-api", action="store_true", help="Scrape mode (no API key, OGG preview)")
-    group.add_argument("--api", type=str, metavar="TOKEN", help="API key mode (full quality)")
+    group.add_argument("--api", type=str, metavar="API_KEY", help="API key mode (full quality)")
     parser.add_argument("--n", type=int, default=150, help="Target files per class (default: 150)")
     parser.add_argument("--output", type=str, default="data/animal1000", help="Output directory")
     args = parser.parse_args()

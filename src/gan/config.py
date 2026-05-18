@@ -10,7 +10,7 @@ class GANConfig:
     # ── Model ──
     latent_dim: int = 256
     cond_dim: int = 256          # conditioning vector after MLP
-    num_classes: int = 7
+    num_classes: int = 6
     gen_base_ch: int = 128       # starting channels after dense
     gen_max_ch: int = 256
     disc_base_ch: int = 48
@@ -69,7 +69,7 @@ class GANConfig:
     discriminator_path: str = "models/gan_discriminator_best.pth"
 
     # ── Classes ──
-    CLASSES: Tuple[str, ...] = ('Dog', 'Cat', 'Rooster', 'Frog', 'Crow', 'Insect', 'Hen')
+    CLASSES: Tuple[str, ...] = ('Dog', 'Cat', 'Chicken', 'Frog', 'Bird', 'Cow')
 
     @property
     def class_to_idx(self):
