@@ -318,20 +318,18 @@ def train():
         g_cls_acc = g_cls_acc_sum / len(train_loader) * 100
 
         # Progress
-        marker, status = "", ""
+        marker = "📉" if val_acc > best_val else "➡️"
         if val_acc > best_val:
             best_val = val_acc
-            marker = "📉"
-            status = " BEST"
             torch.save(G.state_dict(), cfg.generator_path)
             torch.save(D.state_dict(), cfg.discriminator_path)
-        else:
-            marker = "➡️"
+            print(f"   💾 Best model saved (val_acc={val_acc*100:.1f}%)")
 
         lr = g_opt.param_groups[0]['lr']
         print(f"── Epoch {epoch+1:3d}/{cfg.epochs} ({epoch_time:.0f}s) ── "
               f"G={train_g_loss:.4f} D={train_d_loss:.4f} "
-              f"val_acc={val_acc*100:.1f}% {marker} lr={lr:.2e}{status}")
+              f"D_cls={d_cls_acc:.1f}% G_cls={g_cls_acc:.1f}% "
+              f"val_acc={val_acc*100:.1f}% {marker} lr={lr:.2e}")
 
         # Generate samples periodically (every 10 epochs)
         if (epoch + 1) % 10 == 0:
