@@ -372,7 +372,8 @@ def generate_samples(generator, device, epoch):
             labels = torch.full((cfg.num_samples,), cls_idx, device=device, dtype=torch.long)
             mels = generator(z, labels)
             audio = mel_to_audio(mels[0:1])
-            torchaudio.save(f"outputs/gan_v16_e{epoch}_{cls_name}.wav", audio.cpu(), cfg.sample_rate)
+            torchaudio.save(f"outputs/gan_v16_e{epoch}_{cls_name}.wav",
+                            audio.squeeze(0).cpu(), cfg.sample_rate)
     print(f"   🎵 Saved samples to outputs/")
 
 
