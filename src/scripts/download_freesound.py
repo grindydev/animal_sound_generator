@@ -69,7 +69,7 @@ def scrape_sound_ids(query, max_pages=3):
     return results
 
 
-def download_preview(sound, out_path):
+def download_preview(sound, out_path, timeout=10):
     """Download a Freesound preview file."""
     preview_url = sound["preview"]
     if not preview_url.startswith("http"):
@@ -77,32 +77,22 @@ def download_preview(sound, out_path):
 
     try:
         req = urllib.request.Request(preview_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
         with open(out_path, "wb") as f:
             f.write(data)
         return True
-    except Exception as e:
-        print(f"    ❌ Download failed: {e}")
-        return False
-
-
-def convert_to_wav(src_path, wav_path):
-    """Convert audio to WAV using ffmpeg."""
-    try:
-        subprocess.run(["ffmpeg", "-y", "-i", src_path, "-ar", "22050", "-ac", "1",
-                        "-sample_fmt", "s16", wav_path],
-                       capture_output=True, check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except Exception:
         return False
 
 
 def scrape_mode():
     """Download sounds via HTML scraping (no API key)."""
-    print("🔍 Freesound Scrape Mode (no API key)")
+    print("🔍 Freesound Scrape Mode")
+    PER_CLASS_TIMEOUT = 120
 
     for cls_name, queries in QUERIES.items():
+        cls_start = time.time()
         out_dir = os.path.join(OUTPUT_DIR, cls_name)
         os.makedirs(out_dir, exist_ok=True)
 
@@ -110,60 +100,63 @@ def scrape_mode():
                             if f.endswith(".wav") and not f.startswith("aug_")])
         needed = max(0, N_PER_CLASS - existing_real)
         if needed <= 0:
-            print(f"\n📦 {cls_name}: {existing_real} real — skip")
+            print(f"📦 {cls_name}: {existing_real} — skip")
             continue
 
-        print(f"\n📦 {cls_name}: need {needed} (have {existing_real})")
+        print(f"📦 {cls_name}: need {needed} (have {existing_real})")
 
-        # Scrape
         all_sounds = []
         for query in queries:
-            try:
-                sounds = scrape_sound_ids(query, max_pages=2)
-                all_sounds.extend(sounds)
-            except Exception as e:
-                print(f"  ⚠️  query '{query}': {e}")
-            if len(all_sounds) >= needed * 2:
+            if time.time() - cls_start > PER_CLASS_TIMEOUT:
                 break
+            try:
+                all_sounds.extend(scrape_sound_ids(query, max_pages=1))
+            except Exception:
+                pass
 
-        # Deduplicate
+        if not all_sounds:
+            print(f"  ⚠️  No results — skip")
+            continue
+
         seen = set()
         unique = [s for s in all_sounds if s["id"] not in seen and not seen.add(s["id"])]
-        print(f"  Scraped {len(unique)} unique sounds")
+        print(f"  {len(unique)} unique sounds")
 
-        # Download
         downloaded = existing_real
-        errors = 0
+        fails = 0
         for sound in unique:
-            if downloaded >= N_PER_CLASS:
+            if time.time() - cls_start > PER_CLASS_TIMEOUT:
+                print(f"  ⏰ {PER_CLASS_TIMEOUT}s timeout")
                 break
-            if errors > 20:
-                print(f"  ⚠️  Too many errors, moving on")
+            if downloaded >= N_PER_CLASS or fails >= 5:
                 break
 
             sid = sound["id"]
             wav_path = os.path.join(out_dir, f"fs_{sid}.wav")
             if os.path.exists(wav_path):
                 downloaded += 1
+                fails = 0
                 continue
 
             mp3_path = os.path.join(out_dir, f"_tmp_{sid}.mp3")
-            if download_preview(sound, mp3_path):
-                if convert_to_wav(mp3_path, wav_path):
+            if download_preview(sound, mp3_path, timeout=6):
+                try:
+                    subprocess.run(["ffmpeg", "-y", "-i", mp3_path, "-ar", "22050",
+                                    "-ac", "1", "-sample_fmt", "s16", wav_path],
+                                   capture_output=True, timeout=8, check=True)
                     os.remove(mp3_path)
                     downloaded += 1
+                    fails = 0
                     if downloaded % 50 == 0:
-                        print(f"  ... {downloaded}/{N_PER_CLASS}")
-                else:
-                    errors += 1
+                        print(f"  {downloaded}/{N_PER_CLASS}")
+                except Exception:
+                    fails += 1
                     if os.path.exists(mp3_path):
                         os.remove(mp3_path)
             else:
-                errors += 1
+                fails += 1
 
-            time.sleep(0.2)
-
-        print(f"  ✅ {cls_name}: {downloaded} real files")
+        print(f"  ✅ {cls_name}: {downloaded} files")
 
 
 # ═══════════════════════════════════════════════════════════
