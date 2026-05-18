@@ -26,7 +26,14 @@ def load_generator(device):
         )
     G = Generator(cfg).to(device)
     state = torch.load(cfg.generator_path, map_location=device, weights_only=True)
-    G.load_state_dict(state)
+    # Support both dict save and raw state_dict
+    if 'generator' in state:
+        G.load_state_dict(state['generator'])
+        val_acc = state.get('val_acc', None)
+        if val_acc is not None:
+            print(f"   val_acc at save: {val_acc*100:.1f}%")
+    else:
+        G.load_state_dict(state)
     G.eval()
     g_params = sum(p.numel() for p in G.parameters())
     print(f"✅ Generator loaded: {g_params:,} params ({g_params/1e6:.1f}M)")

@@ -33,16 +33,17 @@ class GANConfig:
     segment_seconds: float = 5.0
 
     # ── Training ──
-    batch_size: int = 16          # 32 caused plateau — GANs need smaller batches for stability
+    batch_size: int = 16
     epochs: int = 300
     g_lr: float = 2e-4
     d_lr: float = 2e-4
     beta1: float = 0.0           # Adam β₁ = 0 for GAN stability
     beta2: float = 0.99
-    r1_gamma: float = 1.0        # R1 penalty (10 too high → gradient spikes)
-    r1_every: int = 16           # apply R1 every N steps (saves memory)
-    lr_decay_epochs: tuple = (100, 200)  # halve LR at these epochs
-    grad_clip: float = 5.0        # clip G gradients for stability
+    adam_weight_decay: float = 1e-4
+    ema_decay: float = 0.9999     # EMA for generator
+    r1_gamma: float = 1.0        # R1 penalty
+    r1_every: int = 16           # apply R1 every N steps
+    grad_clip: float = 5.0        # clip gradients
 
     # ── Loss weights ──
     g_adv_weight: float = 1.0
@@ -61,6 +62,7 @@ class GANConfig:
     num_samples: int = 5
 
     # ── Paths ──
+    model_dir: str = "models"
     checkpoint_dir: str = "models"
     generator_path: str = "models/gan_generator_best.pth"
     discriminator_path: str = "models/gan_discriminator_best.pth"
